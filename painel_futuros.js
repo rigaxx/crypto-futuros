@@ -93,6 +93,7 @@ function salvarAutoBotConfig() {
 
 let maxPriceTracker = {};
 let minPriceTracker = {};
+let gatekeeperVetoedUntil = {};
 
 // Cotação USD/BRL
 let brlGlobal = 5.20;
@@ -691,11 +692,11 @@ setInterval(async () => {
         const vetados = await rag.consultarParesVetados(45).catch(() => []);
         const vetadosSet = new Set(vetados.map(v => v.symbol));
 
-        // Ordena por volatilidade
+        // Ordena por volatilidade excluindo pares vetados pelo Gatekeeper recentemente
         const candidatos = volData
-          .filter(t => t.symbol.match(/^[A-Z0-9]+USDT$/) && t.symbol !== 'HEMIUSDT' && t.symbol !== moedaOutroSlot && !vetadosSet.has(t.symbol) && parseFloat(t.count || 0) > 1000)
+          .filter(t => t.symbol.match(/^[A-Z0-9]+USDT$/) && t.symbol !== 'HEMIUSDT' && t.symbol !== moedaOutroSlot && !vetadosSet.has(t.symbol) && (!gatekeeperVetoedUntil[t.symbol] || now >= gatekeeperVetoedUntil[t.symbol]) && parseFloat(t.count || 0) > 1000)
           .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)))
-          .slice(0, 10);
+          .slice(0, 15);
 
         let moedaEscolhida = null;
         for (const c of candidatos) {
@@ -745,6 +746,7 @@ setInterval(async () => {
         console.log(`[AUTOBOT-GATEKEEPER] Slot ${slotNum} (${cand}) VETADO: ${gk.motivo} (0 tokens gastos)`);
         slot.status = `GATEKEEPER_VETO: ${gk.motivo}`;
         autoBotState.lastLog = `Slot ${slotNum} (${cand}): ${gk.motivo}`;
+        gatekeeperVetoedUntil[cand] = now + 120000; // 2 min de respiro para testar outros pares da lista
         // Se a moeda não passou no Gatekeeper, descarta para testar próximo candidato líquido
         slot.targetSymbol = null;
         continue;
