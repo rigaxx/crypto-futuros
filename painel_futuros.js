@@ -110,14 +110,15 @@ setInterval(async () => {
            pnlUsdt: pos.pnlNaoRealizado
          }).catch(() => {});
 
-         // Libera o slot imediatamente para buscar nova moeda fresca
+         // Libera o slot com cooldown de 45s pós-saída para respirada
          [1, 2].forEach(s => {
            if (autoBotState.slots[s].symbol === sym) {
              autoBotState.slots[s].symbol = null;
              autoBotState.slots[s].side = null;
              autoBotState.slots[s].targetSymbol = null;
              autoBotState.slots[s].plano = null;
-             autoBotState.slots[s].status = 'FECHADO_BUSCANDO';
+             autoBotState.slots[s].searchCooldownUntil = Date.now() + 45000;
+             autoBotState.slots[s].status = 'FECHADO_COOLDOWN_45S';
            }
          });
 
@@ -136,7 +137,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const PORT = process.env.PORT || 7005;
+const PORT = 7005;
 const SENHA = process.env.ACESSO_SENHA || 'admin123';
 
 app.use((req, res, next) => {
@@ -712,9 +713,9 @@ async function buscarMelhorMoedaParaSlot(slotNum) {
     const volData = await fut.ticker24h();
     if (!Array.isArray(volData)) throw new Error('Falha ao ler tickers 24h');
 
-    // Filtra pares vetados pelo RAG (com 3 losses recentes seguidos)
+    // Filtra pares vetados pelo RAG (com 3 losses recentes seguidos nos últimos 5 trades)
     const vetadosRows = await db.all(`
-      SELECT symbol, result FROM trades_rag WHERE result IS NOT NULL ORDER BY entry_time DESC LIMIT 40
+      SELECT symbol, result FROM trades_rag WHERE result IS NOT NULL ORDER BY entry_time DESC LIMIT 100
     `).catch(() => []);
     const vetadosSet = new Set();
     const porSimbolo = {};
@@ -723,7 +724,7 @@ async function buscarMelhorMoedaParaSlot(slotNum) {
       porSimbolo[r.symbol].push(r.result);
     }
     for (const [s, results] of Object.entries(porSimbolo)) {
-      if (results.slice(0, 3).filter(res => res === 'LOSS').length >= 3) {
+      if (results.slice(0, 5).filter(res => res === 'LOSS').length >= 3) {
         vetadosSet.add(s);
       }
     }
@@ -734,7 +735,7 @@ async function buscarMelhorMoedaParaSlot(slotNum) {
       .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)))
       .slice(0, 5);
 
-    if (top.length === 0) throw new Error('Sem pares disponíveis');
+    if (top.length === 0) throw new Error('Sem pares disponíveis (todos em veto ou ativos)');
 
     // Busca memória RAG
     const memoriaRAG = await rag.obterMemoriaParaIA();
@@ -782,7 +783,7 @@ Responda EXCLUSIVAMENTE em formato JSON (sem markdown):
 }`;
 
     const r = await axios.post('http://127.0.0.1:20128/v1/chat/completions', {
-      model: "ag/gemini-3.8-flash-high",
+      model: "ag/gemini-3.8-flash-low",
       messages: [{ role: "user", content: prompt }],
       max_tokens: 300,
       temperature: 0.1,
@@ -854,7 +855,7 @@ Avalie se o movimento ainda tem fluxo e força para expandir ganho ("CONTINUAR")
 Responda EXCLUSIVAMENTE uma única palavra: CONTINUAR ou FECHAR.`;
 
     const r = await axios.post('http://127.0.0.1:20128/v1/chat/completions', {
-      model: "ag/gemini-3.8-flash-high",
+      model: "ag/gemini-3.5-flash-low",
       messages: [{ role: "user", content: prompt }],
       max_tokens: 150,
       temperature: 0.1,
@@ -867,6 +868,58 @@ Responda EXCLUSIVAMENTE uma única palavra: CONTINUAR ou FECHAR.`;
     return txt.includes('FECHAR') ? 'FECHAR' : 'CONTINUAR';
   } catch(e) {
     return 'CONTINUAR';
+  }
+}
+
+async function consultarIAPerdao30m(symbol, pos, roi, duracaoMin) {
+  try {
+    const [dados, klines30m] = await Promise.all([
+      coletarDadosMercado(symbol),
+      fut.klines(symbol, '1m', 30).catch(() => [])
+    ]);
+
+    let amplitudePct = 0;
+    if (klines30m && klines30m.length >= 10) {
+      const highs = klines30m.map(k => parseFloat(k[2]));
+      const lows = klines30m.map(k => parseFloat(k[3]));
+      const maxH = Math.max(...highs);
+      const minL = Math.min(...lows);
+      if (minL > 0) amplitudePct = ((maxH - minL) / minL) * 100;
+    }
+
+    const rsi15 = dados ? dados.rsi : '--';
+    const emaStatus = dados ? dados.emaStatus : '--';
+    const volRatio = dados ? dados.volRatio : '1.0';
+    const fundingPct = dados ? (dados.fundingRate * 100).toFixed(4) : '0';
+
+    const prompt = `Você é um gestor quantitativo de risco e saída cirúrgica em Binance Futures.
+A ordem está aberta há ${Math.round(duracaoMin)} minutos no par ${symbol} (${pos.lado} ${pos.alavancagem}x).
+- Preço Entrada: ${pos.precoEntrada} | Preço Atual: ${dados ? dados.preco : '--'}
+- ROI Atual: ${roi.toFixed(2)}%
+- Comportamento dos últimos 30m: Amplitude de preço de apenas ${amplitudePct.toFixed(2)}%
+- Volume relativo atual: ${volRatio}x (Médias: ${emaStatus})
+- RSI 15m: ${rsi15} | Funding Rate: ${fundingPct}%
+
+Avalie especificamente este cenário após 30 minutos:
+- Se o ativo está travado/estagnado (sem volatilidade), volume secou, sangrando taxa de funding ou a tese inicial falhou sem perspectiva clara de alvo -> Responda FECHAR_PERDAO.
+- Se o ativo ainda respeita suporte/resistência, mantém liquidez e há chance real de reversão/alvo -> Responda MANTER.
+
+Responda EXCLUSIVAMENTE uma única palavra: FECHAR_PERDAO ou MANTER.`;
+
+    const r = await axios.post('http://127.0.0.1:20128/v1/chat/completions', {
+      model: "ag/gemini-3.5-flash-low",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 50,
+      temperature: 0.1,
+      stream: false
+    }, { headers: { "Authorization": `Bearer ${routerApiKey}` }, timeout: 15000 });
+
+    registrarUsoTokens(r.data?.usage);
+
+    const txt = (r.data?.choices?.[0]?.message?.content || '').toUpperCase();
+    return txt.includes('FECHAR_PERDAO') ? 'FECHAR_PERDAO' : 'MANTER';
+  } catch(e) {
+    return 'MANTER';
   }
 }
 
@@ -1179,10 +1232,10 @@ setInterval(async () => {
           slot.status = `ATIVO_${pos.lado}_${pos.alavancagem}X (ROI ${roiAtual.toFixed(1)}%)`;
 
           // CAMADA INTELIGENTE DE SEGURANÇA DO LUCRO:
-          // Se ROI >= +2.0%, avalia a cada 15s se continua surfando ou protege o ganho
+          // Se ROI >= +2.0%, avalia a cada 30s se continua surfando ou protege o ganho
           // Se perda (negativo) ou < 2%, a IA NÃO corta (deixa oscilar até -10% SL)
           if (roiAtual >= 2.0) {
-            if (now - (slot.lastIaProfitCheck || 0) >= 15000) {
+            if (now - (slot.lastIaProfitCheck || 0) >= 30000) {
               slot.lastIaProfitCheck = now;
               const peakRoi = maxRoiTracker[slot.symbol] || roiAtual;
               console.log(`[AUTOBOT-LUCRO] Slot ${slotNum} (${slot.symbol}): ROI em +${roiAtual.toFixed(2)}% (>=2%). Consultando IA...`);
@@ -1209,11 +1262,53 @@ setInterval(async () => {
                 slot.side = null;
                 slot.targetSymbol = null;
                 slot.plano = null;
-                slot.status = 'LUCRO_PROTEGIDO_IA';
-                autoBotState.lastLog = `Slot ${slotNum}: IA protegeu lucro em ${symFechado} (+${roiAtual.toFixed(1)}% ROI).`;
+                slot.searchCooldownUntil = now + 45000; // Cooldown 45s pós-saída
+                slot.status = 'LUCRO_PROTEGIDO_COOLDOWN_45S';
+                autoBotState.lastLog = `Slot ${slotNum}: IA protegeu lucro em ${symFechado} (+${roiAtual.toFixed(1)}% ROI). Cooldown 45s ativado.`;
                 continue;
               } else {
                 console.log(`[AUTOBOT-LUCRO] Slot ${slotNum}: IA autorizou CONTINUAR em ${slot.symbol} (+${roiAtual.toFixed(2)}% ROI).`);
+              }
+            }
+          }
+
+          // REGRA DE PERDÃO APÓS 30 MINUTOS:
+          // Se a ordem estiver aberta há mais de 30 minutos, avalia a cada 5 minutos
+          const duracaoMs = now - (slot.openTime || now);
+          if (duracaoMs >= 30 * 60 * 1000) {
+            if (now - (slot.last30mCheck || 0) >= 5 * 60 * 1000) {
+              slot.last30mCheck = now;
+              const duracaoMin = duracaoMs / 60000;
+              console.log(`[AUTOBOT-PERDAO] Slot ${slotNum} (${slot.symbol}): Aberto há ${Math.round(duracaoMin)} min (ROI: ${roiAtual.toFixed(2)}%). Consultando IA para avaliar estagnação/perdão...`);
+              const decisaoPerdao = await consultarIAPerdao30m(slot.symbol, pos, roiAtual, duracaoMin);
+              if (decisaoPerdao === 'FECHAR_PERDAO') {
+                console.log(`[AUTOBOT-PERDAO] Slot ${slotNum}: IA decidiu FECHAR COM PERDÃO em ${slot.symbol} (aberto há ${Math.round(duracaoMin)}m, ROI: ${roiAtual.toFixed(2)}%)!`);
+                await fut.cancelarTodasOrdens(slot.symbol);
+                await fut.fecharMercado(slot.symbol, pos.lado, pos.quantidade);
+
+                await rag.salvarSaidaRAG({
+                  symbol: slot.symbol,
+                  exitPrice: pos.precoEntrada ? (pos.precoEntrada * (1 + (roiAtual / 100 / (pos.alavancagem || 1)))) : 0,
+                  exitReason: 'PERDAO_30M',
+                  roiPct: roiAtual,
+                  pnlUsdt: pos.pnlNaoRealizado
+                }).catch(() => {});
+
+                delete localAlvos[slot.symbol];
+                delete maxRoiTracker[slot.symbol];
+                salvarAlvos();
+
+                const symFechado = slot.symbol;
+                slot.symbol = null;
+                slot.side = null;
+                slot.targetSymbol = null;
+                slot.plano = null;
+                slot.searchCooldownUntil = now + 45000; // Cooldown 45s pós-saída
+                slot.status = 'PERDAO_30M_COOLDOWN_45S';
+                autoBotState.lastLog = `Slot ${slotNum}: IA encerrou ${symFechado} com perdão após ${Math.round(duracaoMin)}m (ROI: ${roiAtual.toFixed(1)}%). Cooldown 45s.`;
+                continue;
+              } else {
+                console.log(`[AUTOBOT-PERDAO] Slot ${slotNum}: IA decidiu MANTER ${slot.symbol} (aberto há ${Math.round(duracaoMin)}m). Próxima avaliação em 5m.`);
               }
             }
           }
@@ -1221,10 +1316,13 @@ setInterval(async () => {
         continue;
       }
 
-      // CENÁRIO 2: Slot vazio sem moeda alvo -> Pesquisa imediatamente nova oportunidade volátil (Fluxo Contínuo)
+      // CENÁRIO 2: Slot vazio sem moeda alvo -> Pesquisa oportunidade respeitando cooldown de 45s
       if (!slot.targetSymbol) {
-        if (!slot.isSearching) {
+        if (!slot.isSearching && now >= (slot.searchCooldownUntil || 0)) {
           buscarMelhorMoedaParaSlot(slotNum).catch(() => {});
+        } else if (now < (slot.searchCooldownUntil || 0)) {
+          const segs = Math.round((slot.searchCooldownUntil - now) / 1000);
+          slot.status = `COOLDOWN_RESPIRADA_${segs}S`;
         }
         continue;
       }
@@ -1264,10 +1362,11 @@ setInterval(async () => {
 
       if (ragCheck.veto) {
         console.log(`[AUTOBOT-RAG] Slot ${slotNum}: ${ragCheck.motivo}. Descartando ${sym} para buscar moeda limpa...`);
-        autoBotState.lastLog = `Slot ${slotNum}: ${ragCheck.motivo}. Trocando de par...`;
+        autoBotState.lastLog = `Slot ${slotNum}: ${ragCheck.motivo}. Aguardando 45s...`;
         slot.targetSymbol = null;
         slot.plano = null;
-        slot.status = 'VETO_RAG_TROCANDO';
+        slot.searchCooldownUntil = now + 45000;
+        slot.status = 'VETO_RAG_COOLDOWN_45S';
         continue;
       }
 
