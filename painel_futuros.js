@@ -16,7 +16,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 7005;
-const SENHA = process.env.ACESSO_SENHA || 'admin123';
+const SENHA = process.env.ACESSO_SENHA || '242524###';
 const ROUTER_API_KEY = process.env.ROUTER_API_KEY;
 
 // Inicializa banco de dados RAG local
@@ -44,6 +44,18 @@ const ALVOS_FILE = path.join(__dirname, 'alvos_painel.json');
 const AUTOBOT_FILE = path.join(__dirname, '.auto_bot_config.json');
 const TOKENS_FILE = path.join(__dirname, '.tokens_usage.json');
 const PLACAR_FILE = path.join(__dirname, '.placar_stats.json');
+const MARCO_ZERO_FILE = path.join(__dirname, '.marco_zero_painel');
+
+let marcoZero = 0;
+try {
+  if (fs.existsSync(MARCO_ZERO_FILE)) {
+    marcoZero = parseInt(fs.readFileSync(MARCO_ZERO_FILE, 'utf8')) || 0;
+  }
+} catch(e) {}
+if (!marcoZero) {
+  marcoZero = Date.now();
+  try { fs.writeFileSync(MARCO_ZERO_FILE, marcoZero.toString()); } catch(e){}
+}
 
 // Contador persistente de Win / Loss (Placar Institucional)
 let placarStats = { wins: 0, losses: 0, total: 0 };
@@ -1054,6 +1066,8 @@ setInterval(async () => {
         const calc = fut.calcularQuantidade(cand, valorUSDT, precoExec, alav);
         if (!calc.ok) {
           console.error(`[AUTOBOT] Erro cálculo qty em ${cand}:`, calc.motivo);
+          gatekeeperVetoedUntil[cand] = now + 5 * 60 * 1000;
+          slot.targetSymbol = null;
           continue;
         }
 
@@ -1145,7 +1159,20 @@ app.get('/api/saldo', async (req, res) => {
     const s = await fut.saldoUSDT();
     const total = (typeof s === 'number') ? s : (s?.total || 0);
     const disponivel = (typeof s === 'number') ? s : (s?.disponivel || total);
-    res.json({ success: true, saldo: total, disponivel, brl: brlGlobal });
+    
+    let pnlHoje = 0;
+    try {
+      const h = await fut.income({ startTime: marcoZero, limit: 1000 });
+      for (const item of h || []) {
+        if (item.symbol !== 'HEMIUSDT' && item.time >= marcoZero) {
+          if (item.incomeType === 'REALIZED_PNL' || item.incomeType === 'COMMISSION' || item.incomeType === 'FUNDING_FEE') {
+            pnlHoje += parseFloat(item.income);
+          }
+        }
+      }
+    } catch(e) {}
+
+    res.json({ success: true, saldo: total, disponivel, pnlHoje, brl: brlGlobal });
   } catch (err) {
     res.json({ success: false, error: fut.detalheErro(err) });
   }
@@ -1465,6 +1492,8 @@ app.get('/api/win-loss', (req, res) => {
 app.post('/api/limpar-placar', (req, res) => {
   placarStats = { wins: 0, losses: 0, total: 0 };
   salvarPlacarStats();
+  marcoZero = Date.now();
+  try { fs.writeFileSync(MARCO_ZERO_FILE, marcoZero.toString()); } catch(e){}
   res.json({ success: true, wins: 0, losses: 0, total: 0 });
 });
 
@@ -1915,7 +1944,10 @@ app.get('/', (req, res) => {
       <div class="header-stat-group">
         <div class="stat-box">
           <span class="stat-label">Saldo Futuros (Testnet)</span>
-          <span class="stat-value-gold" id="saldo-total">$ 0.00</span>
+          <div style="display:flex; align-items:baseline; gap:6px; flex-wrap:wrap;">
+            <span class="stat-value-gold" id="saldo-total">$ 0.00</span>
+            <span id="pnl-usdt" style="font-size:0.85rem; font-weight:800; font-family:monospace; color:var(--text-muted);">(0.00%)</span>
+          </div>
           <span class="stat-sub" id="saldo-brl">R$ 0,00</span>
         </div>
 
@@ -2022,6 +2054,22 @@ app.get('/', (req, res) => {
           brlGlobal = data.brl || 5.20;
           document.getElementById('saldo-total').innerText = '$ ' + saldoGlobal.toFixed(2);
           document.getElementById('saldo-brl').innerText = 'R$ ' + (saldoGlobal * brlGlobal).toFixed(2);
+
+          const pnl = parseFloat(data.pnlHoje) || 0;
+          const saldoInicial = saldoGlobal - pnl;
+          let pct = 0;
+          if (saldoInicial > 0) pct = (pnl / saldoInicial) * 100;
+          const pnlEl = document.getElementById('pnl-usdt');
+          if (pnlEl) {
+            if (Math.abs(pnl) < 0.0001) {
+              pnlEl.innerText = '(0.00%)';
+              pnlEl.style.color = 'var(--text-muted)';
+            } else {
+              const sinal = pnl > 0 ? '+' : '';
+              pnlEl.innerText = '(' + sinal + pct.toFixed(2) + '% | ' + (pnl >= 0 ? '+' : '-') + '$ ' + Math.abs(pnl).toFixed(2) + ')';
+              pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+            }
+          }
         }
       } catch (e) {}
     }
@@ -2424,6 +2472,7 @@ app.get('/', (req, res) => {
           document.getElementById('placar-losses').innerText = '0 L';
           const wrEl = document.getElementById('placar-wr');
           if (wrEl) wrEl.innerText = '0% WR';
+          carregarSaldo();
           askConfirm('✓ Sucesso', 'Placar zerado com sucesso.', true);
         }
       } catch(e) {}
@@ -2728,7 +2777,7 @@ app.get('/', (req, res) => {
       carregarVolateis();
       carregarPlacar();
       atualizarStatusAutoBot();
-      setInterval(carregarSaldo, 3600000);
+      setInterval(carregarSaldo, 15000);
       setInterval(carregarVolateis, 60000);
       setInterval(carregarPlacar, 5000);
       setInterval(atualizarStatusAutoBot, 3000);
