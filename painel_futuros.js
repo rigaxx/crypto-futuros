@@ -2636,12 +2636,47 @@ app.get('/', (req, res) => {
         const inicioHoje = new Date();
         inicioHoje.setHours(0,0,0,0);
         const hojeTrades = groupedArray.filter(g => g.time >= inicioHoje.getTime());
-        container.innerHTML = renderListaSimples(hojeTrades, 'Hoje');
+        container.innerHTML = renderAbaComResumo(hojeTrades, 'Hoje', 'Operações de Hoje');
       } else if (abaAtualHist === 'todas') {
-        container.innerHTML = renderListaSimples(groupedArray, 'Todas as Operações');
+        container.innerHTML = renderAbaComResumo(groupedArray, 'Todas', 'Todas as Operações');
       } else {
-        container.innerHTML = renderAgrupadoPeriodos(groupedArray);
+        container.innerHTML = renderAbaComResumo(groupedArray, 'Geral', 'Últimas 40 Operações');
       }
+    }
+
+    function renderAbaComResumo(lista, titulo, subtitulo) {
+      if (!lista || lista.length === 0) {
+        return '<div style="text-align:center; padding:30px; color:var(--text-muted); font-weight:600;">Nenhum trade encontrado em ' + subtitulo + '.</div>';
+      }
+
+      let totWin = 0, totLoss = 0, totPnl = 0, totFee = 0;
+      lista.forEach(g => {
+        if (g.hasPnl) {
+          if (g.pnl > 0.0001) totWin++;
+          else if (g.pnl < -0.0001) totLoss++;
+          totPnl += g.pnl;
+        }
+        totFee += g.fee;
+      });
+
+      const winRate = (totWin + totLoss) > 0 ? Math.round((totWin / (totWin + totLoss)) * 100) : 0;
+      let html = '<div class="hist-summary-grid">' +
+          '<div class="hist-stat-card">' +
+            '<div class="hist-stat-title">Taxa de Acerto (' + titulo + ')</div>' +
+            '<div class="hist-stat-val" style="color:' + (winRate >= 50 ? 'var(--green)' : 'var(--gold)') + ';">' + winRate + '% <span class="hist-stat-count">(' + totWin + 'W / ' + totLoss + 'L)</span></div>' +
+          '</div>' +
+          '<div class="hist-stat-card">' +
+            '<div class="hist-stat-title">PnL Líquido (' + titulo + ')</div>' +
+            '<div class="hist-stat-val" style="color:' + (totPnl >= 0 ? 'var(--green)' : 'var(--red)') + ';">' + (totPnl >= 0 ? '+' : '') + '$ ' + totPnl.toFixed(2) + '</div>' +
+          '</div>' +
+          '<div class="hist-stat-card">' +
+            '<div class="hist-stat-title">Corretagem (' + titulo + ')</div>' +
+            '<div class="hist-stat-val text-gold">-$ ' + totFee.toFixed(2) + '</div>' +
+          '</div>' +
+        '</div>';
+
+      html += renderListaSimples(lista.slice(0, 50), subtitulo);
+      return html;
     }
 
     function renderListaSimples(lista, titulo) {
@@ -2672,35 +2707,6 @@ app.get('/', (req, res) => {
           '</div>';
       });
       return html;
-    }
-
-    function renderAgrupadoPeriodos(lista) {
-      let totWin = 0, totLoss = 0, totPnl = 0, totFee = 0;
-      lista.forEach(g => {
-        if (g.hasPnl) {
-          if (g.pnl > 0.0001) totWin++;
-          else if (g.pnl < -0.0001) totLoss++;
-          totPnl += g.pnl;
-        }
-        totFee += g.fee;
-      });
-
-      const winRate = (totWin + totLoss) > 0 ? Math.round((totWin / (totWin + totLoss)) * 100) : 0;
-      return '<div class="hist-summary-grid">' +
-          '<div class="hist-stat-card">' +
-            '<div class="hist-stat-title">Taxa de Acerto Geral</div>' +
-            '<div class="hist-stat-val" style="color:' + (winRate >= 50 ? 'var(--green)' : 'var(--gold)') + ';">' + winRate + '% <span class="hist-stat-count">(' + totWin + 'W / ' + totLoss + 'L)</span></div>' +
-          '</div>' +
-          '<div class="hist-stat-card">' +
-            '<div class="hist-stat-title">PnL Realizado Líquido</div>' +
-            '<div class="hist-stat-val" style="color:' + (totPnl >= 0 ? 'var(--green)' : 'var(--red)') + ';">' + (totPnl >= 0 ? '+' : '') + '$ ' + totPnl.toFixed(2) + '</div>' +
-          '</div>' +
-          '<div class="hist-stat-card">' +
-            '<div class="hist-stat-title">Total de Corretagem</div>' +
-            '<div class="hist-stat-val text-gold">-$ ' + totFee.toFixed(2) + '</div>' +
-          '</div>' +
-        '</div>' +
-        renderListaSimples(lista.slice(0, 40), 'Últimas 40 Operações');
     }
 
     function fazerLogout() {
