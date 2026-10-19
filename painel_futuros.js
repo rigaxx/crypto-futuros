@@ -43,6 +43,38 @@ app.use((req, res, next) => {
 const ALVOS_FILE = path.join(__dirname, 'alvos_painel.json');
 const AUTOBOT_FILE = path.join(__dirname, '.auto_bot_config.json');
 const TOKENS_FILE = path.join(__dirname, '.tokens_usage.json');
+const PLACAR_FILE = path.join(__dirname, '.placar_stats.json');
+
+// Contador persistente de Win / Loss (Placar Institucional)
+let placarStats = { wins: 0, losses: 0, total: 0 };
+try {
+  if (fs.existsSync(PLACAR_FILE)) {
+    placarStats = JSON.parse(fs.readFileSync(PLACAR_FILE, 'utf8'));
+  }
+} catch(e) {
+  placarStats = { wins: 0, losses: 0, total: 0 };
+}
+
+function salvarPlacarStats() {
+  try {
+    fs.writeFileSync(PLACAR_FILE, JSON.stringify(placarStats, null, 2));
+  } catch(e) {}
+}
+
+function registrarDesfechoTrade(symbol, exitReason, roi, pnlUsdt) {
+  const pnlNum = parseFloat(pnlUsdt) || 0;
+  const roiNum = parseFloat(roi) || 0;
+  const isWin = (pnlNum > 0.0001 || roiNum > 0.01 || exitReason === 'TP' || (exitReason === 'BREAKEVEN' && roiNum >= 0));
+  if (isWin) {
+    placarStats.wins = (placarStats.wins || 0) + 1;
+  } else {
+    placarStats.losses = (placarStats.losses || 0) + 1;
+  }
+  placarStats.total = (placarStats.wins || 0) + (placarStats.losses || 0);
+  salvarPlacarStats();
+  console.log(`[PLACAR-ATUALIZADO] ${symbol} -> ${isWin ? 'WIN (Vencedor)' : 'LOSS (Perdedor)'} (${exitReason}) | PnL: $${pnlNum.toFixed(2)} | ROI: ${roiNum.toFixed(2)}% | Total: ${placarStats.wins}W / ${placarStats.losses}L`);
+}
+
 
 // Contador persistente de tokens
 let tokensGastos = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
@@ -155,7 +187,7 @@ async function validarLiquidezMoeda(symbol) {
 // ── NOVO MOTOR DE INDICADORES MTF (ETAPAS 3 e 4) ───────────────────────
 async function analisarEstruturaEMercado(symbol) {
   try {
-    const [k5m, k15m, k1h, k4h, oiHist, takerRatio, premiumData, oiData, bookData] = await Promise.all([
+    const [k5m, k15m, k1h, k4h, oiHist, takerRatio, premiumData, oiData, bookData, ticker24] = await Promise.all([
       fut.klines(symbol, '5m', 100).catch(() => []),
       fut.klines(symbol, '15m', 100).catch(() => []),
       fut.klines(symbol, '1h', 100).catch(() => []),
@@ -164,8 +196,10 @@ async function analisarEstruturaEMercado(symbol) {
       fut.takerBuySellRatio(symbol, '5m', 5).catch(() => []),
       fut.precoMarca(symbol).catch(() => null),
       fut.openInterest(symbol).catch(() => null),
-      fut.livroOfertas(symbol, 5).catch(() => null)
+      fut.livroOfertas(symbol, 5).catch(() => null),
+      fut.ticker24h(symbol).catch(() => null)
     ]);
+    const priceChangePercent = parseFloat(ticker24?.priceChangePercent || 0);
 
     if (!k5m || k5m.length < 30 || !k15m || k15m.length < 50 || !k1h || k1h.length < 50) {
       return null;
@@ -448,6 +482,7 @@ async function analisarEstruturaEMercado(symbol) {
     return {
       symbol,
       curPrice,
+      priceChangePercent,
       last5mOpenTime,
       p15, p5, p1h, p4h,
       ema9_15, ema21_15, ema50_15, ema200_15,
@@ -717,6 +752,8 @@ setInterval(async () => {
           pnlUsdt: pos.pnlNaoRealizado
         }).catch(() => {});
 
+        registrarDesfechoTrade(sym, exitTipo, roi, pos.pnlNaoRealizado);
+
         // Libera slot com cooldown 45s
         [1, 2].forEach(s => {
           if (autoBotState.slots[s].symbol === sym) {
@@ -787,6 +824,8 @@ setInterval(async () => {
                   pnlUsdt: pos.pnlNaoRealizado
                 }).catch(() => {});
 
+                registrarDesfechoTrade(slot.symbol, 'PERDAO_30M', roiFinal, pos.pnlNaoRealizado);
+
                 delete localAlvos[slot.symbol];
                 delete maxPriceTracker[slot.symbol];
                 delete minPriceTracker[slot.symbol];
@@ -847,6 +886,8 @@ setInterval(async () => {
                   roiPct: roiFinal,
                   pnlUsdt: pos.pnlNaoRealizado
                 }).catch(() => {});
+
+                registrarDesfechoTrade(slot.symbol, 'PERDAO_30M', roiFinal, pos.pnlNaoRealizado);
 
                 delete localAlvos[slot.symbol];
                 delete maxPriceTracker[slot.symbol];
@@ -1154,6 +1195,7 @@ app.get('/api/moeda/:symbol', async (req, res) => {
       success: true,
       symbol,
       preco: dados.curPrice,
+      priceChangePercent: dados.priceChangePercent || 0,
       intervals: {
         '4h': dados.dir4h,
         '1h': dados.dir1h,
@@ -1314,6 +1356,19 @@ app.post('/api/close', async (req, res) => {
     if (!pos || pos.quantidade === 0) throw new Error('Nenhuma posição aberta.');
     await fut.cancelarTodasOrdens(symbol);
     const r = await fut.fecharMercado(symbol, pos.lado, pos.quantidade);
+
+    const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
+    const roi = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
+    registrarDesfechoTrade(symbol, 'MANUAL_CLOSE', roi, pos.pnlNaoRealizado);
+
+    await rag.salvarSaidaRAG({
+      symbol,
+      exitPrice: pos.precoMarca || pos.precoEntrada,
+      exitReason: 'MANUAL_CLOSE',
+      roiPct: roi,
+      pnlUsdt: pos.pnlNaoRealizado
+    }).catch(() => {});
+
     delete localAlvos[symbol];
     delete maxPriceTracker[symbol];
     delete minPriceTracker[symbol];
@@ -1366,7 +1421,12 @@ app.get('/api/auto-status', (req, res) => {
     enabled: autoBotState.enabled,
     slots: autoBotState.slots,
     lastLog: autoBotState.lastLog,
-    tokensGastos: tokensGastos.total_tokens || 0
+    tokensGastos: tokensGastos.total_tokens || 0,
+    placar: {
+      wins: placarStats.wins || 0,
+      losses: placarStats.losses || 0,
+      total: (placarStats.wins || 0) + (placarStats.losses || 0)
+    }
   });
 });
 
@@ -1390,50 +1450,19 @@ app.get('/api/rag-stats', async (req, res) => {
   }
 });
 
-app.get('/api/win-loss', async (req, res) => {
-  try {
-    const trades = await fut.userTradesCompleto();
-    let tradesFiltrados = trades;
-    let cutoff = 0;
-    try {
-      if (fs.existsSync(path.join(__dirname, '.placar_cutoff.json'))) {
-        cutoff = JSON.parse(fs.readFileSync(path.join(__dirname, '.placar_cutoff.json'), 'utf8')).cutoff || 0;
-        if (cutoff > 0) tradesFiltrados = trades.filter(t => t.time >= cutoff);
-      }
-    } catch(e){}
-
-    const tradeGroups = {};
-    tradesFiltrados.forEach(t => {
-      const orderId = t.orderId;
-      if (!tradeGroups[orderId]) tradeGroups[orderId] = { pnl: 0, time: t.time, symbol: t.symbol, hasPnl: false };
-      const p = parseFloat(t.realizedPnl);
-      if (!isNaN(p)) {
-        tradeGroups[orderId].pnl += p;
-        if (Math.abs(p) > 0.000001) tradeGroups[orderId].hasPnl = true;
-      }
-    });
-
-    let wins = 0, losses = 0;
-    Object.values(tradeGroups).forEach(g => {
-      if (g.hasPnl) {
-        if (g.pnl > 0) wins++;
-        else if (g.pnl < 0) losses++;
-      }
-    });
-
-    res.json({ success: true, wins, losses, total: wins + losses });
-  } catch(e) {
-    res.json({ success: false, error: e.message });
-  }
+app.get('/api/win-loss', (req, res) => {
+  res.json({
+    success: true,
+    wins: placarStats.wins || 0,
+    losses: placarStats.losses || 0,
+    total: (placarStats.wins || 0) + (placarStats.losses || 0)
+  });
 });
 
 app.post('/api/limpar-placar', (req, res) => {
-  try {
-    fs.writeFileSync(path.join(__dirname, '.placar_cutoff.json'), JSON.stringify({ cutoff: Date.now() }));
-    res.json({ success: true });
-  } catch(e) {
-    res.json({ success: false, error: e.message });
-  }
+  placarStats = { wins: 0, losses: 0, total: 0 };
+  salvarPlacarStats();
+  res.json({ success: true, wins: 0, losses: 0, total: 0 });
 });
 
 app.get('/api/historico-completo', async (req, res) => {
@@ -1457,18 +1486,26 @@ app.get('/api/historico', async (req, res) => {
 // ── FRONTEND HTML / UI QUANT DARK (ETAPAS 2 e 3) ──────────────────────
   function renderColHTML(col) { return `
     <div class="card ${col === 1 ? 'active' : ''}" id="card-${col}" onclick="selecionarColuna(${col})">
-      <div class="input-group">
-        <input type="text" id="sym-${col}" placeholder="Moeda (ex: BTC)" oninput="debouncedLoad(${col})" autocomplete="off">
+      
+      <!-- TOPO DO CARD: MOEDA INPUT, VARIAÇÃO 24H E MODO DINÂMICO ATIVO -->
+      <div class="card-top-row">
+        <div class="coin-input-group">
+          <input type="text" id="sym-${col}" placeholder="MOEDA (EX: BTC)" oninput="debouncedLoad(${col})" autocomplete="off">
+          <span class="pct-badge" id="pct-24h-${col}">--%</span>
+        </div>
+        <div class="modo-badge" id="modo-badge-${col}">[AGUARDANDO SETUP]</div>
       </div>
+
+      <!-- PREÇO ATUAL GRANDE E DESTACADO -->
       <div class="price-display" id="price-${col}">$ 0.0000</div>
       
-      <!-- TENDÊNCIA MTF (4h, 1h, 15m, 5m) + ALINHAMENTO MTF -->
+      <!-- TENDÊNCIA MULTI-TIMEFRAME (EMA 50) -->
       <div class="mtf-box">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-          <span style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase; letter-spacing:1px;">Tendência MTF (EMA 50)</span>
-          <span id="mtf-status-${col}" class="badge-mtf">CARREGANDO</span>
+        <div class="mtf-header">
+          <span class="mtf-title">TENDÊNCIA MULTI-TIMEFRAME (EMA 50)</span>
+          <span id="mtf-status-${col}" class="badge-mtf">CARREGANDO...</span>
         </div>
-        <div class="candles-row" id="candles-${col}" style="margin-bottom:0; padding:6px 10px;">
+        <div class="candles-row" id="candles-${col}">
           ${['4h','1h','15m','5m'].map(tf => `
             <div class="candle">
               <span class="candle-label">${tf}</span>
@@ -1478,96 +1515,107 @@ app.get('/api/historico', async (req, res) => {
         </div>
       </div>
 
-      <!-- PAINEL DE ESTRUTURA E FLUXO (5m / 15m) -->
+      <!-- CORPO DO CARD: ESTRUTURA & FLUXO INSTITUCIONAL (5M / 15M) -->
       <div class="flow-panel">
-        <div class="flow-title">Estrutura & Fluxo (5m / 15m)</div>
-        <div class="flow-row">
-          <span style="color:var(--text-muted);">Alinhamento EMAs:</span>
-          <span id="ema-align-${col}" style="font-weight:bold; color:#fff;">--</span>
+        <div class="flow-title">ESTRUTURA & FLUXO INSTITUCIONAL</div>
+        
+        <div class="flow-grid">
+          <div class="flow-cell">
+            <span class="cell-label">Alinhamento EMAs:</span>
+            <span class="cell-val" id="ema-align-${col}">--</span>
+          </div>
+          <div class="flow-cell">
+            <span class="cell-label">Distância EMA 21:</span>
+            <span class="cell-val" id="dist-ema-${col}">--</span>
+          </div>
+          <div class="flow-cell">
+            <span class="cell-label">ATR (14) 15m:</span>
+            <span class="cell-val text-gold" id="atr-pct-${col}">--</span>
+          </div>
+          <div class="flow-cell">
+            <span class="cell-label">ADX / RVOL:</span>
+            <span class="cell-val" id="adx-rvol-${col}">--</span>
+          </div>
+          <div class="flow-cell">
+            <span class="cell-label">RSI (15m Wilder):</span>
+            <span class="cell-val" id="rsi-${col}" style="font-size:1.1rem; font-weight:800;">--</span>
+          </div>
+          <div class="flow-cell">
+            <span class="cell-label">Taker Ratio:</span>
+            <span class="cell-val" id="gauge-taker-${col}">--</span>
+          </div>
+          <div class="flow-cell">
+            <span class="cell-label">Δ OI (15m):</span>
+            <span class="cell-val" id="gauge-delta-oi-${col}">--</span>
+          </div>
+          <div class="flow-cell">
+            <span class="cell-label">Funding Rate:</span>
+            <span class="cell-val" id="gauge-fund-${col}">--</span>
+          </div>
         </div>
-        <div class="flow-row">
-          <span style="color:var(--text-muted);">Distância EMA 21:</span>
-          <span id="dist-ema-${col}" style="font-weight:bold;">--</span>
-        </div>
-        <div class="flow-row">
-          <span style="color:var(--text-muted);">ATR (14) 15m:</span>
-          <span id="atr-pct-${col}" style="color:var(--gold); font-weight:bold;">--</span>
-        </div>
-        <div class="flow-row" style="margin-bottom:0;">
-          <span style="color:var(--text-muted);">ADX / RVOL:</span>
-          <span id="adx-rvol-${col}" style="color:#fff; font-weight:bold;">--</span>
+
+        <div class="compass-row">
+          <span class="compass-label">Bússola Quant (-100 a +100):</span>
+          <span class="compass-val" id="trend-${col}">--</span>
         </div>
       </div>
 
-      <!-- RSI (15m WILDER) & BÚSSOLA QUANT & MODO ATIVO -->
-      <div class="setup-quality-box" style="flex-direction:column; align-items:stretch; gap:6px;">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-          <div>
-            <div style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase;">RSI (15m Wilder)</div>
-            <div id="rsi-${col}" style="font-weight:bold; font-size:1.1rem; color:var(--text);">--</div>
-          </div>
-          <div style="text-align:right;">
-            <div style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase;">Bússola (-100 a +100)</div>
-            <div id="trend-${col}" style="font-weight:bold; font-size:0.9rem;">--</div>
-          </div>
-        </div>
-        <div style="border-top:1px dashed rgba(255,255,255,0.08); padding-top:4px; display:flex; justify-content:space-between; align-items:center;">
-          <span style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase;">Regime:</span>
-          <span id="modo-badge-${col}" style="font-size:0.7rem; font-weight:bold; padding:2px 6px; border-radius:4px; background:rgba(255,255,255,0.05); color:var(--text-muted);">[AGUARDANDO MODO]</span>
-        </div>
-      </div>
-
-      <!-- POSIÇÃO ABERTA -->
+      <!-- POSIÇÃO ABERTA (DESTACADA QUANDO HOUVER) -->
       <div class="pos-card" id="pos-${col}">
         <div class="pos-header">
-          <span id="pos-lado-${col}" style="font-weight: bold;">--</span>
-          <span id="pos-qty-${col}" style="color: var(--text-muted);">Qty: --</span>
+          <span id="pos-lado-${col}" style="font-weight: 800; font-size:1.05rem;">--</span>
+          <span id="pos-qty-${col}" style="color: var(--text-muted); font-size:0.9rem;">Qty: --</span>
         </div>
         <div class="pos-pnl" id="pos-pnl-${col}">$ 0.00 (0.00%)</div>
-        <div style="font-size: 0.75rem; color: #3b82f6; text-align: center; margin-bottom: 8px;" id="pos-pnl-brl-${col}">R$ 0,00</div>
-        <div style="font-size: 0.75rem; color: var(--text-muted); text-align: center; margin-bottom: 8px;">Entrada: <span id="pos-entry-${col}">--</span></div>
-        <div style="display:flex; gap:6px; margin-bottom:6px;">
-          <button class="btn-close" style="flex:1; padding:8px; font-size:0.7rem;" onclick="fecharPosicao(${col})">FECHAR MERCADO</button>
-          <button class="btn-reverse" style="flex:1; padding:8px; font-size:0.7rem;" onclick="reverterPosicao(${col})">REVERTER</button>
+        <div style="font-size: 0.9rem; color: var(--blue); text-align: center; margin-bottom: 8px; font-weight:700;" id="pos-pnl-brl-${col}">R$ 0,00</div>
+        <div style="font-size: 0.85rem; color: var(--text-muted); text-align: center; margin-bottom: 12px;">Preço Entrada: <b id="pos-entry-${col}" style="color:#FFF;">--</b></div>
+        <div style="display:flex; gap:10px;">
+          <button class="btn-close" style="flex:1; padding:12px; font-size:0.8rem;" onclick="fecharPosicao(${col})">FECHAR MERCADO</button>
+          <button class="btn-reverse" style="flex:1; padding:12px; font-size:0.8rem;" onclick="reverterPosicao(${col})">REVERTER</button>
         </div>
       </div>
 
-      <!-- PROJEÇÃO DE RISCO QUANTITATIVO (SL / BE / TP / ATR) -->
-      <div class="risk-proj-box">
-        <div style="display:flex; justify-content:space-between; color:var(--text-muted); margin-bottom:4px; font-size:0.7rem;">
+      <!-- RODAPÉ: BLOCO DE RISCO QUANTITATIVO BEM DIMENSIONADO -->
+      <div class="risk-card">
+        <div class="risk-meta-row">
           <span>Alav Sugerida: <b id="proj-alav-${col}" style="color:var(--gold);">--x</b></span>
-          <span>Entrada: <b style="color:#fff;">10 USDT</b></span>
+          <span>Entrada Projetada: <b id="proj-entry-${col}" style="color:#FFF;">$--</b></span>
         </div>
-        <div style="display:flex; justify-content:space-between; font-family:monospace; font-size:0.7rem;">
-          <span style="color:var(--red);">SL: <span id="proj-sl-${col}">--</span></span>
-          <span style="color:var(--blue);">BE: <span id="proj-be-${col}">--</span></span>
-          <span style="color:var(--green);">TP: <span id="proj-tp-${col}">--</span></span>
+
+        <div class="range-group">
+          <label>Alavancagem Manual</label>
+          <input type="range" id="alav-${col}" min="1" max="5" value="3" oninput="document.getElementById('alav-val-${col}').innerText = this.value + 'x'">
+          <span id="alav-val-${col}">3x</span>
+        </div>
+        
+        <div class="input-group" style="margin-bottom: 14px;">
+          <input type="number" id="val-${col}" placeholder="Tamanho (USDT)" value="10" style="font-size:1.05rem; padding:12px;">
+        </div>
+
+        <!-- TARGETS EM 3 BOXES BEM DISTRIBUÍDAS -->
+        <div class="targets-grid">
+          <div class="target-box target-sl">
+            <div class="target-title">STOP LOSS (1.8x ATR)</div>
+            <div class="target-val" id="proj-sl-${col}">--</div>
+          </div>
+          <div class="target-box target-be">
+            <div class="target-title">BREAKEVEN (+0.25%)</div>
+            <div class="target-val" id="proj-be-${col}">--</div>
+          </div>
+          <div class="target-box target-tp">
+            <div class="target-title">TAKE PROFIT (1:2 R:R)</div>
+            <div class="target-val" id="proj-tp-${col}">--</div>
+          </div>
         </div>
       </div>
 
-      <div class="range-group">
-        <label>Alavancagem</label>
-        <input type="range" id="alav-${col}" min="1" max="5" value="3" oninput="document.getElementById('alav-val-${col}').innerText = this.value + 'x'">
-        <span id="alav-val-${col}">3x</span>
-      </div>
-      
-      <div class="input-group" style="margin-bottom: 10px;">
-        <input type="number" id="val-${col}" placeholder="Tamanho (USDT)" value="10" style="font-size:1rem; padding:10px;">
-      </div>
-
-      <!-- MÉTRICAS DO RODAPÉ: TAKER RATIO, Δ OI (15m), FUND -->
-      <div class="card-footer-metrics">
-        <div>Taker: <span id="gauge-taker-${col}" style="color:#FFF; font-weight:bold;">--</span></div>
-        <div>Δ OI: <span id="gauge-delta-oi-${col}" style="color:#FFF; font-weight:bold;">--</span></div>
-        <div>Fund: <span id="gauge-fund-${col}" style="color:#FFF; font-weight:bold;">--</span></div>
-      </div>
-
+      <!-- BOTÕES DE AÇÃO -->
       <div class="actions">
         <button class="btn-buy" onclick="execTrade(${col}, 'BUY')">COMPRAR (LONG)</button>
         <button class="btn-sell" onclick="execTrade(${col}, 'SELL')">VENDER (SHORT)</button>
       </div>
 
-      <button onclick="consultarIaManual(${col})" class="btn-ia-advise" style="width:100%; margin-bottom:8px; padding:10px; background:rgba(212,175,55,0.15); border:1px solid var(--gold); color:var(--gold); border-radius:8px; font-size:0.75rem; font-weight:bold; cursor:pointer;">
+      <button onclick="consultarIaManual(${col})" class="btn-ia-advise">
         ⚡ AUXÍLIO DE IA (GEMINI FLASH)
       </button>
 
@@ -1577,8 +1625,6 @@ app.get('/api/historico', async (req, res) => {
 }
 
 app.get('/', (req, res) => {
-
-
   res.send(`<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -1588,91 +1634,200 @@ app.get('/', (req, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <style>
     :root {
-      --bg: #050814;
-      --card-bg: #0c0e15;
+      --bg: #070a13;
+      --card-bg: #0d111c;
+      --card-border: rgba(255, 255, 255, 0.10);
       --border: rgba(255, 255, 255, 0.08);
       --text: #F8FAFC;
-      --text-muted: #64748B;
+      --text-muted: #94A3B8;
       --green: #10B981;
       --red: #EF4444;
-      --blue: #3B82F6;
+      --blue: #38BDF8;
       --gold: #D4AF37;
+      --purple: #A78BFA;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
-    body { background-color: var(--bg); color: var(--text); padding: 10px; }
+    body { background-color: var(--bg); color: var(--text); padding: 12px; min-height: 100vh; }
+    .container { max-width: 1280px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
     
-    .header-bar { max-width: 1000px; margin: 0 auto 10px; display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.4); border: 1px solid var(--border); padding: 10px 15px; border-radius: 12px; }
-    .header-info { display: flex; gap: 15px; align-items: center; }
+    /* PAINEL DE RESUMO DE DESEMPENHO NO TOPO */
+    .perf-header-bar {
+      background: linear-gradient(180deg, rgba(16,21,35,0.9) 0%, rgba(10,13,23,0.95) 100%);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 14px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 14px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+    }
+    .header-stat-group { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+    .stat-box { display: flex; flex-direction: column; gap: 3px; }
+    .stat-label { font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
+    .stat-value-gold { font-size: 1.45rem; font-weight: 800; color: var(--gold); letter-spacing: 0.5px; }
+    .stat-sub { font-size: 0.8rem; color: var(--blue); font-weight: 600; }
+
+    /* PLACAR DE TRADES NOVO E RESUMIDO */
+    .placar-box {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(0,0,0,0.4);
+      border: 1px solid var(--border);
+      padding: 6px 14px;
+      border-radius: 10px;
+    }
+    .badge-win { font-size: 0.95rem; font-weight: 800; color: var(--green); background: rgba(16,185,129,0.18); border: 1px solid rgba(16,185,129,0.35); padding: 4px 10px; border-radius: 6px; }
+    .badge-loss { font-size: 0.95rem; font-weight: 800; color: var(--red); background: rgba(239,68,68,0.18); border: 1px solid rgba(239,68,68,0.35); padding: 4px 10px; border-radius: 6px; }
+    .badge-wr { font-size: 0.75rem; font-weight: 700; color: var(--gold); background: rgba(212,175,55,0.15); border: 1px solid rgba(212,175,55,0.3); padding: 3px 8px; border-radius: 5px; }
+    .btn-zerar { padding: 4px 8px; font-size: 0.7rem; background: rgba(255,255,255,0.08); border: 1px solid var(--border); color: var(--text-muted); border-radius: 5px; cursor: pointer; font-weight: 700; transition: 0.2s; }
+    .btn-zerar:hover { background: rgba(255,255,255,0.15); color: #FFF; }
+
     .header-btns { display: flex; gap: 8px; }
-    .header-btns button { padding: 6px 12px; font-size: 0.75rem; background: rgba(255,255,255,0.05); border: 1px solid var(--border); color: var(--text); border-radius: 6px; cursor: pointer; }
+    .header-btns button { padding: 8px 14px; font-size: 0.8rem; background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--text); border-radius: 8px; cursor: pointer; font-weight: 600; transition: 0.2s; }
+    .header-btns button:hover { background: rgba(255,255,255,0.12); border-color: rgba(255,255,255,0.2); }
 
-    /* CARROSSEL SUPERIOR COM BUG DE TEXTO CORRIGIDO (ETAPA 2) */
-    .volatility-bar { max-width: 1000px; margin: 0 auto 10px; display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px; scrollbar-width: thin; scrollbar-color: var(--gold) rgba(0,0,0,0.3); }
-    .volatility-bar::-webkit-scrollbar { height: 4px; }
+    /* CARROSSEL SUPERIOR DE MOEDAS */
+    .volatility-bar { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 6px; scrollbar-width: thin; scrollbar-color: var(--gold) rgba(0,0,0,0.3); }
+    .volatility-bar::-webkit-scrollbar { height: 5px; }
     .volatility-bar::-webkit-scrollbar-thumb { background: var(--gold); border-radius: 4px; }
-    .vol-item { flex-shrink: 0; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; background: rgba(0,0,0,0.4); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 0.75rem; cursor: pointer; transition: 0.2s; }
-    .vol-item:hover { border-color: var(--gold); background: rgba(212, 175, 55, 0.1); }
-    .vol-item .sym { font-weight: bold; color: var(--text); }
-    .vol-item .pct { font-weight: bold; }
+    .vol-item { flex-shrink: 0; display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; background: rgba(13,17,28,0.85); border: 1px solid var(--border); border-radius: 8px; padding: 7px 12px; font-size: 0.82rem; cursor: pointer; transition: 0.2s; font-weight: 700; }
+    .vol-item:hover { border-color: var(--gold); background: rgba(212, 175, 55, 0.12); transform: translateY(-1px); }
+    .vol-item .sym { color: var(--text); }
+    .vol-item .pct { font-weight: 800; }
 
-    .bot-control-bar { max-width: 1000px; margin: 0 auto 10px; background: rgba(0,0,0,0.35); border: 1px solid var(--border); border-radius: 10px; padding: 10px 15px; display: flex; flex-direction: column; gap: 8px; }
-    .bot-control-top { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+    /* BARRA DE CONTROLE DO ROBÔ AUTÔNOMO */
+    .bot-control-bar {
+      background: linear-gradient(180deg, rgba(13,17,28,0.9) 0%, rgba(9,12,20,0.95) 100%);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 12px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .bot-control-top { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
 
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; max-width: 1000px; margin: 0 auto; }
-    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 14px; padding: 14px; transition: border-color 0.3s; position: relative; }
-    .card.active { border-color: rgba(212, 175, 55, 0.5); box-shadow: 0 0 15px rgba(212, 175, 55, 0.05); }
+    /* GRELHA DOS CARTÕES (EXPANDIDA E ESPAÇADA) */
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .card {
+      background: linear-gradient(180deg, #0e121e 0%, #080b14 100%);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 18px;
+      transition: all 0.3s;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.35);
+    }
+    .card.active { border-color: rgba(212, 175, 55, 0.55); box-shadow: 0 0 25px rgba(212, 175, 55, 0.1); }
 
-    .input-group { margin-bottom: 8px; }
-    .input-group input { width: 100%; background: rgba(0,0,0,0.3); border: 1px solid var(--border); color: var(--gold); font-size: 0.95rem; padding: 8px; border-radius: 6px; outline: none; text-transform: uppercase; text-align: center; font-weight: bold; }
-    .price-display { font-size: 1.25rem; text-align: center; margin: 2px 0 8px; font-weight: 200; color: var(--text); letter-spacing: 1px; }
+    /* CARD HEADER */
+    .card-top-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+    .coin-input-group { display: flex; align-items: center; gap: 8px; flex: 1; max-width: 250px; }
+    .coin-input-group input {
+      width: 100%;
+      background: rgba(0,0,0,0.4);
+      border: 1px solid var(--border);
+      color: var(--gold);
+      font-size: 1.15rem;
+      padding: 10px 12px;
+      border-radius: 8px;
+      outline: none;
+      text-transform: uppercase;
+      font-weight: 800;
+      letter-spacing: 1px;
+    }
+    .coin-input-group input:focus { border-color: var(--gold); box-shadow: 0 0 10px rgba(212,175,55,0.2); }
+    .pct-badge { font-size: 0.82rem; font-weight: 800; padding: 4px 8px; border-radius: 6px; background: rgba(255,255,255,0.06); }
 
-    .mtf-box { background: rgba(0,0,0,0.25); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
-    .badge-mtf { font-size: 0.65rem; font-weight: bold; padding: 2px 6px; border-radius: 4px; background: rgba(255,255,255,0.08); color: var(--text-muted); }
-    .candles-row { display: flex; justify-content: space-between; background: rgba(0,0,0,0.2); border-radius: 6px; border: 1px solid var(--border); }
-    .candle { display: flex; flex-direction: column; align-items: center; gap: 4px; }
-    .candle-label { font-size: 0.65rem; color: var(--text-muted); font-weight: 500; }
-    .dot { width: 9px; height: 9px; border-radius: 50%; background: #334155; }
-    .dot.green { background: var(--green); box-shadow: 0 0 6px rgba(16, 185, 129, 0.5); }
-    .dot.red { background: var(--red); box-shadow: 0 0 6px rgba(239, 68, 68, 0.5); }
+    .modo-badge {
+      font-size: 0.8rem;
+      font-weight: 800;
+      padding: 5px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.05);
+      color: var(--text-muted);
+      letter-spacing: 0.5px;
+      text-align: right;
+    }
 
-    .flow-panel { background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 10px; font-size: 0.75rem; }
-    .flow-title { font-size: 0.65rem; color: var(--gold); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; border-bottom: 1px solid rgba(212,175,55,0.2); padding-bottom: 4px; }
-    .flow-row { display: flex; justify-content: space-between; margin-bottom: 6px; }
+    /* PREÇO */
+    .price-display { font-size: 1.85rem; text-align: center; font-weight: 800; color: var(--text); letter-spacing: 1px; margin: 2px 0; }
 
-    .setup-quality-box { background: rgba(0,0,0,0.2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+    /* MTF BOX */
+    .mtf-box { background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; }
+    .mtf-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .mtf-title { font-size: 0.72rem; color: var(--text-muted); font-weight: 700; letter-spacing: 1px; text-transform: uppercase; }
+    .badge-mtf { font-size: 0.75rem; font-weight: 800; padding: 3px 8px; border-radius: 5px; background: rgba(255,255,255,0.08); color: var(--gold); }
+    .candles-row { display: flex; justify-content: space-around; background: rgba(0,0,0,0.25); border-radius: 8px; border: 1px solid var(--border); padding: 8px 12px; }
+    .candle { display: flex; flex-direction: column; align-items: center; gap: 5px; }
+    .candle-label { font-size: 0.72rem; color: var(--text-muted); font-weight: 600; }
+    .dot { width: 12px; height: 12px; border-radius: 50%; background: #334155; transition: 0.3s; }
+    .dot.green { background: var(--green); box-shadow: 0 0 8px rgba(16, 185, 129, 0.6); }
+    .dot.red { background: var(--red); box-shadow: 0 0 8px rgba(239, 68, 68, 0.6); }
 
-    .risk-proj-box { background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
+    /* ESTRUTURA & FLUXO INSTITUCIONAL */
+    .flow-panel { background: rgba(0,0,0,0.35); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; font-size: 0.85rem; }
+    .flow-title { font-size: 0.72rem; color: var(--gold); font-weight: 800; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; border-bottom: 1px solid rgba(212,175,55,0.2); padding-bottom: 5px; }
+    .flow-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; margin-bottom: 10px; }
+    .flow-cell { display: flex; justify-content: space-between; align-items: center; }
+    .cell-label { color: var(--text-muted); font-size: 0.8rem; }
+    .cell-val { font-weight: 700; color: #FFF; font-size: 0.85rem; }
+    .text-gold { color: var(--gold) !important; }
 
-    .range-group { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; background: rgba(0,0,0,0.2); padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); }
-    .range-group label { flex: 1; font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; }
+    .compass-row { display: flex; justify-content: space-between; align-items: center; border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 8px; }
+    .compass-label { font-size: 0.78rem; color: var(--text-muted); font-weight: 600; text-transform: uppercase; }
+    .compass-val { font-size: 0.95rem; font-weight: 800; }
+
+    /* BLOCO DE RISCO QUANTITATIVO BEM DIMENSIONADO */
+    .risk-card { background: rgba(0,0,0,0.4); border: 1px solid var(--card-border); border-radius: 12px; padding: 14px 16px; }
+    .risk-meta-row { display: flex; justify-content: space-between; color: var(--text-muted); font-size: 0.82rem; margin-bottom: 10px; font-weight: 600; }
+    .range-group { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); }
+    .range-group label { flex: 1; font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }
     .range-group input[type="range"] { flex: 2; accent-color: var(--gold); }
-    .range-group span { font-size: 0.9rem; color: var(--gold); font-weight: bold; width: 30px; text-align: right; }
+    .range-group span { font-size: 0.95rem; color: var(--gold); font-weight: 800; width: 35px; text-align: right; }
 
-    .card-footer-metrics { display: flex; justify-content: space-between; font-size: 0.65rem; color: var(--text-muted); margin-bottom: 10px; padding: 0 4px; text-transform: uppercase; }
+    .input-group input { width: 100%; background: rgba(0,0,0,0.3); border: 1px solid var(--border); color: var(--gold); font-size: 1.05rem; padding: 10px; border-radius: 8px; outline: none; text-align: center; font-weight: 700; }
 
-    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
-    button { padding: 12px; border: none; border-radius: 8px; font-size: 0.8rem; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; color: white; cursor: pointer; transition: 0.2s; outline: none; }
-    button:active { transform: scale(0.96); }
-    .btn-buy { background: linear-gradient(135deg, #059669 0%, #10B981 100%); }
-    .btn-sell { background: linear-gradient(135deg, #DC2626 0%, #EF4444 100%); }
+    .targets-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+    .target-box { padding: 8px; border-radius: 8px; text-align: center; font-family: monospace; }
+    .target-title { font-size: 0.65rem; font-weight: 700; text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.5px; }
+    .target-val { font-size: 0.82rem; font-weight: 800; }
+    .target-sl { background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.3); color: var(--red); }
+    .target-be { background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.3); color: var(--blue); }
+    .target-tp { background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3); color: var(--green); }
+
+    /* BOTÕES */
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    button { padding: 14px; border: none; border-radius: 10px; font-size: 0.85rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; color: white; cursor: pointer; transition: 0.2s; outline: none; }
+    button:active { transform: scale(0.97); }
+    .btn-buy { background: linear-gradient(135deg, #059669 0%, #10B981 100%); box-shadow: 0 4px 12px rgba(16, 185, 129, 0.25); }
+    .btn-sell { background: linear-gradient(135deg, #DC2626 0%, #EF4444 100%); box-shadow: 0 4px 12px rgba(239, 68, 68, 0.25); }
     .btn-close { background: linear-gradient(135deg, #F59E0B 0%, #D97706 100%); }
     .btn-reverse { background: linear-gradient(135deg, #8B5CF6 0%, #6D28D9 100%); }
+    .btn-ia-advise { width: 100%; padding: 12px; background: rgba(212,175,55,0.15); border: 1px solid var(--gold); color: var(--gold); border-radius: 10px; font-size: 0.8rem; font-weight: 800; cursor: pointer; transition: 0.2s; }
+    .btn-ia-advise:hover { background: rgba(212,175,55,0.25); }
 
-    .pos-card { background: rgba(0,0,0,0.4); border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-bottom: 12px; display: none; }
-    .pos-header { display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 5px; }
-    .pos-pnl { font-size: 1.2rem; font-weight: bold; text-align: center; margin: 4px 0; }
-    .status { text-align: center; font-size: 0.75rem; color: var(--text-muted); min-height: 1.2rem; }
+    .pos-card { background: rgba(0,0,0,0.5); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 12px; padding: 14px; display: none; }
+    .pos-header { display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 6px; }
+    .pos-pnl { font-size: 1.45rem; font-weight: 800; text-align: center; margin: 4px 0; }
+    .status { text-align: center; font-size: 0.82rem; color: var(--text-muted); min-height: 1.4rem; font-weight: 600; }
 
-    .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); backdrop-filter: blur(5px); display: none; justify-content: center; align-items: center; z-index: 999; }
-    .modal { background: var(--bg); border: 1px solid var(--border); border-radius: 16px; width: 90%; max-width: 600px; max-height: 80vh; overflow-y: auto; padding: 20px; }
-    .modal-head { display: flex; justify-content: space-between; margin-bottom: 15px; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
-    .day-block { margin-bottom: 12px; background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; border: 1px solid var(--border); }
-    .day-title { display: flex; justify-content: space-between; color: var(--gold); margin-bottom: 8px; font-weight: bold; }
-    .trade-row { display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 4px; border-bottom: 1px dashed rgba(255,255,255,0.08); padding-bottom: 4px; }
+    .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); backdrop-filter: blur(6px); display: none; justify-content: center; align-items: center; z-index: 999; }
+    .modal { background: var(--bg); border: 1px solid var(--card-border); border-radius: 16px; width: 90%; max-width: 650px; max-height: 82vh; overflow-y: auto; padding: 22px; }
+    .modal-head { display: flex; justify-content: space-between; margin-bottom: 16px; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+    .trade-row { display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 6px; border-bottom: 1px dashed rgba(255,255,255,0.08); padding-bottom: 6px; }
 
-    @media (max-width: 700px) {
+    @media (max-width: 820px) {
       .grid { grid-template-columns: 1fr; }
-      .header-bar { flex-direction: column; gap: 8px; text-align: center; }
+      .perf-header-bar { flex-direction: column; text-align: center; }
+      .header-stat-group { justify-content: center; }
     }
   </style>
 </head>
@@ -1680,12 +1835,12 @@ app.get('/', (req, res) => {
 
   <!-- MODAL DE CONFIRMAÇÃO ESTÉTICO -->
   <div class="modal-overlay" id="modal-confirm">
-    <div class="modal" style="max-width: 400px; text-align: center;">
-      <h3 id="modal-confirm-title" style="color: var(--gold); margin-bottom: 15px; font-size: 1.2rem;">Confirmação</h3>
+    <div class="modal" style="max-width: 420px; text-align: center;">
+      <h3 id="modal-confirm-title" style="color: var(--gold); margin-bottom: 15px; font-size: 1.25rem;">Confirmação</h3>
       <div id="modal-confirm-body" style="color: var(--text); font-size: 0.95rem; margin-bottom: 25px; line-height: 1.5;"></div>
       <div style="display: flex; gap: 10px; justify-content: center;" id="modal-confirm-actions">
-        <button id="modal-btn-cancel" style="flex: 1; padding: 10px; background: rgba(255,255,255,0.1); color: var(--text); border: 1px solid var(--border); border-radius: 8px; font-weight: bold; cursor: pointer;">CANCELAR</button>
-        <button id="modal-btn-ok" style="flex: 1; padding: 10px; background: var(--gold); color: #000; border: none; border-radius: 8px; font-weight: bold; cursor: pointer;">CONFIRMAR</button>
+        <button id="modal-btn-cancel" style="flex: 1; padding: 12px; background: rgba(255,255,255,0.1); color: var(--text); border: 1px solid var(--border); border-radius: 8px; font-weight: bold; cursor: pointer;">CANCELAR</button>
+        <button id="modal-btn-ok" style="flex: 1; padding: 12px; background: var(--gold); color: #000; border: none; border-radius: 8px; font-weight: bold; cursor: pointer;">CONFIRMAR</button>
       </div>
     </div>
   </div>
@@ -1695,72 +1850,81 @@ app.get('/', (req, res) => {
     <div class="modal">
       <div class="modal-head">
         <h3 style="color: var(--gold);">Histórico de Ordens</h3>
-        <button onclick="fecharHistorico()" style="background:transparent; border:none; color:var(--text-muted); font-size:1.2rem; cursor:pointer;">&times;</button>
+        <button onclick="fecharHistorico()" style="background:transparent; border:none; color:var(--text-muted); font-size:1.4rem; cursor:pointer;">&times;</button>
       </div>
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; flex-wrap:wrap; gap:10px;">
-        <div style="display:flex; gap:6px;">
-          <button id="btn-tab-periodo" onclick="mudarAbaHist('periodo')" style="padding:6px 12px; font-size:0.75rem; background:var(--gold); color:#000; border-radius:6px; font-weight:bold; cursor:pointer;">Agrupado</button>
-          <button id="btn-tab-hoje" onclick="mudarAbaHist('hoje')" style="padding:6px 12px; font-size:0.75rem; background:rgba(255,255,255,0.08); color:var(--text); border-radius:6px; cursor:pointer;">Hoje</button>
-          <button id="btn-tab-todas" onclick="mudarAbaHist('todas')" style="padding:6px 12px; font-size:0.75rem; background:rgba(255,255,255,0.08); color:var(--text); border-radius:6px; cursor:pointer;">Todas</button>
+        <div style="display:flex; gap:8px;">
+          <button id="btn-tab-periodo" onclick="mudarAbaHist('periodo')" style="padding:7px 14px; font-size:0.8rem; background:var(--gold); color:#000; border-radius:6px; font-weight:bold; cursor:pointer;">Agrupado</button>
+          <button id="btn-tab-hoje" onclick="mudarAbaHist('hoje')" style="padding:7px 14px; font-size:0.8rem; background:rgba(255,255,255,0.08); color:var(--text); border-radius:6px; cursor:pointer;">Hoje</button>
+          <button id="btn-tab-todas" onclick="mudarAbaHist('todas')" style="padding:7px 14px; font-size:0.8rem; background:rgba(255,255,255,0.08); color:var(--text); border-radius:6px; cursor:pointer;">Todas</button>
         </div>
       </div>
       <div id="hist-content">Carregando...</div>
     </div>
   </div>
 
-  <div class="header-bar">
-    <div class="header-info">
-      <div>
-        <div style="font-size:0.7rem; color:var(--text-muted); text-transform:uppercase;">Saldo Futuros</div>
-        <div style="font-size:1.1rem; font-weight:bold; color:var(--gold);" id="saldo-total">$ 0.00</div>
-      </div>
-      <div>
-        <div style="font-size:0.7rem; color:var(--text-muted); text-transform:uppercase;">Tokens Gastos</div>
-        <div style="font-size:0.9rem; font-weight:bold; color:#A78BFA;" id="total-tokens-val">0</div>
-      </div>
-    </div>
+  <div class="container">
     
-    <!-- PLACAR DE TRADES (SEM DOBRADINHA) -->
-    <div style="display:flex; align-items:center; gap:8px; background:rgba(0,0,0,0.35); border:1px solid var(--border); padding:5px 10px; border-radius:8px;">
-       <span style="font-size:0.7rem; color:var(--text-muted); text-transform:uppercase;">Trades:</span>
-       <span id="placar-wins" style="font-size:0.85rem; font-weight:bold; color:var(--green); background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.3); padding:2px 6px; border-radius:5px;">0 W</span>
-       <span style="color:var(--text-muted); font-size:0.75rem;">/</span>
-       <span id="placar-losses" style="font-size:0.85rem; font-weight:bold; color:var(--red); background:rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.3); padding:2px 6px; border-radius:5px;">0 L</span>
-       <button onclick="zerarPlacar()" style="padding:2px 6px; font-size:0.65rem; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); color:var(--text-muted); border-radius:4px; margin-left:4px; cursor:pointer;">ZERAR</button>
-    </div>
+    <!-- PAINEL DE RESUMO DE DESEMPENHO INSTITUCIONAL -->
+    <div class="perf-header-bar">
+      <div class="header-stat-group">
+        <div class="stat-box">
+          <span class="stat-label">Saldo Futuros (Testnet)</span>
+          <span class="stat-value-gold" id="saldo-total">$ 0.00</span>
+          <span class="stat-sub" id="saldo-brl">R$ 0,00</span>
+        </div>
 
-    <div class="header-btns">
-      <button onclick="carregarSaldo()">Atualizar</button>
-      <button onclick="abrirHistorico()">Histórico</button>
-      <button onclick="fazerLogout()">Sair</button>
-    </div>
-  </div>
+        <!-- PLACAR DE ACERTOS / ERROS COM WIN RATE REAL -->
+        <div class="placar-box">
+          <span class="stat-label" style="margin-right:4px;">Trades:</span>
+          <span class="badge-win" id="placar-wins">0 W</span>
+          <span style="color:var(--text-muted); font-weight:bold;">/</span>
+          <span class="badge-loss" id="placar-losses">0 L</span>
+          <span class="badge-wr" id="placar-wr">0% WR</span>
+          <button class="btn-zerar" onclick="zerarPlacar()" title="Zerar contadores">ZERAR</button>
+        </div>
 
-  <!-- BARRA DE MOEDAS VOLÁTEIS (FILTRADA E COM CSS CORRIGIDO) -->
-  <div class="volatility-bar" id="vol-bar"></div>
-
-  <!-- BARRA DE CONTROLE DO ROBÔ AUTÔNOMO -->
-  <div class="bot-control-bar">
-    <div class="bot-control-top">
-      <div style="display:flex; align-items:center; gap:10px;">
-        <button id="btn-auto-toggle" onclick="toggleAutoBot()" style="padding:8px 14px; font-size:0.75rem; border-radius:8px; border:1px solid var(--green); background:rgba(16, 185, 129, 0.2); color:var(--green); cursor:pointer;">
-          LIGAR ROBÔ IA
-        </button>
-        <span id="auto-status-text" style="font-size:0.8rem; color:var(--text-muted); font-weight:bold;">Robô Desligado</span>
+        <div class="stat-box">
+          <span class="stat-label">Tokens Gastos</span>
+          <span style="font-size:1.15rem; font-weight:800; color:var(--purple);" id="total-tokens-val">0</span>
+        </div>
       </div>
-      <div style="display:flex; align-items:center; gap:8px;">
-        <span style="font-size:0.75rem; color:var(--text-muted);">Memória RAG:</span>
-        <span id="auto-rag-badge" style="font-size:0.75rem; color:var(--gold); font-weight:bold; background:rgba(212, 175, 55, 0.15); border:1px solid rgba(212, 175, 55, 0.3); padding:2px 8px; border-radius:5px;">0 trades</span>
+
+      <div class="header-btns">
+        <button onclick="carregarSaldo()">Atualizar</button>
+        <button onclick="abrirHistorico()">Histórico</button>
+        <button onclick="fazerLogout()">Sair</button>
       </div>
     </div>
-    <div style="font-size:0.7rem; color:var(--text-muted); font-family:monospace; background:rgba(0,0,0,0.2); padding:6px 10px; border-radius:6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" id="auto-log-text">
-      Nenhum evento registrado.
-    </div>
-  </div>
 
-  <div class="grid">
-    ${renderColHTML(1)}
-    ${renderColHTML(2)}
+    <!-- CARROSSEL SUPERIOR DE MOEDAS VOLÁTEIS -->
+    <div class="volatility-bar" id="vol-bar"></div>
+
+    <!-- BARRA DE CONTROLE DO ROBÔ AUTÔNOMO -->
+    <div class="bot-control-bar">
+      <div class="bot-control-top">
+        <div style="display:flex; align-items:center; gap:12px;">
+          <button id="btn-auto-toggle" onclick="toggleAutoBot()" style="padding:10px 18px; font-size:0.85rem; border-radius:8px; border:1px solid var(--green); background:rgba(16, 185, 129, 0.2); color:var(--green); cursor:pointer; font-weight:800;">
+            LIGAR ROBÔ IA
+          </button>
+          <span id="auto-status-text" style="font-size:0.9rem; color:var(--text-muted); font-weight:bold;">Robô Desligado</span>
+        </div>
+        <div style="display:flex; align-items:center; gap:10px;">
+          <span style="font-size:0.8rem; color:var(--text-muted);">Memória RAG:</span>
+          <span id="auto-rag-badge" style="font-size:0.8rem; color:var(--gold); font-weight:bold; background:rgba(212, 175, 55, 0.15); border:1px solid rgba(212, 175, 55, 0.35); padding:3px 10px; border-radius:6px;">0 trades</span>
+        </div>
+      </div>
+      <div style="font-size:0.78rem; color:var(--text-muted); font-family:monospace; background:rgba(0,0,0,0.3); padding:8px 12px; border-radius:8px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border:1px solid var(--border);" id="auto-log-text">
+        Nenhum evento registrado.
+      </div>
+    </div>
+
+    <!-- GRELHA DOS CARTÕES (1 E 2) -->
+    <div class="grid">
+      ${renderColHTML(1)}
+      ${renderColHTML(2)}
+    </div>
+
   </div>
 
   <script>
@@ -1810,7 +1974,9 @@ app.get('/', (req, res) => {
         const data = await res.json();
         if (data.success) {
           saldoGlobal = typeof data.saldo === 'number' ? data.saldo : (data.saldo?.total || 0);
+          brlGlobal = data.brl || 5.20;
           document.getElementById('saldo-total').innerText = '$ ' + saldoGlobal.toFixed(2);
+          document.getElementById('saldo-brl').innerText = 'R$ ' + (saldoGlobal * brlGlobal).toFixed(2);
         }
       } catch (e) {}
     }
@@ -1825,10 +1991,10 @@ app.get('/', (req, res) => {
             const pct = parseFloat(item.priceChangePercent);
             const cor = pct >= 0 ? 'var(--green)' : 'var(--red)';
             const sinal = pct >= 0 ? '+' : '';
-            html += \`<div class="vol-item" onclick="aplicarMoeda('\${item.symbol}')">
-              <span class="sym">\${item.symbol.replace('USDT','')}</span>
-              <span class="pct" style="color:\${cor};">\${sinal}\${pct.toFixed(1)}%</span>
-            </div>\`;
+            html += '<div class="vol-item" onclick="aplicarMoeda(\'' + item.symbol + '\')">' +
+              '<span class="sym">' + item.symbol.replace('USDT','') + '</span>' +
+              '<span class="pct" style="color:' + cor + ';">' + sinal + pct.toFixed(1) + '%</span>' +
+            '</div>';
           });
           document.getElementById('vol-bar').innerHTML = html;
         }
@@ -1874,6 +2040,16 @@ app.get('/', (req, res) => {
         document.getElementById('status-' + col).style.color = "var(--green)";
         document.getElementById('price-' + col).innerText = "$ " + parseFloat(data.preco).toFixed(4);
 
+        // Variação 24h
+        const pctEl = document.getElementById('pct-24h-' + col);
+        if (pctEl) {
+          const p24 = parseFloat(data.priceChangePercent || 0);
+          const corP24 = p24 >= 0 ? 'var(--green)' : 'var(--red)';
+          pctEl.innerText = (p24 >= 0 ? '+' : '') + p24.toFixed(1) + '%';
+          pctEl.style.color = corP24;
+          pctEl.style.borderColor = corP24;
+        }
+
         // Atualiza Dots MTF (4h, 1h, 15m, 5m)
         ['4h','1h','15m','5m'].forEach(tf => {
           const dot = document.getElementById('dot-' + col + '-' + tf);
@@ -1901,9 +2077,12 @@ app.get('/', (req, res) => {
         const trendEl = document.getElementById('trend-' + col);
         const scoreSign = (data.directionalScore > 0 ? '+' : '');
         let scoreColor = 'var(--text-muted)';
-        if (data.directionalScore >= 55) scoreColor = 'var(--green)';
-        else if (data.directionalScore <= -55) scoreColor = 'var(--red)';
-        trendEl.innerHTML = '<span style="color:' + scoreColor + '; font-weight:bold;">' + scoreSign + (data.directionalScore || 0) + '</span>';
+        let scoreTag = 'NEUTRO';
+        if (data.directionalScore >= 55) { scoreColor = 'var(--green)'; scoreTag = 'COMPRA FORTE'; }
+        else if (data.directionalScore <= -55) { scoreColor = 'var(--red)'; scoreTag = 'VENDA FORTE'; }
+        else if (data.directionalScore > 20) { scoreColor = 'var(--green)'; scoreTag = 'COMPRA LEVE'; }
+        else if (data.directionalScore < -20) { scoreColor = 'var(--red)'; scoreTag = 'VENDA LEVE'; }
+        trendEl.innerHTML = '<span style="color:' + scoreColor + '; font-weight:800;">' + scoreSign + (data.directionalScore || 0) + ' [' + scoreTag + ']</span>';
 
         // Badge do Modo Ativo
         const modoBadge = document.getElementById('modo-badge-' + col);
@@ -1915,18 +2094,19 @@ app.get('/', (req, res) => {
             else if (data.modoDetectado === 'EXAUSTAO_REVERSAO') corModo = 'var(--red)';
             modoBadge.innerText = '[MODO: ' + data.modoLabel + ']';
             modoBadge.style.color = corModo;
-            modoBadge.style.border = '1px solid ' + corModo;
+            modoBadge.style.borderColor = corModo;
             modoBadge.style.background = 'rgba(255,255,255,0.06)';
           } else {
             modoBadge.innerText = '[SEM SETUP ATIVO]';
             modoBadge.style.color = 'var(--text-muted)';
-            modoBadge.style.border = '1px solid var(--border)';
+            modoBadge.style.borderColor = 'var(--border)';
             modoBadge.style.background = 'transparent';
           }
         }
 
-        // Projeção de Risco
+        // Projeção de Risco Quantitativo
         document.getElementById('proj-alav-' + col).innerText = (data.leverageSugerida || 3) + 'x';
+        document.getElementById('proj-entry-' + col).innerText = '$ ' + parseFloat(data.preco).toFixed(4);
         document.getElementById('proj-sl-' + col).innerText = '$ ' + (data.slPrice ? data.slPrice.toFixed(4) : '--') + ' (-' + (data.slRoe ? data.slRoe.toFixed(1) : '--') + '%)';
         document.getElementById('proj-be-' + col).innerText = '$ ' + (data.beTriggerPrice ? data.beTriggerPrice.toFixed(4) : '--') + ' (+' + (data.beTriggerPctReal ? data.beTriggerPctReal.toFixed(2) : '--') + '%)';
         document.getElementById('proj-tp-' + col).innerText = '$ ' + (data.tpPrice ? data.tpPrice.toFixed(4) : '--') + ' (+' + (data.tpRoe ? data.tpRoe.toFixed(1) : '--') + '%)';
@@ -1953,7 +2133,7 @@ app.get('/', (req, res) => {
           let roi = margem > 0 ? (pnl / margem) * 100 : 0;
           const sinal = pnl >= 0 ? '+' : '';
           const pnlEl = document.getElementById('pos-pnl-' + col);
-          pnlEl.innerHTML = (pnl >= 0 ? "+$ " : "-$ ") + Math.abs(pnl).toFixed(2) + \` (\${sinal}\${roi.toFixed(2)}%)\`;
+          pnlEl.innerHTML = (pnl >= 0 ? "+$ " : "-$ ") + Math.abs(pnl).toFixed(2) + ' (' + sinal + roi.toFixed(2) + '%)';
           pnlEl.className = "pos-pnl " + (pnl >= 0 ? 'text-green' : 'text-red');
           document.getElementById('pos-pnl-brl-' + col).innerText = 'R$ ' + Math.abs(pnl * brlGlobal).toFixed(2);
           document.getElementById('pos-entry-' + col).innerText = p.precoEntrada.toFixed(4);
@@ -1976,7 +2156,7 @@ app.get('/', (req, res) => {
           const takerEl = document.getElementById('gauge-taker-' + col);
           if (takerEl) {
             const tr = parseFloat(d.takerRatio || 1);
-            takerEl.innerText = tr.toFixed(2) + 'x ' + (tr >= 1 ? '[C]' : '[V]');
+            takerEl.innerText = tr.toFixed(2) + 'x ' + (tr >= 1 ? '[COMPRA]' : '[VENDA]');
             takerEl.style.color = tr >= 1 ? 'var(--green)' : 'var(--red)';
           }
 
@@ -2010,16 +2190,15 @@ app.get('/', (req, res) => {
         const res = await fetch('/api/ia-advise/' + sym);
         const data = await res.json();
         if (data.success) {
-          const html = \`
-            <div style="font-size:1rem; margin-bottom:10px;">Veredito: <b style="color:\${data.decisao === 'LONG' ? 'var(--green)' : (data.decisao === 'SHORT' ? 'var(--red)' : 'var(--gold)')};">\${data.decisao}</b> (\${data.confianca}% confiança)</div>
-            <div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:15px;">\${data.motivo}</div>
-            <div style="font-size:0.8rem; font-family:monospace; background:rgba(0,0,0,0.3); padding:8px; border-radius:6px; text-align:left;">
-              <div>• Alavancagem: \${data.alavancagem}x</div>
-              <div>• Stop Loss: $ \${data.slPrice?.toFixed(4)}</div>
-              <div>• Take Profit: $ \${data.tpPrice?.toFixed(4)}</div>
-              <div>• Breakeven: $ \${data.beTriggerPrice?.toFixed(4)}</div>
-            </div>
-          \`;
+          const corDec = data.decisao === 'LONG' ? 'var(--green)' : (data.decisao === 'SHORT' ? 'var(--red)' : 'var(--gold)');
+          const html = '<div style="font-size:1rem; margin-bottom:10px;">Veredito: <b style="color:' + corDec + ';">' + data.decisao + '</b> (' + data.confianca + '% confiança)</div>' +
+            '<div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:15px;">' + data.motivo + '</div>' +
+            '<div style="font-size:0.8rem; font-family:monospace; background:rgba(0,0,0,0.3); padding:10px; border-radius:8px; text-align:left;">' +
+              '<div>• Alavancagem: ' + data.alavancagem + 'x</div>' +
+              '<div>• Stop Loss: $ ' + (data.slPrice ? data.slPrice.toFixed(4) : '--') + '</div>' +
+              '<div>• Take Profit: $ ' + (data.tpPrice ? data.tpPrice.toFixed(4) : '--') + '</div>' +
+              '<div>• Breakeven: $ ' + (data.beTriggerPrice ? data.beTriggerPrice.toFixed(4) : '--') + '</div>' +
+            '</div>';
           askConfirm("⚡ Análise Institucional", html, true);
           st.innerText = "IA: " + data.decisao + " (" + data.motivo + ")";
         } else {
@@ -2040,12 +2219,10 @@ app.get('/', (req, res) => {
       const txtLado = lado === 'BUY' ? 'COMPRA (LONG)' : 'VENDA (SHORT)';
       const corLado = lado === 'BUY' ? 'var(--green)' : 'var(--red)';
 
-      const html = \`
-        <div style="font-size:1.1rem; margin-bottom:10px;">Ativo: <b style="color:var(--gold);">\${sym}</b></div>
-        <div style="font-size:1.1rem; margin-bottom:10px;">Ordem: <b style="color:\${corLado};">\${txtLado}</b></div>
-        <div style="font-size:1.1rem; margin-bottom:10px;">Alavancagem: <b style="color:var(--text);">\${alav}x</b></div>
-        <div style="font-size:1.1rem; margin-bottom:20px;">Tamanho Total: <b style="color:var(--text);">\${val} USDT</b></div>
-      \`;
+      const html = '<div style="font-size:1.1rem; margin-bottom:10px;">Ativo: <b style="color:var(--gold);">' + sym + '</b></div>' +
+        '<div style="font-size:1.1rem; margin-bottom:10px;">Ordem: <b style="color:' + corLado + ';">' + txtLado + '</b></div>' +
+        '<div style="font-size:1.1rem; margin-bottom:10px;">Alavancagem: <b style="color:var(--text);">' + alav + 'x</b></div>' +
+        '<div style="font-size:1.1rem; margin-bottom:20px;">Tamanho Total: <b style="color:var(--text);">' + val + ' USDT</b></div>';
 
       if (!(await askConfirm('Executar Ordem', html))) return;
 
@@ -2079,7 +2256,7 @@ app.get('/', (req, res) => {
       let sym = document.getElementById('sym-' + col).value.trim().toUpperCase();
       if (!sym.endsWith('USDT')) sym += 'USDT';
 
-      if (!(await askConfirm('Fechar Posição', \`Deseja encerrar 100% da posição de <b style='color:var(--gold);'>\${sym}</b> a mercado?\`))) return;
+      if (!(await askConfirm('Fechar Posição', 'Deseja encerrar 100% da posição de <b style=\'color:var(--gold);\'>' + sym + '</b> a mercado?'))) return;
 
       const st = document.getElementById('status-' + col);
       st.innerText = "Fechando...";
@@ -2096,6 +2273,7 @@ app.get('/', (req, res) => {
           st.style.color = "var(--green)";
           loadData(col);
           carregarSaldo();
+          carregarPlacar();
         } else {
           st.innerText = "Erro: " + data.error;
           st.style.color = "var(--red)";
@@ -2109,7 +2287,7 @@ app.get('/', (req, res) => {
       let sym = document.getElementById('sym-' + col).value.trim().toUpperCase();
       if (!sym.endsWith('USDT')) sym += 'USDT';
 
-      if (!(await askConfirm('Reverter Posição', \`Deseja <b style='color:var(--gold);'>REVERTER</b> a posição de \${sym}?\`))) return;
+      if (!(await askConfirm('Reverter Posição', 'Deseja <b style=\'color:var(--gold);\'>REVERTER</b> a posição de ' + sym + '?'))) return;
 
       const st = document.getElementById('status-' + col);
       st.innerText = "Revertendo...";
@@ -2126,6 +2304,7 @@ app.get('/', (req, res) => {
           st.style.color = "var(--green)";
           loadData(col);
           carregarSaldo();
+          carregarPlacar();
         } else {
           st.innerText = "Erro: " + data.error;
           st.style.color = "var(--red)";
@@ -2135,31 +2314,41 @@ app.get('/', (req, res) => {
       }
     }
 
-    // ── ROBÔ AUTÔNOMO E PLACAR ──────────────────────────────────────────
-    let autoBotActive = false;
-
+    // ── PLACAR INSTITUCIONAL WIN / LOSS EM TEMPO REAL ──
     async function carregarPlacar() {
       try {
         const r = await fetch('/api/win-loss');
         const d = await r.json();
         if (d.success) {
-          document.getElementById('placar-wins').innerText = d.wins + ' W';
-          document.getElementById('placar-losses').innerText = d.losses + ' L';
+          const w = d.wins || 0;
+          const l = d.losses || 0;
+          const tot = w + l;
+          const wr = tot > 0 ? Math.round((w / tot) * 100) : 0;
+          document.getElementById('placar-wins').innerText = w + ' W';
+          document.getElementById('placar-losses').innerText = l + ' L';
+          const wrEl = document.getElementById('placar-wr');
+          if (wrEl) wrEl.innerText = wr + '% WR';
         }
       } catch(e) {}
     }
 
     async function zerarPlacar() {
-      if (!(await askConfirm('Zerar Placar', 'Deseja reiniciar a contagem de acertos e erros a partir de agora?'))) return;
+      if (!(await askConfirm('Zerar Placar', 'Deseja reiniciar a contagem de acertos e erros a partir deste momento?'))) return;
       try {
         const r = await fetch('/api/limpar-placar', { method: 'POST' });
         const d = await r.json();
         if (d.success) {
-          carregarPlacar();
+          document.getElementById('placar-wins').innerText = '0 W';
+          document.getElementById('placar-losses').innerText = '0 L';
+          const wrEl = document.getElementById('placar-wr');
+          if (wrEl) wrEl.innerText = '0% WR';
           askConfirm('✓ Sucesso', 'Placar zerado com sucesso.', true);
         }
       } catch(e) {}
     }
+
+    // ── ROBÔ AUTÔNOMO ──
+    let autoBotActive = false;
 
     async function atualizarStatusAutoBot() {
       try {
@@ -2222,6 +2411,21 @@ app.get('/', (req, res) => {
           if (tokEl && d.tokensGastos !== undefined) {
             tokEl.innerText = Number(d.tokensGastos).toLocaleString('pt-BR');
           }
+
+          // Atualiza placar em tempo real se vier no payload de auto-status
+          if (d.placar) {
+            const w = d.placar.wins || 0;
+            const l = d.placar.losses || 0;
+            const tot = w + l;
+            const wr = tot > 0 ? Math.round((w / tot) * 100) : 0;
+            const wEl = document.getElementById('placar-wins');
+            const lEl = document.getElementById('placar-losses');
+            const wrEl = document.getElementById('placar-wr');
+            if (wEl) wEl.innerText = w + ' W';
+            if (lEl) lEl.innerText = l + ' L';
+            if (wrEl) wrEl.innerText = wr + '% WR';
+          }
+
           carregarRagBadge();
         }
       } catch(e) {}
@@ -2250,7 +2454,7 @@ app.get('/', (req, res) => {
     async function toggleAutoBot() {
       const novoEstado = !autoBotActive;
       const acao = novoEstado ? 'LIGAR' : 'DESLIGAR';
-      if (!(await askConfirm(acao + ' ROBÔ', 'Deseja ' + acao.toLowerCase() + ' o robô autônomo com Gatekeeper e gestão de risco 1:2?'))) return;
+      if (!(await askConfirm(acao + ' ROBÔ', 'Deseja ' + acao.toLowerCase() + ' o robô autônomo com 3 Modos Dinâmicos e gestão de risco 1:2?'))) return;
 
       try {
         const r = await fetch('/api/auto-trade', {
@@ -2265,7 +2469,7 @@ app.get('/', (req, res) => {
       }
     }
 
-    // ── HISTÓRICO MODAL ────────────────────────────────────────────────
+    // ── HISTÓRICO MODAL ──
     let abaAtualHist = 'periodo';
     let todosTradesCache = [];
 
@@ -2359,23 +2563,21 @@ app.get('/', (req, res) => {
     }
 
     function renderListaSimples(lista, titulo) {
-      if (lista.length === 0) return \`<div style="text-align:center; padding:20px; color:var(--text-muted);">Nenhum trade encontrado em \${titulo}.</div>\`;
-      let html = \`<div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:10px;">Exibindo \${lista.length} ordens (\${titulo})</div>\`;
+      if (lista.length === 0) return '<div style="text-align:center; padding:20px; color:var(--text-muted);">Nenhum trade encontrado em ' + titulo + '.</div>';
+      let html = '<div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:12px; font-weight:600;">Exibindo ' + lista.length + ' ordens (' + titulo + ')</div>';
       lista.forEach(g => {
         const cor = g.pnl > 0 ? 'var(--green)' : (g.pnl < 0 ? 'var(--red)' : 'var(--text-muted)');
         const dataStr = new Date(g.time).toLocaleString('pt-BR');
-        html += \`
-          <div class="trade-row">
-            <div>
-              <b style="color:var(--text);">\${g.symbol}</b> <span style="font-size:0.7rem; color:\${g.side === 'BUY' ? 'var(--green)' : 'var(--red)'};">\${g.side}</span>
-              <div style="font-size:0.65rem; color:var(--text-muted);">\${dataStr}</div>
-            </div>
-            <div style="text-align:right;">
-              <span style="font-weight:bold; color:\${cor};">\${g.pnl >= 0 ? '+' : ''}$ \${g.pnl.toFixed(2)}</span>
-              <div style="font-size:0.65rem; color:var(--text-muted);">Taxa: $ \${g.fee.toFixed(4)}</div>
-            </div>
-          </div>
-        \`;
+        html += '<div class="trade-row">' +
+            '<div>' +
+              '<b style="color:var(--text);">' + g.symbol + '</b> <span style="font-size:0.75rem; color:' + (g.side === 'BUY' ? 'var(--green)' : 'var(--red)') + ';">' + g.side + '</span>' +
+              '<div style="font-size:0.7rem; color:var(--text-muted);">' + dataStr + '</div>' +
+            '</div>' +
+            '<div style="text-align:right;">' +
+              '<span style="font-weight:bold; color:' + cor + ';">' + (g.pnl >= 0 ? '+' : '') + '$ ' + g.pnl.toFixed(2) + '</span>' +
+              '<div style="font-size:0.7rem; color:var(--text-muted);">Taxa: $ ' + g.fee.toFixed(4) + '</div>' +
+            '</div>' +
+          '</div>';
       });
       return html;
     }
@@ -2392,19 +2594,17 @@ app.get('/', (req, res) => {
       });
 
       const winRate = (totWin + totLoss) > 0 ? Math.round((totWin / (totWin + totLoss)) * 100) : 0;
-      return \`
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:15px;">
-          <div style="background:rgba(0,0,0,0.3); border:1px solid var(--border); padding:10px; border-radius:8px;">
-            <div style="font-size:0.7rem; color:var(--text-muted);">Taxa de Acerto Geral</div>
-            <div style="font-size:1.2rem; font-weight:bold; color:\${winRate >= 50 ? 'var(--green)' : 'var(--gold)'};">\${winRate}% <span style="font-size:0.8rem; color:var(--text-muted);">(\${totWin}W / \${totLoss}L)</span></div>
-          </div>
-          <div style="background:rgba(0,0,0,0.3); border:1px solid var(--border); padding:10px; border-radius:8px;">
-            <div style="font-size:0.7rem; color:var(--text-muted);">PnL Realizado Líquido</div>
-            <div style="font-size:1.2rem; font-weight:bold; color:\${totPnl >= 0 ? 'var(--green)' : 'var(--red)'};">\${totPnl >= 0 ? '+' : ''}$ \${totPnl.toFixed(2)}</div>
-          </div>
-        </div>
-        \${renderListaSimples(lista.slice(0, 30), 'Últimas 30 Ordens')}
-      \`;
+      return '<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px;">' +
+          '<div style="background:rgba(0,0,0,0.35); border:1px solid var(--border); padding:12px; border-radius:10px;">' +
+            '<div style="font-size:0.75rem; color:var(--text-muted); font-weight:600;">Taxa de Acerto Geral</div>' +
+            '<div style="font-size:1.35rem; font-weight:800; color:' + (winRate >= 50 ? 'var(--green)' : 'var(--gold)') + ';">' + winRate + '% <span style="font-size:0.85rem; color:var(--text-muted);">(' + totWin + 'W / ' + totLoss + 'L)</span></div>' +
+          '</div>' +
+          '<div style="background:rgba(0,0,0,0.35); border:1px solid var(--border); padding:12px; border-radius:10px;">' +
+            '<div style="font-size:0.75rem; color:var(--text-muted); font-weight:600;">PnL Realizado Líquido</div>' +
+            '<div style="font-size:1.35rem; font-weight:800; color:' + (totPnl >= 0 ? 'var(--green)' : 'var(--red)') + ';">' + (totPnl >= 0 ? '+' : '') + '$ ' + totPnl.toFixed(2) + '</div>' +
+          '</div>' +
+        '</div>' +
+        renderListaSimples(lista.slice(0, 30), 'Últimas 30 Ordens');
     }
 
     function fazerLogout() {
@@ -2428,13 +2628,14 @@ app.get('/', (req, res) => {
       atualizarStatusAutoBot();
       setInterval(carregarSaldo, 3600000);
       setInterval(carregarVolateis, 60000);
-      setInterval(carregarPlacar, 10000);
+      setInterval(carregarPlacar, 5000);
       setInterval(atualizarStatusAutoBot, 3000);
     });
   </script>
 </body>
 </html>`);
 });
+
 
 (async () => {
   try {
