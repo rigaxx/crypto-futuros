@@ -744,11 +744,9 @@ setInterval(async () => {
       if (!gk.passou) {
         console.log(`[AUTOBOT-GATEKEEPER] Slot ${slotNum} (${cand}) VETADO: ${gk.motivo} (0 tokens gastos)`);
         slot.status = `GATEKEEPER_VETO: ${gk.motivo}`;
-
-        // Se ficar mais de 15 minutos sem passar no Gatekeeper, troca de moeda
-        if (now - (slot.targetAssignedTime || now) > 15 * 60 * 1000) {
-          slot.targetSymbol = null;
-        }
+        autoBotState.lastLog = `Slot ${slotNum} (${cand}): ${gk.motivo}`;
+        // Se a moeda não passou no Gatekeeper, descarta para testar próximo candidato líquido
+        slot.targetSymbol = null;
         continue;
       }
 
@@ -843,6 +841,7 @@ setInterval(async () => {
         }
       } else {
         slot.status = `IA_WAIT: ${dec.reason_short || 'Sem confluência'}`;
+        autoBotState.lastLog = `Slot ${slotNum} (${cand}) IA: ${dec.reason_short || 'Aguardar confluência'}`;
         // Se a IA rejeitar, troca de alvo
         slot.targetSymbol = null;
       }
