@@ -655,6 +655,125 @@ Responda JSON: {"decisao": "FECHAR" ou "MANTER", "motivo": "explicacao curta"}`;
   }
 }
 
+// ── STOP & REVERSE POR ARMADILHA DE LIQUIDEZ ──────────────────────────
+async function executarStopAndReverse(sym, pos, alvo, roi) {
+  try {
+    console.log(`[STOP-AND-REVERSE] ${sym} (${pos.lado}): Gatilho de Armadilha acionado! Atingiu +${(alvo.maxRoiReached || 0).toFixed(2)}% ROI e caiu para ${roi.toFixed(2)}% ROI com fluxo contrário. Revertendo posição...`);
+
+    // 1. Encerra imediatamente a posição atual a mercado
+    await fut.cancelarTodasOrdens(sym);
+    await fut.fecharMercado(sym, pos.lado, pos.quantidade);
+
+    const curPrice = parseFloat(pos.precoMarca) || parseFloat(pos.precoEntrada);
+    await rag.salvarSaidaRAG({
+      symbol: sym,
+      exitPrice: curPrice,
+      exitReason: 'REVERSAO_TRAP_-1.5%',
+      roiPct: roi,
+      pnlUsdt: pos.pnlNaoRealizado
+    }).catch(() => {});
+
+    registrarDesfechoTrade(sym, 'REVERSAO_TRAP_-1.5%', roi, pos.pnlNaoRealizado);
+
+    // Identifica o slot do bot
+    let slotNum = 1;
+    if (autoBotState.slots[2].symbol === sym) slotNum = 2;
+    else if (autoBotState.slots[1].symbol === sym) slotNum = 1;
+    const slot = autoBotState.slots[slotNum];
+
+    // 2. Aguarda 1 segundo para liberação da margem na Binance
+    await new Promise(r => setTimeout(r, 1000));
+
+    // 3. Nova ordem a mercado na direção oposta
+    const novoLado = pos.lado === 'LONG' ? 'SHORT' : 'LONG';
+    const novoLadoTrade = novoLado === 'LONG' ? 'BUY' : 'SELL';
+
+    // Herança total das regras normais: 10 USDT, alavancagem dinâmica por ATR 15m, SL 1.8x, TP 3.6x
+    const dados = await analisarEstruturaEMercado(sym);
+    const alav = dados?.leverageSugerida || pos.alavancagem || 3;
+    const valorUSDT = 10;
+
+    await fut.garantirAlavancagem(sym, alav, 'ISOLATED');
+
+    const book = await fut.livroOfertas(sym, 5);
+    const precoExec = parseFloat(novoLadoTrade === 'BUY' ? (book?.asks?.[0] || [])[0] : (book?.bids?.[0] || [])[0]) || curPrice;
+
+    const calc = fut.calcularQuantidade(sym, valorUSDT, precoExec, alav);
+    if (!calc.ok) {
+      console.error(`[STOP-AND-REVERSE] Erro quantidade para ${sym}:`, calc.motivo);
+      slot.symbol = null;
+      slot.side = null;
+      slot.targetSymbol = null;
+      slot.searchCooldownUntil = Date.now() + 45000;
+      delete localAlvos[sym];
+      delete maxPriceTracker[sym];
+      delete minPriceTracker[sym];
+      salvarAlvos();
+      return;
+    }
+
+    const ordExec = await fut.abrirMercado(sym, novoLadoTrade, calc.qty);
+    const precoFinal = parseFloat(ordExec?.avgPrice) || parseFloat(ordExec?.price) || precoExec;
+    console.log(`[STOP-AND-REVERSE-SUCESSO] ${sym}: Nova ordem aberta ${novoLado} ${alav}x a mercado (Preço: $${precoFinal} | Qty: ${calc.qty})! Herança total das regras ativada.`);
+
+    const atr15m = dados?.atr15m || (precoFinal * 0.01);
+    const slDist = 1.8 * atr15m;
+    const tpDist = 2.0 * slDist; // 3.6x ATR (R:R 1:2)
+    const slPrice = novoLado === 'LONG' ? (precoFinal - slDist) : (precoFinal + slDist);
+    const tpPrice = novoLado === 'LONG' ? (precoFinal + tpDist) : (precoFinal - tpDist);
+    const beTriggerDist = Math.max(precoFinal * 0.012, slDist);
+    const beTriggerPrice = novoLado === 'LONG' ? (precoFinal + beTriggerDist) : (precoFinal - beTriggerDist);
+    const slDistPct = slDist / precoFinal;
+
+    localAlvos[sym] = {
+      side: novoLado,
+      entryPrice: precoFinal,
+      slPrice: slPrice,
+      tpPrice: tpPrice,
+      beTriggerPrice: beTriggerPrice,
+      slDistPct: slDistPct,
+      beArmed: false,
+      leverage: alav,
+      jaReverteu: true,
+      maxRoiReached: 0,
+      elegivelParaReversao: false
+    };
+    maxPriceTracker[sym] = precoFinal;
+    minPriceTracker[sym] = precoFinal;
+    salvarAlvos();
+
+    slot.symbol = sym;
+    slot.targetSymbol = sym;
+    slot.side = novoLado;
+    slot.leverage = alav;
+    slot.openTime = Date.now();
+    slot.last30mCheck = Date.now();
+    slot.status = `[REVERTIDA: ${sym} ${novoLado} ${alav}x]`;
+    autoBotState.lastLog = `Stop & Reverse executado: ${sym} agora ${novoLado} ${alav}x com regras normais herdadas.`;
+
+    await rag.salvarEntradaRAG({
+      symbol: sym,
+      side: novoLado,
+      leverage: alav,
+      mode: 'REVERSAO_TRAP',
+      scoreTotal: 85,
+      rsi15m: dados ? dados.rsi15m : 50,
+      rsi1m: 50.0,
+      emaStatus: dados ? dados.emaAlignStatus : '--',
+      sarStatus: dados ? dados.mtfStatus : '--',
+      volRatio: dados ? dados.rvol15m : 1.0,
+      fundingRate: dados ? dados.fundingRate : 0,
+      bookRatio: dados ? dados.takerRatioVal : 1.0,
+      fiboPos: dados ? `${dados.distEma21Atr.toFixed(1)}x ATR` : '1.5x ATR',
+      patterns: 'Stop & Reverse por Armadilha',
+      aiThesis: `Reversão executada: ${pos.lado} falhou após pico de +${(alvo.maxRoiReached || 0).toFixed(2)}% ROI e caiu para ${roi.toFixed(2)}% com fluxo contrário`,
+      entryPrice: precoFinal
+    }).catch(() => {});
+  } catch(e) {
+    console.error(`[STOP-AND-REVERSE] Erro ao reverter ${sym}:`, e.message);
+  }
+}
+
 // ── MONITORAMENTO DE RISCO EM CÓDIGO (1.5s - 0 Tokens, 0ms Delay) ─────
 setInterval(async () => {
   for (const sym of Object.keys(localAlvos)) {
@@ -675,6 +794,39 @@ setInterval(async () => {
       const margem = pos.margem || ((pos.quantidade * entryPrice) / alav);
       let roi = 0;
       if (margem > 0) roi = (pos.pnlNaoRealizado / margem) * 100;
+
+      // ── MONITORAMENTO DE ROI MÁXIMO E REVERSÃO POR ARMADILHA ──
+      if (alvo.maxRoiReached === undefined || roi > alvo.maxRoiReached) {
+        alvo.maxRoiReached = roi;
+      }
+
+      // Condição 1: Atingir >= +0.80% de ROI arma o gatilho de armadilha
+      if (alvo.maxRoiReached >= 0.80 && !alvo.elegivelParaReversao && !alvo.jaReverteu) {
+        alvo.elegivelParaReversao = true;
+        salvarAlvos();
+        console.log(`[TRAP-ARMADA] ${sym} (${pos.lado}): Pico atingiu +${alvo.maxRoiReached.toFixed(2)}% ROI (>= +0.80%). Monitorando armadilha para Stop & Reverse se recuar para <= -1.50%!`);
+      }
+
+      // Condição 2: Se elegível para reversão, ainda não reverteu, e despencou para <= -1.50% ROI
+      if (alvo.elegivelParaReversao && !alvo.jaReverteu && roi <= -1.50) {
+        let fluxoContra = false;
+        try {
+          const tRatioData = await fut.takerBuySellRatio(sym, '5m', 2).catch(() => []);
+          const tVal = (tRatioData && tRatioData.length > 0) ? parseFloat(tRatioData[tRatioData.length - 1].buySellRatio) : 1.0;
+          if (pos.lado === 'LONG' && tVal < 0.95) fluxoContra = true;
+          else if (pos.lado === 'SHORT' && tVal > 1.05) fluxoContra = true;
+          else {
+            console.log(`[TRAP-CHECK] ${sym} (${pos.lado}): ROI em ${roi.toFixed(2)}% mas fluxo não confirmou contra (Taker: ${tVal.toFixed(2)}).`);
+          }
+        } catch(e) {
+          fluxoContra = false;
+        }
+
+        if (fluxoContra) {
+          await executarStopAndReverse(sym, pos, alvo, roi);
+          continue;
+        }
+      }
 
       let deveFechar = false;
       let motivoFechamento = '';
@@ -1108,7 +1260,10 @@ setInterval(async () => {
             beTriggerPrice: dec.breakeven_trigger_price || dados.beTriggerPrice,
             slDistPct: dados.slPctReal / 100,
             beArmed: false,
-            leverage: alav
+            leverage: alav,
+            jaReverteu: false,
+            maxRoiReached: 0,
+            elegivelParaReversao: false
           };
           salvarAlvos();
 
@@ -1259,6 +1414,9 @@ app.get('/api/moeda/:symbol', async (req, res) => {
       motivoModo: dados.motivoModo,
       directionalScore: dados.directionalScore,
       beArmed: !!localAlvos[symbol]?.beArmed,
+      jaReverteu: !!localAlvos[symbol]?.jaReverteu,
+      elegivelParaReversao: !!localAlvos[symbol]?.elegivelParaReversao,
+      maxRoiReached: localAlvos[symbol]?.maxRoiReached || 0,
       pos
     });
   } catch(err) {
@@ -1826,6 +1984,12 @@ app.get('/', (req, res) => {
     .badge-short { background: rgba(239,68,68,0.25); color: var(--red); border: 1px solid var(--red); }
     .pos-qty { color: var(--text-muted); font-size: 0.9rem; font-weight: 700; }
     .pos-be-banner { background: rgba(56, 189, 248, 0.18); border: 1px solid var(--blue); color: var(--blue); border-radius: 8px; padding: 6px 12px; font-weight: 800; font-size: 0.8rem; text-align: center; margin-bottom: 10px; }
+    @keyframes pulse-alert {
+      0% { opacity: 1; transform: scale(1); box-shadow: 0 0 8px rgba(212, 175, 55, 0.4); }
+      50% { opacity: 0.8; transform: scale(1.02); box-shadow: 0 0 18px rgba(212, 175, 55, 0.85); }
+      100% { opacity: 1; transform: scale(1); box-shadow: 0 0 8px rgba(212, 175, 55, 0.4); }
+    }
+    .pos-alert-banner { animation: pulse-alert 1.2s infinite ease-in-out; }
     .pos-pnl { font-size: 2.2rem; font-weight: 900; text-align: center; margin: 6px 0; letter-spacing: 0.5px; }
     .pos-pnl-brl { font-size: 1.1rem; font-weight: 800; text-align: center; margin-bottom: 10px; }
     .pos-entry-row { font-size: 0.9rem; color: var(--text-muted); text-align: center; margin-bottom: 14px; }
@@ -2253,12 +2417,30 @@ app.get('/', (req, res) => {
 
           document.getElementById('pos-entry-' + col).innerText = '$ ' + p.precoEntrada.toFixed(4);
 
-          // Banner de Breakeven se armado
+          // Banner de Status da Posição (Reversão / Breakeven / Armadilha)
           const beEl = document.getElementById('pos-be-status-' + col);
           if (beEl) {
-            if (data.beArmed) {
+            if (data.jaReverteu) {
               beEl.style.display = 'block';
+              beEl.className = 'pos-be-banner';
+              beEl.style.background = 'rgba(167, 139, 250, 0.25)';
+              beEl.style.borderColor = 'var(--purple)';
+              beEl.style.color = 'var(--purple)';
+              beEl.innerText = '🔄 REVERTIDA: REGRAS NORMAIS ATIVAS';
+            } else if (data.beArmed) {
+              beEl.style.display = 'block';
+              beEl.className = 'pos-be-banner';
+              beEl.style.background = 'rgba(56, 189, 248, 0.18)';
+              beEl.style.borderColor = 'var(--blue)';
+              beEl.style.color = 'var(--blue)';
               beEl.innerText = '🛡️ BREAKEVEN ATIVADO (STOP PROTEGIDO NO 0 A 0 COM GANHO)';
+            } else if (data.elegivelParaReversao) {
+              beEl.style.display = 'block';
+              beEl.className = 'pos-be-banner pos-alert-banner';
+              beEl.style.background = 'rgba(212, 175, 55, 0.20)';
+              beEl.style.borderColor = 'var(--gold)';
+              beEl.style.color = 'var(--gold)';
+              beEl.innerText = '⚡ ARMADILHA ARMADA: STOP & REVERSE SE CAIR PARA -1.5%';
             } else {
               beEl.style.display = 'none';
             }
@@ -2818,8 +3000,16 @@ app.get('/', (req, res) => {
               beTriggerPrice: isLong ? pEntrada * 1.015 : pEntrada * 0.985,
               slDistPct: 0.02,
               beArmed: false,
-              leverage: p.alavancagem
+              leverage: p.alavancagem,
+              jaReverteu: false,
+              maxRoiReached: 0,
+              elegivelParaReversao: false
             };
+            salvarAlvos();
+          } else {
+            if (localAlvos[p.symbol].jaReverteu === undefined) localAlvos[p.symbol].jaReverteu = false;
+            if (localAlvos[p.symbol].elegivelParaReversao === undefined) localAlvos[p.symbol].elegivelParaReversao = false;
+            if (localAlvos[p.symbol].maxRoiReached === undefined) localAlvos[p.symbol].maxRoiReached = 0;
             salvarAlvos();
           }
         });
