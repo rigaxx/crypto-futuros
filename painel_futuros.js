@@ -1207,25 +1207,24 @@ app.get('/api/historico', async (req, res) => {
 });
 
 // ── FRONTEND HTML / UI QUANT DARK (ETAPAS 2 e 3) ──────────────────────
-app.get('/', (req, res) => {
-  const renderCol = (col) => `
-    <div class="card \${col === 1 ? 'active' : ''}" id="card-\${col}" onclick="selecionarColuna(\${col})">
+  function renderColHTML(col) { return `
+    <div class="card ${col === 1 ? 'active' : ''}" id="card-${col}" onclick="selecionarColuna(${col})">
       <div class="input-group">
-        <input type="text" id="sym-\${col}" placeholder="Moeda (ex: BTC)" oninput="debouncedLoad(\${col})" autocomplete="off">
+        <input type="text" id="sym-${col}" placeholder="Moeda (ex: BTC)" oninput="debouncedLoad(${col})" autocomplete="off">
       </div>
-      <div class="price-display" id="price-\${col}">$ 0.0000</div>
+      <div class="price-display" id="price-${col}">$ 0.0000</div>
       
       <!-- TENDÊNCIA MTF (4h, 1h, 15m, 5m) + ALINHAMENTO MTF -->
       <div class="mtf-box">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
           <span style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase; letter-spacing:1px;">Tendência MTF (EMA 50)</span>
-          <span id="mtf-status-\${col}" class="badge-mtf">CARREGANDO</span>
+          <span id="mtf-status-${col}" class="badge-mtf">CARREGANDO</span>
         </div>
-        <div class="candles-row" id="candles-\${col}" style="margin-bottom:0; padding:6px 10px;">
+        <div class="candles-row" id="candles-${col}" style="margin-bottom:0; padding:6px 10px;">
           ${['4h','1h','15m','5m'].map(tf => `
             <div class="candle">
               <span class="candle-label">${tf}</span>
-              <div class="dot" id="dot-\${col}-${tf}"></div>
+              <div class="dot" id="dot-${col}-${tf}"></div>
             </div>
           `).join('')}
         </div>
@@ -1236,19 +1235,19 @@ app.get('/', (req, res) => {
         <div class="flow-title">Estrutura & Fluxo (5m / 15m)</div>
         <div class="flow-row">
           <span style="color:var(--text-muted);">Alinhamento EMAs:</span>
-          <span id="ema-align-\${col}" style="font-weight:bold; color:#fff;">--</span>
+          <span id="ema-align-${col}" style="font-weight:bold; color:#fff;">--</span>
         </div>
         <div class="flow-row">
           <span style="color:var(--text-muted);">Distância EMA 21:</span>
-          <span id="dist-ema-\${col}" style="font-weight:bold;">--</span>
+          <span id="dist-ema-${col}" style="font-weight:bold;">--</span>
         </div>
         <div class="flow-row">
           <span style="color:var(--text-muted);">ATR (14) 15m:</span>
-          <span id="atr-pct-\${col}" style="color:var(--gold); font-weight:bold;">--</span>
+          <span id="atr-pct-${col}" style="color:var(--gold); font-weight:bold;">--</span>
         </div>
         <div class="flow-row" style="margin-bottom:0;">
           <span style="color:var(--text-muted);">ADX / RVOL:</span>
-          <span id="adx-rvol-\${col}" style="color:#fff; font-weight:bold;">--</span>
+          <span id="adx-rvol-${col}" style="color:#fff; font-weight:bold;">--</span>
         </div>
       </div>
 
@@ -1256,77 +1255,82 @@ app.get('/', (req, res) => {
       <div class="setup-quality-box">
         <div>
           <div style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase;">RSI (15m Wilder)</div>
-          <div id="rsi-\${col}" style="font-weight:bold; font-size:1.1rem; color:var(--text);">--</div>
+          <div id="rsi-${col}" style="font-weight:bold; font-size:1.1rem; color:var(--text);">--</div>
         </div>
         <div style="text-align:right;">
           <div style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase;">Qualidade do Setup</div>
-          <div id="trend-\${col}" style="font-weight:bold; font-size:0.75rem;">--</div>
+          <div id="trend-${col}" style="font-weight:bold; font-size:0.75rem;">--</div>
         </div>
       </div>
 
       <!-- POSIÇÃO ABERTA -->
-      <div class="pos-card" id="pos-\${col}">
+      <div class="pos-card" id="pos-${col}">
         <div class="pos-header">
-          <span id="pos-lado-\${col}" style="font-weight: bold;">--</span>
-          <span id="pos-qty-\${col}" style="color: var(--text-muted);">Qty: --</span>
+          <span id="pos-lado-${col}" style="font-weight: bold;">--</span>
+          <span id="pos-qty-${col}" style="color: var(--text-muted);">Qty: --</span>
         </div>
-        <div class="pos-pnl" id="pos-pnl-\${col}">$ 0.00 (0.00%)</div>
-        <div style="font-size: 0.75rem; color: #3b82f6; text-align: center; margin-bottom: 8px;" id="pos-pnl-brl-\${col}">R$ 0,00</div>
-        <div style="font-size: 0.75rem; color: var(--text-muted); text-align: center; margin-bottom: 8px;">Entrada: <span id="pos-entry-\${col}">--</span></div>
+        <div class="pos-pnl" id="pos-pnl-${col}">$ 0.00 (0.00%)</div>
+        <div style="font-size: 0.75rem; color: #3b82f6; text-align: center; margin-bottom: 8px;" id="pos-pnl-brl-${col}">R$ 0,00</div>
+        <div style="font-size: 0.75rem; color: var(--text-muted); text-align: center; margin-bottom: 8px;">Entrada: <span id="pos-entry-${col}">--</span></div>
         <div style="display:flex; gap:6px; margin-bottom:6px;">
-          <button class="btn-close" style="flex:1; padding:8px; font-size:0.7rem;" onclick="fecharPosicao(\${col})">FECHAR MERCADO</button>
-          <button class="btn-reverse" style="flex:1; padding:8px; font-size:0.7rem;" onclick="reverterPosicao(\${col})">REVERTER</button>
+          <button class="btn-close" style="flex:1; padding:8px; font-size:0.7rem;" onclick="fecharPosicao(${col})">FECHAR MERCADO</button>
+          <button class="btn-reverse" style="flex:1; padding:8px; font-size:0.7rem;" onclick="reverterPosicao(${col})">REVERTER</button>
         </div>
       </div>
 
       <!-- PROJEÇÃO DE RISCO QUANTITATIVO (SL / BE / TP / ATR) -->
       <div class="risk-proj-box">
         <div style="display:flex; justify-content:space-between; color:var(--text-muted); margin-bottom:4px; font-size:0.7rem;">
-          <span>Alav Sugerida: <b id="proj-alav-\${col}" style="color:var(--gold);">--x</b></span>
+          <span>Alav Sugerida: <b id="proj-alav-${col}" style="color:var(--gold);">--x</b></span>
           <span>Entrada: <b style="color:#fff;">10 USDT</b></span>
         </div>
         <div style="display:flex; justify-content:space-between; font-family:monospace; font-size:0.7rem;">
-          <span style="color:var(--red);">SL: <span id="proj-sl-\${col}">--</span></span>
-          <span style="color:var(--blue);">BE: <span id="proj-be-\${col}">--</span></span>
-          <span style="color:var(--green);">TP: <span id="proj-tp-\${col}">--</span></span>
+          <span style="color:var(--red);">SL: <span id="proj-sl-${col}">--</span></span>
+          <span style="color:var(--blue);">BE: <span id="proj-be-${col}">--</span></span>
+          <span style="color:var(--green);">TP: <span id="proj-tp-${col}">--</span></span>
         </div>
       </div>
 
       <div class="range-group">
         <label>Alavancagem</label>
-        <input type="range" id="alav-\${col}" min="1" max="5" value="3" oninput="document.getElementById('alav-val-\${col}').innerText = this.value + 'x'">
-        <span id="alav-val-\${col}">3x</span>
+        <input type="range" id="alav-${col}" min="1" max="5" value="3" oninput="document.getElementById('alav-val-${col}').innerText = this.value + 'x'">
+        <span id="alav-val-${col}">3x</span>
       </div>
       
       <div class="input-group" style="margin-bottom: 10px;">
-        <input type="number" id="val-\${col}" placeholder="Tamanho (USDT)" value="10" style="font-size:1rem; padding:10px;">
+        <input type="number" id="val-${col}" placeholder="Tamanho (USDT)" value="10" style="font-size:1rem; padding:10px;">
       </div>
 
       <!-- MÉTRICAS DO RODAPÉ: TAKER RATIO, Δ OI (15m), FUND -->
       <div class="card-footer-metrics">
-        <div>Taker: <span id="gauge-taker-\${col}" style="color:#FFF; font-weight:bold;">--</span></div>
-        <div>Δ OI: <span id="gauge-delta-oi-\${col}" style="color:#FFF; font-weight:bold;">--</span></div>
-        <div>Fund: <span id="gauge-fund-\${col}" style="color:#FFF; font-weight:bold;">--</span></div>
+        <div>Taker: <span id="gauge-taker-${col}" style="color:#FFF; font-weight:bold;">--</span></div>
+        <div>Δ OI: <span id="gauge-delta-oi-${col}" style="color:#FFF; font-weight:bold;">--</span></div>
+        <div>Fund: <span id="gauge-fund-${col}" style="color:#FFF; font-weight:bold;">--</span></div>
       </div>
 
       <div class="actions">
-        <button class="btn-buy" onclick="execTrade(\${col}, 'BUY')">COMPRAR (LONG)</button>
-        <button class="btn-sell" onclick="execTrade(\${col}, 'SELL')">VENDER (SHORT)</button>
+        <button class="btn-buy" onclick="execTrade(${col}, 'BUY')">COMPRAR (LONG)</button>
+        <button class="btn-sell" onclick="execTrade(${col}, 'SELL')">VENDER (SHORT)</button>
       </div>
 
-      <button onclick="consultarIaManual(\${col})" class="btn-ia-advise" style="width:100%; margin-bottom:8px; padding:10px; background:rgba(212,175,55,0.15); border:1px solid var(--gold); color:var(--gold); border-radius:8px; font-size:0.75rem; font-weight:bold; cursor:pointer;">
+      <button onclick="consultarIaManual(${col})" class="btn-ia-advise" style="width:100%; margin-bottom:8px; padding:10px; background:rgba(212,175,55,0.15); border:1px solid var(--gold); color:var(--gold); border-radius:8px; font-size:0.75rem; font-weight:bold; cursor:pointer;">
         ⚡ AUXÍLIO DE IA (GEMINI FLASH)
       </button>
 
-      <div class="status" id="status-\${col}">Pronto</div>
+      <div class="status" id="status-${col}">Pronto</div>
     </div>
   `;
+}
+
+app.get('/', (req, res) => {
+
 
   res.send(`<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8">
   <title>Futuros Quant Institucional - Binance</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22 fill=%22%23D4AF37%22>$</text></svg>">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <style>
     :root {
@@ -1501,8 +1505,8 @@ app.get('/', (req, res) => {
   </div>
 
   <div class="grid">
-    \${renderCol(1)}
-    \${renderCol(2)}
+    ${renderColHTML(1)}
+    ${renderColHTML(2)}
   </div>
 
   <script>
