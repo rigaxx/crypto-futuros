@@ -688,13 +688,14 @@ setInterval(async () => {
           deveFechar = true;
           motivoFechamento = `[SAFETY SL -10%] ROI bateu ${roi.toFixed(2)}%`;
         }
-        // 4. Breakeven Dinâmico
+        // 4. Breakeven Dinâmico (Long)
         else {
           const beGatilho = Math.max(0.012, alvo.slDistPct || 0.012);
-          if (!alvo.beArmed && peakGainReal >= beGatilho) {
+          const bateuGatilhoBE = (peakGainReal >= beGatilho) || (alvo.beTriggerPrice && curPrice >= alvo.beTriggerPrice);
+          if (!alvo.beArmed && bateuGatilhoBE) {
             alvo.beArmed = true;
             salvarAlvos();
-            console.log(`[BREAKEVEN ARMADO] ${sym}: Pico andou +${(peakGainReal * 100).toFixed(2)}% (>= ${(beGatilho * 100).toFixed(2)}%). Stop movido para Entrada + 0.25%.`);
+            console.log(`[BREAKEVEN ARMADO] ${sym} LONG: Pico andou +${(peakGainReal * 100).toFixed(2)}% (>= ${(beGatilho * 100).toFixed(2)}%). Stop movido para Entrada + 0.25%.`);
           }
           if (alvo.beArmed && curPrice <= entryPrice * 1.0025) {
             deveFechar = true;
@@ -723,13 +724,14 @@ setInterval(async () => {
           deveFechar = true;
           motivoFechamento = `[SAFETY SL -10%] ROI bateu ${roi.toFixed(2)}%`;
         }
-        // 4. Breakeven Dinâmico
+        // 4. Breakeven Dinâmico (Short)
         else {
           const beGatilho = Math.max(0.012, alvo.slDistPct || 0.012);
-          if (!alvo.beArmed && peakGainReal >= beGatilho) {
+          const bateuGatilhoBE = (peakGainReal >= beGatilho) || (alvo.beTriggerPrice && curPrice <= alvo.beTriggerPrice);
+          if (!alvo.beArmed && bateuGatilhoBE) {
             alvo.beArmed = true;
             salvarAlvos();
-            console.log(`[BREAKEVEN ARMADO] ${sym}: Pico andou +${(peakGainReal * 100).toFixed(2)}% (>= ${(beGatilho * 100).toFixed(2)}%). Stop movido para Entrada + 0.25%.`);
+            console.log(`[BREAKEVEN ARMADO] ${sym} SHORT: Pico andou +${(peakGainReal * 100).toFixed(2)}% (>= ${(beGatilho * 100).toFixed(2)}%). Stop movido para Entrada + 0.25%.`);
           }
           if (alvo.beArmed && curPrice >= entryPrice * 0.9975) {
             deveFechar = true;
@@ -1229,6 +1231,7 @@ app.get('/api/moeda/:symbol', async (req, res) => {
       direcaoModo: dados.direcaoModo,
       motivoModo: dados.motivoModo,
       directionalScore: dados.directionalScore,
+      beArmed: !!localAlvos[symbol]?.beArmed,
       pos
     });
   } catch(err) {
@@ -1538,7 +1541,7 @@ app.get('/api/historico', async (req, res) => {
           </div>
           <div class="flow-cell">
             <span class="cell-label">RSI (15m Wilder):</span>
-            <span class="cell-val" id="rsi-${col}" style="font-size:1.1rem; font-weight:800;">--</span>
+            <span class="cell-val" id="rsi-${col}" style="font-size:1.15rem; font-weight:800;">--</span>
           </div>
           <div class="flow-cell">
             <span class="cell-label">Taker Ratio:</span>
@@ -1560,18 +1563,19 @@ app.get('/api/historico', async (req, res) => {
         </div>
       </div>
 
-      <!-- POSIÇÃO ABERTA (DESTACADA QUANDO HOUVER) -->
+      <!-- POSIÇÃO ABERTA (ALTO DESTAQUE VISUAL COM GLOW) -->
       <div class="pos-card" id="pos-${col}">
         <div class="pos-header">
-          <span id="pos-lado-${col}" style="font-weight: 800; font-size:1.05rem;">--</span>
-          <span id="pos-qty-${col}" style="color: var(--text-muted); font-size:0.9rem;">Qty: --</span>
+          <div id="pos-lado-${col}" class="pos-side-pill">--</div>
+          <span id="pos-qty-${col}" class="pos-qty">Qty: --</span>
         </div>
+        <div id="pos-be-status-${col}" class="pos-be-banner" style="display:none;"></div>
         <div class="pos-pnl" id="pos-pnl-${col}">$ 0.00 (0.00%)</div>
-        <div style="font-size: 0.9rem; color: var(--blue); text-align: center; margin-bottom: 8px; font-weight:700;" id="pos-pnl-brl-${col}">R$ 0,00</div>
-        <div style="font-size: 0.85rem; color: var(--text-muted); text-align: center; margin-bottom: 12px;">Preço Entrada: <b id="pos-entry-${col}" style="color:#FFF;">--</b></div>
-        <div style="display:flex; gap:10px;">
-          <button class="btn-close" style="flex:1; padding:12px; font-size:0.8rem;" onclick="fecharPosicao(${col})">FECHAR MERCADO</button>
-          <button class="btn-reverse" style="flex:1; padding:12px; font-size:0.8rem;" onclick="reverterPosicao(${col})">REVERTER</button>
+        <div class="pos-pnl-brl" id="pos-pnl-brl-${col}">R$ 0,00</div>
+        <div class="pos-entry-row">Preço Entrada: <b id="pos-entry-${col}" style="color:#FFF;">--</b></div>
+        <div class="pos-actions-row">
+          <button class="btn-close" onclick="fecharPosicao(${col})">FECHAR MERCADO</button>
+          <button class="btn-reverse" onclick="reverterPosicao(${col})">REVERTER</button>
         </div>
       </div>
 
@@ -1647,109 +1651,109 @@ app.get('/', (req, res) => {
       --purple: #A78BFA;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
-    body { background-color: var(--bg); color: var(--text); padding: 12px; min-height: 100vh; }
-    .container { max-width: 1280px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+    body { background-color: var(--bg); color: var(--text); padding: 14px; min-height: 100vh; }
+    .container { max-width: 1280px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
     
     /* PAINEL DE RESUMO DE DESEMPENHO NO TOPO */
     .perf-header-bar {
-      background: linear-gradient(180deg, rgba(16,21,35,0.9) 0%, rgba(10,13,23,0.95) 100%);
+      background: linear-gradient(180deg, rgba(16,21,35,0.95) 0%, rgba(10,13,23,0.98) 100%);
       border: 1px solid var(--card-border);
-      border-radius: 14px;
-      padding: 14px 20px;
+      border-radius: 16px;
+      padding: 16px 22px;
       display: flex;
       justify-content: space-between;
       align-items: center;
       flex-wrap: wrap;
-      gap: 14px;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+      gap: 16px;
+      box-shadow: 0 4px 25px rgba(0,0,0,0.45);
     }
-    .header-stat-group { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
-    .stat-box { display: flex; flex-direction: column; gap: 3px; }
-    .stat-label { font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
-    .stat-value-gold { font-size: 1.45rem; font-weight: 800; color: var(--gold); letter-spacing: 0.5px; }
-    .stat-sub { font-size: 0.8rem; color: var(--blue); font-weight: 600; }
+    .header-stat-group { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+    .stat-box { display: flex; flex-direction: column; gap: 4px; }
+    .stat-label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; font-weight: 700; }
+    .stat-value-gold { font-size: 1.55rem; font-weight: 900; color: var(--gold); letter-spacing: 0.5px; }
+    .stat-sub { font-size: 0.85rem; color: var(--blue); font-weight: 700; }
 
-    /* PLACAR DE TRADES NOVO E RESUMIDO */
+    /* PLACAR DE TRADES INSTITUCIONAL COM WIN RATE */
     .placar-box {
       display: flex;
       align-items: center;
       gap: 8px;
-      background: rgba(0,0,0,0.4);
+      background: rgba(0,0,0,0.45);
       border: 1px solid var(--border);
-      padding: 6px 14px;
-      border-radius: 10px;
+      padding: 8px 16px;
+      border-radius: 12px;
     }
-    .badge-win { font-size: 0.95rem; font-weight: 800; color: var(--green); background: rgba(16,185,129,0.18); border: 1px solid rgba(16,185,129,0.35); padding: 4px 10px; border-radius: 6px; }
-    .badge-loss { font-size: 0.95rem; font-weight: 800; color: var(--red); background: rgba(239,68,68,0.18); border: 1px solid rgba(239,68,68,0.35); padding: 4px 10px; border-radius: 6px; }
-    .badge-wr { font-size: 0.75rem; font-weight: 700; color: var(--gold); background: rgba(212,175,55,0.15); border: 1px solid rgba(212,175,55,0.3); padding: 3px 8px; border-radius: 5px; }
-    .btn-zerar { padding: 4px 8px; font-size: 0.7rem; background: rgba(255,255,255,0.08); border: 1px solid var(--border); color: var(--text-muted); border-radius: 5px; cursor: pointer; font-weight: 700; transition: 0.2s; }
-    .btn-zerar:hover { background: rgba(255,255,255,0.15); color: #FFF; }
+    .badge-win { font-size: 1rem; font-weight: 800; color: var(--green); background: rgba(16,185,129,0.2); border: 1px solid rgba(16,185,129,0.4); padding: 4px 10px; border-radius: 6px; }
+    .badge-loss { font-size: 1rem; font-weight: 800; color: var(--red); background: rgba(239,68,68,0.2); border: 1px solid rgba(239,68,68,0.4); padding: 4px 10px; border-radius: 6px; }
+    .badge-wr { font-size: 0.8rem; font-weight: 800; color: var(--gold); background: rgba(212,175,55,0.18); border: 1px solid rgba(212,175,55,0.35); padding: 4px 10px; border-radius: 6px; }
+    .btn-zerar { padding: 4px 10px; font-size: 0.72rem; background: rgba(255,255,255,0.08); border: 1px solid var(--border); color: var(--text-muted); border-radius: 6px; cursor: pointer; font-weight: 800; transition: 0.2s; }
+    .btn-zerar:hover { background: rgba(255,255,255,0.16); color: #FFF; }
 
-    .header-btns { display: flex; gap: 8px; }
-    .header-btns button { padding: 8px 14px; font-size: 0.8rem; background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--text); border-radius: 8px; cursor: pointer; font-weight: 600; transition: 0.2s; }
-    .header-btns button:hover { background: rgba(255,255,255,0.12); border-color: rgba(255,255,255,0.2); }
+    .header-btns { display: flex; gap: 10px; }
+    .header-btns button { padding: 10px 16px; font-size: 0.85rem; background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--text); border-radius: 10px; cursor: pointer; font-weight: 700; transition: 0.2s; }
+    .header-btns button:hover { background: rgba(255,255,255,0.14); border-color: rgba(255,255,255,0.25); }
 
     /* CARROSSEL SUPERIOR DE MOEDAS */
-    .volatility-bar { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 6px; scrollbar-width: thin; scrollbar-color: var(--gold) rgba(0,0,0,0.3); }
+    .volatility-bar { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 6px; scrollbar-width: thin; scrollbar-color: var(--gold) rgba(0,0,0,0.3); }
     .volatility-bar::-webkit-scrollbar { height: 5px; }
     .volatility-bar::-webkit-scrollbar-thumb { background: var(--gold); border-radius: 4px; }
-    .vol-item { flex-shrink: 0; display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; background: rgba(13,17,28,0.85); border: 1px solid var(--border); border-radius: 8px; padding: 7px 12px; font-size: 0.82rem; cursor: pointer; transition: 0.2s; font-weight: 700; }
-    .vol-item:hover { border-color: var(--gold); background: rgba(212, 175, 55, 0.12); transform: translateY(-1px); }
+    .vol-item { flex-shrink: 0; display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; background: rgba(13,17,28,0.9); border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px; font-size: 0.85rem; cursor: pointer; transition: 0.2s; font-weight: 800; }
+    .vol-item:hover { border-color: var(--gold); background: rgba(212, 175, 55, 0.15); transform: translateY(-1px); }
     .vol-item .sym { color: var(--text); }
-    .vol-item .pct { font-weight: 800; }
+    .vol-item .pct { font-weight: 900; }
 
     /* BARRA DE CONTROLE DO ROBÔ AUTÔNOMO */
     .bot-control-bar {
-      background: linear-gradient(180deg, rgba(13,17,28,0.9) 0%, rgba(9,12,20,0.95) 100%);
+      background: linear-gradient(180deg, rgba(13,17,28,0.95) 0%, rgba(9,12,20,0.98) 100%);
       border: 1px solid var(--card-border);
-      border-radius: 12px;
-      padding: 12px 18px;
+      border-radius: 14px;
+      padding: 14px 20px;
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 12px;
     }
-    .bot-control-top { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
+    .bot-control-top { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
 
-    /* GRELHA DOS CARTÕES (EXPANDIDA E ESPAÇADA) */
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    /* GRELHA DOS CARTÕES (1 E 2) */
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
     .card {
       background: linear-gradient(180deg, #0e121e 0%, #080b14 100%);
       border: 1px solid var(--card-border);
-      border-radius: 16px;
-      padding: 18px;
+      border-radius: 18px;
+      padding: 20px;
       transition: all 0.3s;
       position: relative;
       display: flex;
       flex-direction: column;
-      gap: 12px;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.35);
+      gap: 14px;
+      box-shadow: 0 4px 25px rgba(0,0,0,0.4);
     }
     .card.active { border-color: rgba(212, 175, 55, 0.55); box-shadow: 0 0 25px rgba(212, 175, 55, 0.1); }
 
     /* CARD HEADER */
-    .card-top-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
-    .coin-input-group { display: flex; align-items: center; gap: 8px; flex: 1; max-width: 250px; }
+    .card-top-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .coin-input-group { display: flex; align-items: center; gap: 8px; flex: 1; max-width: 270px; }
     .coin-input-group input {
       width: 100%;
-      background: rgba(0,0,0,0.4);
+      background: rgba(0,0,0,0.45);
       border: 1px solid var(--border);
       color: var(--gold);
-      font-size: 1.15rem;
-      padding: 10px 12px;
-      border-radius: 8px;
+      font-size: 1.2rem;
+      padding: 10px 14px;
+      border-radius: 10px;
       outline: none;
       text-transform: uppercase;
-      font-weight: 800;
+      font-weight: 900;
       letter-spacing: 1px;
     }
-    .coin-input-group input:focus { border-color: var(--gold); box-shadow: 0 0 10px rgba(212,175,55,0.2); }
-    .pct-badge { font-size: 0.82rem; font-weight: 800; padding: 4px 8px; border-radius: 6px; background: rgba(255,255,255,0.06); }
+    .coin-input-group input:focus { border-color: var(--gold); box-shadow: 0 0 12px rgba(212,175,55,0.25); }
+    .pct-badge { font-size: 0.85rem; font-weight: 800; padding: 5px 10px; border-radius: 8px; background: rgba(255,255,255,0.06); border: 1px solid var(--border); }
 
     .modo-badge {
-      font-size: 0.8rem;
+      font-size: 0.85rem;
       font-weight: 800;
-      padding: 5px 10px;
-      border-radius: 6px;
+      padding: 6px 12px;
+      border-radius: 8px;
       border: 1px solid var(--border);
       background: rgba(255,255,255,0.05);
       color: var(--text-muted);
@@ -1758,76 +1762,117 @@ app.get('/', (req, res) => {
     }
 
     /* PREÇO */
-    .price-display { font-size: 1.85rem; text-align: center; font-weight: 800; color: var(--text); letter-spacing: 1px; margin: 2px 0; }
+    .price-display { font-size: 2rem; text-align: center; font-weight: 900; color: var(--text); letter-spacing: 1px; margin: 4px 0; }
 
     /* MTF BOX */
-    .mtf-box { background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; }
-    .mtf-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-    .mtf-title { font-size: 0.72rem; color: var(--text-muted); font-weight: 700; letter-spacing: 1px; text-transform: uppercase; }
-    .badge-mtf { font-size: 0.75rem; font-weight: 800; padding: 3px 8px; border-radius: 5px; background: rgba(255,255,255,0.08); color: var(--gold); }
-    .candles-row { display: flex; justify-content: space-around; background: rgba(0,0,0,0.25); border-radius: 8px; border: 1px solid var(--border); padding: 8px 12px; }
-    .candle { display: flex; flex-direction: column; align-items: center; gap: 5px; }
-    .candle-label { font-size: 0.72rem; color: var(--text-muted); font-weight: 600; }
-    .dot { width: 12px; height: 12px; border-radius: 50%; background: #334155; transition: 0.3s; }
-    .dot.green { background: var(--green); box-shadow: 0 0 8px rgba(16, 185, 129, 0.6); }
-    .dot.red { background: var(--red); box-shadow: 0 0 8px rgba(239, 68, 68, 0.6); }
+    .mtf-box { background: rgba(0,0,0,0.35); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; }
+    .mtf-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .mtf-title { font-size: 0.75rem; color: var(--text-muted); font-weight: 700; letter-spacing: 1px; text-transform: uppercase; }
+    .badge-mtf { font-size: 0.78rem; font-weight: 800; padding: 4px 10px; border-radius: 6px; background: rgba(255,255,255,0.08); color: var(--gold); }
+    .candles-row { display: flex; justify-content: space-around; background: rgba(0,0,0,0.25); border-radius: 10px; border: 1px solid var(--border); padding: 10px 14px; }
+    .candle { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+    .candle-label { font-size: 0.75rem; color: var(--text-muted); font-weight: 700; }
+    .dot { width: 14px; height: 14px; border-radius: 50%; background: #334155; transition: 0.3s; }
+    .dot.green { background: var(--green); box-shadow: 0 0 10px rgba(16, 185, 129, 0.7); }
+    .dot.red { background: var(--red); box-shadow: 0 0 10px rgba(239, 68, 68, 0.7); }
 
     /* ESTRUTURA & FLUXO INSTITUCIONAL */
-    .flow-panel { background: rgba(0,0,0,0.35); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; font-size: 0.85rem; }
-    .flow-title { font-size: 0.72rem; color: var(--gold); font-weight: 800; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; border-bottom: 1px solid rgba(212,175,55,0.2); padding-bottom: 5px; }
-    .flow-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; margin-bottom: 10px; }
+    .flow-panel { background: rgba(0,0,0,0.4); border: 1px solid var(--border); border-radius: 14px; padding: 14px 18px; font-size: 0.9rem; }
+    .flow-title { font-size: 0.75rem; color: var(--gold); font-weight: 800; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; border-bottom: 1px solid rgba(212,175,55,0.25); padding-bottom: 6px; }
+    .flow-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 20px; margin-bottom: 12px; }
     .flow-cell { display: flex; justify-content: space-between; align-items: center; }
-    .cell-label { color: var(--text-muted); font-size: 0.8rem; }
-    .cell-val { font-weight: 700; color: #FFF; font-size: 0.85rem; }
+    .cell-label { color: var(--text-muted); font-size: 0.85rem; font-weight: 600; }
+    .cell-val { font-weight: 700; color: #FFF; font-size: 0.9rem; }
     .text-gold { color: var(--gold) !important; }
 
-    .compass-row { display: flex; justify-content: space-between; align-items: center; border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 8px; }
-    .compass-label { font-size: 0.78rem; color: var(--text-muted); font-weight: 600; text-transform: uppercase; }
-    .compass-val { font-size: 0.95rem; font-weight: 800; }
+    .compass-row { display: flex; justify-content: space-between; align-items: center; border-top: 1px dashed rgba(255,255,255,0.1); padding-top: 10px; }
+    .compass-label { font-size: 0.82rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase; }
+    .compass-val { font-size: 1rem; font-weight: 800; }
+
+    /* POSIÇÃO ABERTA COM DESTAQUE MÁXIMO */
+    .pos-card { border-radius: 14px; padding: 16px; display: none; transition: all 0.3s; }
+    .pos-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .pos-side-pill { font-weight: 900; font-size: 1.1rem; padding: 4px 12px; border-radius: 8px; }
+    .badge-long { background: rgba(16,185,129,0.25); color: var(--green); border: 1px solid var(--green); }
+    .badge-short { background: rgba(239,68,68,0.25); color: var(--red); border: 1px solid var(--red); }
+    .pos-qty { color: var(--text-muted); font-size: 0.9rem; font-weight: 700; }
+    .pos-be-banner { background: rgba(56, 189, 248, 0.18); border: 1px solid var(--blue); color: var(--blue); border-radius: 8px; padding: 6px 12px; font-weight: 800; font-size: 0.8rem; text-align: center; margin-bottom: 10px; }
+    .pos-pnl { font-size: 2.2rem; font-weight: 900; text-align: center; margin: 6px 0; letter-spacing: 0.5px; }
+    .pos-pnl-brl { font-size: 1.1rem; font-weight: 800; text-align: center; margin-bottom: 10px; }
+    .pos-entry-row { font-size: 0.9rem; color: var(--text-muted); text-align: center; margin-bottom: 14px; }
+    .pos-actions-row { display: flex; gap: 10px; }
 
     /* BLOCO DE RISCO QUANTITATIVO BEM DIMENSIONADO */
-    .risk-card { background: rgba(0,0,0,0.4); border: 1px solid var(--card-border); border-radius: 12px; padding: 14px 16px; }
-    .risk-meta-row { display: flex; justify-content: space-between; color: var(--text-muted); font-size: 0.82rem; margin-bottom: 10px; font-weight: 600; }
-    .range-group { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); }
-    .range-group label { flex: 1; font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }
+    .risk-card { background: rgba(0,0,0,0.45); border: 1px solid var(--card-border); border-radius: 14px; padding: 16px 18px; }
+    .risk-meta-row { display: flex; justify-content: space-between; color: var(--text-muted); font-size: 0.85rem; margin-bottom: 12px; font-weight: 700; }
+    .range-group { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; background: rgba(0,0,0,0.3); padding: 10px 14px; border-radius: 10px; border: 1px solid var(--border); }
+    .range-group label { flex: 1; font-size: 0.78rem; color: var(--text-muted); text-transform: uppercase; font-weight: 700; }
     .range-group input[type="range"] { flex: 2; accent-color: var(--gold); }
-    .range-group span { font-size: 0.95rem; color: var(--gold); font-weight: 800; width: 35px; text-align: right; }
+    .range-group span { font-size: 1.05rem; color: var(--gold); font-weight: 800; width: 40px; text-align: right; }
 
-    .input-group input { width: 100%; background: rgba(0,0,0,0.3); border: 1px solid var(--border); color: var(--gold); font-size: 1.05rem; padding: 10px; border-radius: 8px; outline: none; text-align: center; font-weight: 700; }
+    .input-group input { width: 100%; background: rgba(0,0,0,0.35); border: 1px solid var(--border); color: var(--gold); font-size: 1.1rem; padding: 12px; border-radius: 10px; outline: none; text-align: center; font-weight: 800; }
 
-    .targets-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
-    .target-box { padding: 8px; border-radius: 8px; text-align: center; font-family: monospace; }
-    .target-title { font-size: 0.65rem; font-weight: 700; text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.5px; }
-    .target-val { font-size: 0.82rem; font-weight: 800; }
-    .target-sl { background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.3); color: var(--red); }
-    .target-be { background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.3); color: var(--blue); }
-    .target-tp { background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.3); color: var(--green); }
+    .targets-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    .target-box { padding: 10px; border-radius: 10px; text-align: center; font-family: monospace; }
+    .target-title { font-size: 0.68rem; font-weight: 800; text-transform: uppercase; margin-bottom: 5px; letter-spacing: 0.5px; }
+    .target-val { font-size: 0.88rem; font-weight: 900; }
+    .target-sl { background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.35); color: var(--red); }
+    .target-be { background: rgba(56, 189, 248, 0.15); border: 1px solid rgba(56, 189, 248, 0.35); color: var(--blue); }
+    .target-tp { background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.35); color: var(--green); }
 
     /* BOTÕES */
     .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     button { padding: 14px; border: none; border-radius: 10px; font-size: 0.85rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; color: white; cursor: pointer; transition: 0.2s; outline: none; }
     button:active { transform: scale(0.97); }
-    .btn-buy { background: linear-gradient(135deg, #059669 0%, #10B981 100%); box-shadow: 0 4px 12px rgba(16, 185, 129, 0.25); }
-    .btn-sell { background: linear-gradient(135deg, #DC2626 0%, #EF4444 100%); box-shadow: 0 4px 12px rgba(239, 68, 68, 0.25); }
+    .btn-buy { background: linear-gradient(135deg, #059669 0%, #10B981 100%); box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3); }
+    .btn-sell { background: linear-gradient(135deg, #DC2626 0%, #EF4444 100%); box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3); }
     .btn-close { background: linear-gradient(135deg, #F59E0B 0%, #D97706 100%); }
     .btn-reverse { background: linear-gradient(135deg, #8B5CF6 0%, #6D28D9 100%); }
-    .btn-ia-advise { width: 100%; padding: 12px; background: rgba(212,175,55,0.15); border: 1px solid var(--gold); color: var(--gold); border-radius: 10px; font-size: 0.8rem; font-weight: 800; cursor: pointer; transition: 0.2s; }
+    .btn-ia-advise { width: 100%; padding: 13px; background: rgba(212,175,55,0.15); border: 1px solid var(--gold); color: var(--gold); border-radius: 10px; font-size: 0.82rem; font-weight: 800; cursor: pointer; transition: 0.2s; }
     .btn-ia-advise:hover { background: rgba(212,175,55,0.25); }
 
-    .pos-card { background: rgba(0,0,0,0.5); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 12px; padding: 14px; display: none; }
-    .pos-header { display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 6px; }
-    .pos-pnl { font-size: 1.45rem; font-weight: 800; text-align: center; margin: 4px 0; }
-    .status { text-align: center; font-size: 0.82rem; color: var(--text-muted); min-height: 1.4rem; font-weight: 600; }
+    .status { text-align: center; font-size: 0.85rem; color: var(--text-muted); min-height: 1.4rem; font-weight: 600; }
 
-    .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); backdrop-filter: blur(6px); display: none; justify-content: center; align-items: center; z-index: 999; }
-    .modal { background: var(--bg); border: 1px solid var(--card-border); border-radius: 16px; width: 90%; max-width: 650px; max-height: 82vh; overflow-y: auto; padding: 22px; }
-    .modal-head { display: flex; justify-content: space-between; margin-bottom: 16px; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
-    .trade-row { display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 6px; border-bottom: 1px dashed rgba(255,255,255,0.08); padding-bottom: 6px; }
+    /* MODAL HISTÓRICO COM VISUAL INSTITUCIONAL */
+    .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.88); backdrop-filter: blur(8px); display: none; justify-content: center; align-items: center; z-index: 999; }
+    .modal { background: #0c0f1d; border: 1px solid var(--card-border); border-radius: 20px; width: 92%; max-width: 720px; max-height: 85vh; overflow-y: auto; padding: 24px; box-shadow: 0 8px 35px rgba(0,0,0,0.6); }
+    .modal-head { display: flex; justify-content: space-between; margin-bottom: 18px; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+
+    .hist-summary-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 20px; }
+    .hist-stat-card { background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 12px; padding: 14px; text-align: center; }
+    .hist-stat-title { font-size: 0.72rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase; margin-bottom: 4px; }
+    .hist-stat-val { font-size: 1.35rem; font-weight: 900; }
+    .hist-stat-count { font-size: 0.85rem; color: var(--text-muted); font-weight: 600; }
+
+    .trade-card-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: rgba(255,255,255,0.025);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 16px;
+      margin-bottom: 10px;
+      transition: 0.2s;
+    }
+    .trade-card-row:hover { background: rgba(255,255,255,0.05); }
+    .trade-left { display: flex; flex-direction: column; gap: 4px; }
+    .trade-sym-row { display: flex; align-items: center; gap: 8px; }
+    .trade-sym { font-weight: 800; color: #FFF; font-size: 0.95rem; }
+    .trade-side-pill { font-size: 0.7rem; font-weight: 800; padding: 2px 7px; border-radius: 4px; }
+    .pill-buy { background: rgba(16,185,129,0.2); color: var(--green); }
+    .pill-sell { background: rgba(239,68,68,0.2); color: var(--red); }
+    .trade-tag-pill { font-size: 0.7rem; font-weight: 800; padding: 2px 7px; border-radius: 4px; }
+    .trade-date { font-size: 0.72rem; color: var(--text-muted); }
+    .trade-right { text-align: right; display: flex; flex-direction: column; gap: 2px; }
+    .trade-pnl { font-size: 1.15rem; font-weight: 900; }
+    .trade-fee { font-size: 0.72rem; color: var(--text-muted); }
 
     @media (max-width: 820px) {
       .grid { grid-template-columns: 1fr; }
       .perf-header-bar { flex-direction: column; text-align: center; }
       .header-stat-group { justify-content: center; }
+      .hist-summary-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -1835,10 +1880,10 @@ app.get('/', (req, res) => {
 
   <!-- MODAL DE CONFIRMAÇÃO ESTÉTICO -->
   <div class="modal-overlay" id="modal-confirm">
-    <div class="modal" style="max-width: 420px; text-align: center;">
-      <h3 id="modal-confirm-title" style="color: var(--gold); margin-bottom: 15px; font-size: 1.25rem;">Confirmação</h3>
+    <div class="modal" style="max-width: 440px; text-align: center;">
+      <h3 id="modal-confirm-title" style="color: var(--gold); margin-bottom: 15px; font-size: 1.3rem;">Confirmação</h3>
       <div id="modal-confirm-body" style="color: var(--text); font-size: 0.95rem; margin-bottom: 25px; line-height: 1.5;"></div>
-      <div style="display: flex; gap: 10px; justify-content: center;" id="modal-confirm-actions">
+      <div style="display: flex; gap: 12px; justify-content: center;" id="modal-confirm-actions">
         <button id="modal-btn-cancel" style="flex: 1; padding: 12px; background: rgba(255,255,255,0.1); color: var(--text); border: 1px solid var(--border); border-radius: 8px; font-weight: bold; cursor: pointer;">CANCELAR</button>
         <button id="modal-btn-ok" style="flex: 1; padding: 12px; background: var(--gold); color: #000; border: none; border-radius: 8px; font-weight: bold; cursor: pointer;">CONFIRMAR</button>
       </div>
@@ -1849,14 +1894,14 @@ app.get('/', (req, res) => {
   <div class="modal-overlay" id="modal-hist">
     <div class="modal">
       <div class="modal-head">
-        <h3 style="color: var(--gold);">Histórico de Ordens</h3>
-        <button onclick="fecharHistorico()" style="background:transparent; border:none; color:var(--text-muted); font-size:1.4rem; cursor:pointer;">&times;</button>
+        <h3 style="color: var(--gold); font-size: 1.25rem;">Histórico Institucional de Ordens</h3>
+        <button onclick="fecharHistorico()" style="background:transparent; border:none; color:var(--text-muted); font-size:1.5rem; cursor:pointer;">&times;</button>
       </div>
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; flex-wrap:wrap; gap:10px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:10px;">
         <div style="display:flex; gap:8px;">
-          <button id="btn-tab-periodo" onclick="mudarAbaHist('periodo')" style="padding:7px 14px; font-size:0.8rem; background:var(--gold); color:#000; border-radius:6px; font-weight:bold; cursor:pointer;">Agrupado</button>
-          <button id="btn-tab-hoje" onclick="mudarAbaHist('hoje')" style="padding:7px 14px; font-size:0.8rem; background:rgba(255,255,255,0.08); color:var(--text); border-radius:6px; cursor:pointer;">Hoje</button>
-          <button id="btn-tab-todas" onclick="mudarAbaHist('todas')" style="padding:7px 14px; font-size:0.8rem; background:rgba(255,255,255,0.08); color:var(--text); border-radius:6px; cursor:pointer;">Todas</button>
+          <button id="btn-tab-periodo" onclick="mudarAbaHist('periodo')" style="padding:8px 16px; font-size:0.8rem; background:var(--gold); color:#000; border-radius:8px; font-weight:800; cursor:pointer;">Agrupado</button>
+          <button id="btn-tab-hoje" onclick="mudarAbaHist('hoje')" style="padding:8px 16px; font-size:0.8rem; background:rgba(255,255,255,0.08); color:var(--text); border-radius:8px; cursor:pointer; font-weight:700;">Hoje</button>
+          <button id="btn-tab-todas" onclick="mudarAbaHist('todas')" style="padding:8px 16px; font-size:0.8rem; background:rgba(255,255,255,0.08); color:var(--text); border-radius:8px; cursor:pointer; font-weight:700;">Todas</button>
         </div>
       </div>
       <div id="hist-content">Carregando...</div>
@@ -1886,7 +1931,7 @@ app.get('/', (req, res) => {
 
         <div class="stat-box">
           <span class="stat-label">Tokens Gastos</span>
-          <span style="font-size:1.15rem; font-weight:800; color:var(--purple);" id="total-tokens-val">0</span>
+          <span style="font-size:1.25rem; font-weight:900; color:var(--purple);" id="total-tokens-val">0</span>
         </div>
       </div>
 
@@ -1904,17 +1949,17 @@ app.get('/', (req, res) => {
     <div class="bot-control-bar">
       <div class="bot-control-top">
         <div style="display:flex; align-items:center; gap:12px;">
-          <button id="btn-auto-toggle" onclick="toggleAutoBot()" style="padding:10px 18px; font-size:0.85rem; border-radius:8px; border:1px solid var(--green); background:rgba(16, 185, 129, 0.2); color:var(--green); cursor:pointer; font-weight:800;">
+          <button id="btn-auto-toggle" onclick="toggleAutoBot()" style="padding:10px 18px; font-size:0.85rem; border-radius:10px; border:1px solid var(--green); background:rgba(16, 185, 129, 0.2); color:var(--green); cursor:pointer; font-weight:900;">
             LIGAR ROBÔ IA
           </button>
           <span id="auto-status-text" style="font-size:0.9rem; color:var(--text-muted); font-weight:bold;">Robô Desligado</span>
         </div>
         <div style="display:flex; align-items:center; gap:10px;">
           <span style="font-size:0.8rem; color:var(--text-muted);">Memória RAG:</span>
-          <span id="auto-rag-badge" style="font-size:0.8rem; color:var(--gold); font-weight:bold; background:rgba(212, 175, 55, 0.15); border:1px solid rgba(212, 175, 55, 0.35); padding:3px 10px; border-radius:6px;">0 trades</span>
+          <span id="auto-rag-badge" style="font-size:0.8rem; color:var(--gold); font-weight:bold; background:rgba(212, 175, 55, 0.15); border:1px solid rgba(212, 175, 55, 0.35); padding:4px 12px; border-radius:8px;">0 trades</span>
         </div>
       </div>
-      <div style="font-size:0.78rem; color:var(--text-muted); font-family:monospace; background:rgba(0,0,0,0.3); padding:8px 12px; border-radius:8px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border:1px solid var(--border);" id="auto-log-text">
+      <div style="font-size:0.8rem; color:var(--text-muted); font-family:monospace; background:rgba(0,0,0,0.3); padding:9px 14px; border-radius:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border:1px solid var(--border);" id="auto-log-text">
         Nenhum evento registrado.
       </div>
     </div>
@@ -2118,27 +2163,64 @@ app.get('/', (req, res) => {
           document.getElementById('alav-val-' + col).innerText = data.leverageSugerida + 'x';
         }
 
-        // Posição Aberta
+        // ── POSIÇÃO ABERTA (ALTO DESTAQUE VISUAL COM GLOW) ──
         const posBox = document.getElementById('pos-' + col);
+        const cardEl = document.getElementById('card-' + col);
         if (data.pos) {
           posBox.style.display = 'block';
           const p = data.pos;
           const ladoEl = document.getElementById('pos-lado-' + col);
-          ladoEl.innerText = p.lado + " " + p.alavancagem + "x";
-          ladoEl.className = p.lado === 'LONG' ? 'text-green' : 'text-red';
+          const isLong = p.lado === 'LONG';
+          ladoEl.innerHTML = '<span class="pos-side-pill ' + (isLong ? 'badge-long' : 'badge-short') + '">' + p.lado + ' ' + p.alavancagem + 'x</span>';
+
           document.getElementById('pos-qty-' + col).innerText = "Qty: " + p.quantidade;
 
           const pnl = p.pnlNaoRealizado;
           const margem = p.margem || ((p.quantidade * p.precoEntrada) / p.alavancagem);
           let roi = margem > 0 ? (pnl / margem) * 100 : 0;
-          const sinal = pnl >= 0 ? '+' : '';
+          const isProfit = pnl >= 0;
+          const sinal = isProfit ? '+' : '';
+          const cor = isProfit ? '#10B981' : '#EF4444';
           const pnlEl = document.getElementById('pos-pnl-' + col);
-          pnlEl.innerHTML = (pnl >= 0 ? "+$ " : "-$ ") + Math.abs(pnl).toFixed(2) + ' (' + sinal + roi.toFixed(2) + '%)';
-          pnlEl.className = "pos-pnl " + (pnl >= 0 ? 'text-green' : 'text-red');
-          document.getElementById('pos-pnl-brl-' + col).innerText = 'R$ ' + Math.abs(pnl * brlGlobal).toFixed(2);
-          document.getElementById('pos-entry-' + col).innerText = p.precoEntrada.toFixed(4);
+          const pnlBrlEl = document.getElementById('pos-pnl-brl-' + col);
+
+          // Destaque visual: Verde vibrante se ganhando, Vermelho se perdendo
+          pnlEl.style.color = cor;
+          pnlEl.style.textShadow = '0 0 20px ' + (isProfit ? 'rgba(16, 185, 129, 0.6)' : 'rgba(239, 68, 68, 0.6)');
+          pnlEl.innerText = (isProfit ? "+$ " : "-$ ") + Math.abs(pnl).toFixed(2) + ' (' + sinal + roi.toFixed(2) + '%)';
+
+          pnlBrlEl.style.color = isProfit ? '#34D399' : '#F87171';
+          pnlBrlEl.innerText = (isProfit ? "+R$ " : "-R$ ") + Math.abs(pnl * brlGlobal).toFixed(2);
+
+          posBox.style.border = '2px solid ' + cor;
+          posBox.style.boxShadow = '0 0 25px ' + (isProfit ? 'rgba(16, 185, 129, 0.35)' : 'rgba(239, 68, 68, 0.35)');
+          posBox.style.background = isProfit
+            ? 'linear-gradient(180deg, rgba(16,185,129,0.18) 0%, rgba(6,78,59,0.25) 100%)'
+            : 'linear-gradient(180deg, rgba(239,68,68,0.18) 0%, rgba(127,29,29,0.25) 100%)';
+
+          if (cardEl) {
+            cardEl.style.borderColor = isProfit ? 'rgba(16, 185, 129, 0.7)' : 'rgba(239, 68, 68, 0.7)';
+            cardEl.style.boxShadow = '0 0 25px ' + (isProfit ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)');
+          }
+
+          document.getElementById('pos-entry-' + col).innerText = '$ ' + p.precoEntrada.toFixed(4);
+
+          // Banner de Breakeven se armado
+          const beEl = document.getElementById('pos-be-status-' + col);
+          if (beEl) {
+            if (data.beArmed) {
+              beEl.style.display = 'block';
+              beEl.innerText = '🛡️ BREAKEVEN ATIVADO (STOP PROTEGIDO NO 0 A 0 COM GANHO)';
+            } else {
+              beEl.style.display = 'none';
+            }
+          }
         } else {
           posBox.style.display = 'none';
+          if (cardEl) {
+            cardEl.style.borderColor = (colunaAtiva === col ? 'rgba(212, 175, 55, 0.55)' : 'var(--card-border)');
+            cardEl.style.boxShadow = (colunaAtiva === col ? '0 0 25px rgba(212, 175, 55, 0.1)' : '0 4px 20px rgba(0,0,0,0.35)');
+          }
         }
       } catch(e) {
         document.getElementById('status-' + col).innerText = "Falha de rede";
@@ -2469,7 +2551,7 @@ app.get('/', (req, res) => {
       }
     }
 
-    // ── HISTÓRICO MODAL ──
+    // ── HISTÓRICO MODAL INSTITUCIONAL ──
     let abaAtualHist = 'periodo';
     let todosTradesCache = [];
 
@@ -2488,11 +2570,11 @@ app.get('/', (req, res) => {
         if (t === aba) {
           btn.style.background = 'var(--gold)';
           btn.style.color = '#000';
-          btn.style.fontWeight = 'bold';
+          btn.style.fontWeight = '800';
         } else {
           btn.style.background = 'rgba(255,255,255,0.08)';
           btn.style.color = 'var(--text)';
-          btn.style.fontWeight = 'normal';
+          btn.style.fontWeight = '600';
         }
       });
       renderizarAbaHistorico();
@@ -2500,25 +2582,25 @@ app.get('/', (req, res) => {
 
     async function carregarHistoricoCompleto() {
       const container = document.getElementById('hist-content');
-      container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">Carregando histórico Binance...</div>';
+      container.innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-muted); font-weight:600;">Carregando histórico Binance...</div>';
       try {
         const res = await fetch('/api/historico-completo');
         const data = await res.json();
         if (!data.success || !data.trades || data.trades.length === 0) {
-          container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">Nenhum trade encontrado.</div>';
+          container.innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-muted); font-weight:600;">Nenhum trade encontrado.</div>';
           return;
         }
         todosTradesCache = data.trades;
         renderizarAbaHistorico();
       } catch(e) {
-        container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--red);">Erro ao carregar histórico.</div>';
+        container.innerHTML = '<div style="text-align:center; padding:30px; color:var(--red); font-weight:700;">Erro ao carregar histórico.</div>';
       }
     }
 
     function renderizarAbaHistorico() {
       const container = document.getElementById('hist-content');
       if (!todosTradesCache || todosTradesCache.length === 0) {
-        container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">Sem registros.</div>';
+        container.innerHTML = '<div style="text-align:center; padding:30px; color:var(--text-muted); font-weight:600;">Sem registros.</div>';
         return;
       }
 
@@ -2563,19 +2645,29 @@ app.get('/', (req, res) => {
     }
 
     function renderListaSimples(lista, titulo) {
-      if (lista.length === 0) return '<div style="text-align:center; padding:20px; color:var(--text-muted);">Nenhum trade encontrado em ' + titulo + '.</div>';
-      let html = '<div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:12px; font-weight:600;">Exibindo ' + lista.length + ' ordens (' + titulo + ')</div>';
+      if (lista.length === 0) return '<div style="text-align:center; padding:30px; color:var(--text-muted); font-weight:600;">Nenhum trade encontrado em ' + titulo + '.</div>';
+      let html = '<div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:14px; font-weight:700;">Exibindo ' + lista.length + ' ordens (' + titulo + ')</div>';
       lista.forEach(g => {
-        const cor = g.pnl > 0 ? 'var(--green)' : (g.pnl < 0 ? 'var(--red)' : 'var(--text-muted)');
+        const isWin = g.pnl > 0.0001;
+        const isLoss = g.pnl < -0.0001;
+        const cor = isWin ? '#10B981' : (isLoss ? '#EF4444' : '#94A3B8');
+        const borderCor = isWin ? 'var(--green)' : (isLoss ? 'var(--red)' : 'var(--border)');
+        const bgBadge = isWin ? 'rgba(16,185,129,0.18)' : (isLoss ? 'rgba(239,68,68,0.18)' : 'rgba(255,255,255,0.06)');
         const dataStr = new Date(g.time).toLocaleString('pt-BR');
-        html += '<div class="trade-row">' +
-            '<div>' +
-              '<b style="color:var(--text);">' + g.symbol + '</b> <span style="font-size:0.75rem; color:' + (g.side === 'BUY' ? 'var(--green)' : 'var(--red)') + ';">' + g.side + '</span>' +
-              '<div style="font-size:0.7rem; color:var(--text-muted);">' + dataStr + '</div>' +
+        const tag = isWin ? 'WIN' : (isLoss ? 'LOSS' : '0 a 0');
+
+        html += '<div class="trade-card-row" style="border-left: 4px solid ' + borderCor + ';">' +
+            '<div class="trade-left">' +
+              '<div class="trade-sym-row">' +
+                '<span class="trade-sym">' + g.symbol + '</span>' +
+                '<span class="trade-side-pill ' + (g.side === 'BUY' ? 'pill-buy' : 'pill-sell') + '">' + (g.side === 'BUY' ? 'COMPRA' : 'VENDA') + '</span>' +
+                '<span class="trade-tag-pill" style="color:' + cor + '; background:' + bgBadge + ';">' + tag + '</span>' +
+              '</div>' +
+              '<div class="trade-date">' + dataStr + '</div>' +
             '</div>' +
-            '<div style="text-align:right;">' +
-              '<span style="font-weight:bold; color:' + cor + ';">' + (g.pnl >= 0 ? '+' : '') + '$ ' + g.pnl.toFixed(2) + '</span>' +
-              '<div style="font-size:0.7rem; color:var(--text-muted);">Taxa: $ ' + g.fee.toFixed(4) + '</div>' +
+            '<div class="trade-right">' +
+              '<div class="trade-pnl" style="color:' + cor + ';">' + (g.pnl >= 0 ? '+' : '') + '$ ' + g.pnl.toFixed(2) + '</div>' +
+              '<div class="trade-fee">Taxa: $ ' + g.fee.toFixed(4) + '</div>' +
             '</div>' +
           '</div>';
       });
@@ -2586,25 +2678,29 @@ app.get('/', (req, res) => {
       let totWin = 0, totLoss = 0, totPnl = 0, totFee = 0;
       lista.forEach(g => {
         if (g.hasPnl) {
-          if (g.pnl > 0) totWin++;
-          else if (g.pnl < 0) totLoss++;
+          if (g.pnl > 0.0001) totWin++;
+          else if (g.pnl < -0.0001) totLoss++;
           totPnl += g.pnl;
         }
         totFee += g.fee;
       });
 
       const winRate = (totWin + totLoss) > 0 ? Math.round((totWin / (totWin + totLoss)) * 100) : 0;
-      return '<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px;">' +
-          '<div style="background:rgba(0,0,0,0.35); border:1px solid var(--border); padding:12px; border-radius:10px;">' +
-            '<div style="font-size:0.75rem; color:var(--text-muted); font-weight:600;">Taxa de Acerto Geral</div>' +
-            '<div style="font-size:1.35rem; font-weight:800; color:' + (winRate >= 50 ? 'var(--green)' : 'var(--gold)') + ';">' + winRate + '% <span style="font-size:0.85rem; color:var(--text-muted);">(' + totWin + 'W / ' + totLoss + 'L)</span></div>' +
+      return '<div class="hist-summary-grid">' +
+          '<div class="hist-stat-card">' +
+            '<div class="hist-stat-title">Taxa de Acerto Geral</div>' +
+            '<div class="hist-stat-val" style="color:' + (winRate >= 50 ? 'var(--green)' : 'var(--gold)') + ';">' + winRate + '% <span class="hist-stat-count">(' + totWin + 'W / ' + totLoss + 'L)</span></div>' +
           '</div>' +
-          '<div style="background:rgba(0,0,0,0.35); border:1px solid var(--border); padding:12px; border-radius:10px;">' +
-            '<div style="font-size:0.75rem; color:var(--text-muted); font-weight:600;">PnL Realizado Líquido</div>' +
-            '<div style="font-size:1.35rem; font-weight:800; color:' + (totPnl >= 0 ? 'var(--green)' : 'var(--red)') + ';">' + (totPnl >= 0 ? '+' : '') + '$ ' + totPnl.toFixed(2) + '</div>' +
+          '<div class="hist-stat-card">' +
+            '<div class="hist-stat-title">PnL Realizado Líquido</div>' +
+            '<div class="hist-stat-val" style="color:' + (totPnl >= 0 ? 'var(--green)' : 'var(--red)') + ';">' + (totPnl >= 0 ? '+' : '') + '$ ' + totPnl.toFixed(2) + '</div>' +
+          '</div>' +
+          '<div class="hist-stat-card">' +
+            '<div class="hist-stat-title">Total de Corretagem</div>' +
+            '<div class="hist-stat-val text-gold">-$ ' + totFee.toFixed(2) + '</div>' +
           '</div>' +
         '</div>' +
-        renderListaSimples(lista.slice(0, 30), 'Últimas 30 Ordens');
+        renderListaSimples(lista.slice(0, 40), 'Últimas 40 Operações');
     }
 
     function fazerLogout() {
