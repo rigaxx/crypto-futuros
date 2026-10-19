@@ -1,15 +1,15 @@
-const express = require('express');
-const cors = require('cors');
 const path = require('path');
 const dotenv = require('dotenv');
+dotenv.config({ path: path.join(__dirname, '.env') });
+
+const express = require('express');
+const cors = require('cors');
 const fut = require('./lib/futuresApi');
 const ti = require('technicalindicators');
 const axios = require('axios');
 const fs = require('fs');
 const db = require('./db');
 const rag = require('./lib/rag_memory');
-
-dotenv.config({ path: path.join(__dirname, '.env') });
 
 const app = express();
 app.use(cors());
@@ -307,29 +307,141 @@ async function analisarEstruturaEMercado(symbol) {
       if (bid > 0) spreadPct = ((ask - bid) / bid) * 100;
     }
 
+    // ── VELA 5M E IDENTIFICAÇÃO DE PAVIO / DIREÇÃO ──
+    const l5_open = p5.opens.slice(-1)[0] || curPrice;
+    const l5_close = p5.closes.slice(-1)[0] || curPrice;
+    const l5_high = p5.highs.slice(-1)[0] || curPrice;
+    const l5_low = p5.lows.slice(-1)[0] || curPrice;
+    const isGreen5m = l5_close >= l5_open;
+    const isRed5m = l5_close < l5_open;
+    const bodyHigh = Math.max(l5_open, l5_close);
+    const bodyLow = Math.min(l5_open, l5_close);
+    const bodySize = Math.max(0.000001, bodyHigh - bodyLow);
+    const upperWick = l5_high - bodyHigh;
+    const lowerWick = bodyLow - l5_low;
+    const hasUpperRejection = upperWick > bodySize * 1.2;
+    const hasLowerRejection = lowerWick > bodySize * 1.2;
+
+    // Tendência 1h vs 15m (EMA 21 vs EMA 50)
+    const isBull1h = ema21_1h > ema50_1h;
+    const isBear1h = ema21_1h < ema50_1h;
+    const isBull15m = ema21_15 > ema50_15;
+    const isBear15m = ema21_15 < ema50_15;
+
+    // Rompimento EMAs no 5m e 15m
+    const breakUp = curPrice > ema9_5 && curPrice > ema21_5 && curPrice > ema50_5 && curPrice > ema9_15 && curPrice > ema21_15 && curPrice > ema50_15;
+    const breakDown = curPrice < ema9_5 && curPrice < ema21_5 && curPrice < ema50_5 && curPrice < ema9_15 && curPrice < ema21_15 && curPrice < ema50_15;
+
+    // ── CLASSIFICADOR DE 3 MODOS DINÂMICOS ──
+    let modoDetectado = null;
+    let modoLabel = 'SEM SETUP';
+    let direcaoModo = null;
+    let motivoModo = 'Aguardando confluência quantitativa';
+
+    // MODO A: PULLBACK DE TENDÊNCIA (Continuidade)
+    if (isBull1h && isBull15m && distEma21Atr >= 0.2 && distEma21Atr <= 2.2 && isGreen5m) {
+      modoDetectado = 'PULLBACK';
+      modoLabel = 'PULLBACK LONG';
+      direcaoModo = 'LONG';
+      motivoModo = 'Pullback na EMA 21 (15m) a favor da tendência de alta';
+    } else if (isBear1h && isBear15m && distEma21Atr >= 0.2 && distEma21Atr <= 2.2 && isRed5m) {
+      modoDetectado = 'PULLBACK';
+      modoLabel = 'PULLBACK SHORT';
+      direcaoModo = 'SHORT';
+      motivoModo = 'Pullback na EMA 21 (15m) a favor da tendência de baixa';
+    }
+
+    // MODO B: IGNIÇÃO DE FLUXO / BREAKOUT (Momentum)
+    if (!modoDetectado) {
+      if (breakUp && rvol15m >= 1.4 && deltaOI > 0.5 && takerRatioVal > 1.10 && distEma21Atr <= 3.2) {
+        modoDetectado = 'MOMENTUM';
+        modoLabel = 'MOMENTUM LONG';
+        direcaoModo = 'LONG';
+        motivoModo = 'Rompimento de alta com RVOL, Delta OI e agressão compradora';
+      } else if (breakDown && rvol15m >= 1.4 && deltaOI > 0.5 && takerRatioVal < 0.90 && distEma21Atr <= 3.2) {
+        modoDetectado = 'MOMENTUM';
+        modoLabel = 'MOMENTUM SHORT';
+        direcaoModo = 'SHORT';
+        motivoModo = 'Rompimento de baixa com RVOL, Delta OI e agressão vendedora';
+      }
+    }
+
+    // MODO C: EXAUSTÃO / RETORNO À MÉDIA (Caça-Reversão)
+    if (!modoDetectado) {
+      if (distEma21Atr > 3.2 && rsi15m < 22 && takerRatioVal >= 0.95 && deltaOI <= 0.2 && hasLowerRejection) {
+        modoDetectado = 'EXAUSTAO_REVERSAO';
+        modoLabel = 'EXAUSTÃO REVERSÃO LONG';
+        direcaoModo = 'LONG';
+        motivoModo = 'Fundo esticado >3.2x ATR com RSI<22, pavio de rejeição e fluxo reagindo';
+      } else if (distEma21Atr > 3.2 && rsi15m > 78 && takerRatioVal <= 1.05 && deltaOI <= 0.2 && hasUpperRejection) {
+        modoDetectado = 'EXAUSTAO_REVERSAO';
+        modoLabel = 'EXAUSTÃO REVERSÃO SHORT';
+        direcaoModo = 'SHORT';
+        motivoModo = 'Topo esticado >3.2x ATR com RSI>78, pavio de rejeição e agressão exausta';
+      }
+    }
+
+    // ── SCORE DIRECIONAL AUTOMÁTICO (-100 A +100) ──
+    let directionalScore = 0;
+    // 1. Posição das EMAs (-35 a +35)
+    if (curPrice > ema9_15) directionalScore += 10; else directionalScore -= 10;
+    if (ema9_15 > ema21_15) directionalScore += 10; else directionalScore -= 10;
+    if (ema21_15 > ema50_15) directionalScore += 10; else directionalScore -= 10;
+    if (curPrice > ema21_5) directionalScore += 5; else directionalScore -= 5;
+
+    // 2. Taker Buy/Sell Ratio (-35 a +35)
+    if (takerRatioVal >= 1.30) directionalScore += 35;
+    else if (takerRatioVal >= 1.15) directionalScore += 25;
+    else if (takerRatioVal >= 1.05) directionalScore += 15;
+    else if (takerRatioVal <= 0.70) directionalScore -= 35;
+    else if (takerRatioVal <= 0.85) directionalScore -= 25;
+    else if (takerRatioVal <= 0.95) directionalScore -= 15;
+
+    // 3. Delta OI vs Preço (-30 a +30)
+    if (curPrice > ema9_15) {
+      if (deltaOI > 1.0) directionalScore += 30;
+      else if (deltaOI > 0.3) directionalScore += 20;
+      else if (deltaOI < -0.5) directionalScore += 10;
+    } else {
+      if (deltaOI > 1.0) directionalScore -= 30;
+      else if (deltaOI > 0.3) directionalScore -= 20;
+      else if (deltaOI < -0.5) directionalScore -= 10;
+    }
+    directionalScore = Math.max(-100, Math.min(100, directionalScore));
+
     // Projeções Dinâmicas de Risco (SL / TP / BE / Alavancagem)
-    // Alavancagem 1x a 5x baseada no ATR%
     let leverageSugerida = 5;
     if (atrPct15m > 1.5) leverageSugerida = 2;
     else if (atrPct15m > 1.0) leverageSugerida = 3;
     else if (atrPct15m > 0.6) leverageSugerida = 4;
     else leverageSugerida = 5;
 
-    const isLongSugerido = (mtfStatus === 'APTO_LONG');
-    const slDist = 1.8 * atr15m;
+    const ladoOp = direcaoModo || (directionalScore >= 0 ? 'LONG' : 'SHORT');
+    let slDist, tpDist, slPrice, tpPrice;
+
+    if (modoDetectado === 'EXAUSTAO_REVERSAO') {
+      // Modo C: TP exatamente na EMA 21 do 15m
+      tpPrice = ema21_15;
+      slDist = 1.5 * atr15m;
+      slPrice = ladoOp === 'LONG' ? (curPrice - slDist) : (curPrice + slDist);
+      tpDist = Math.abs(curPrice - tpPrice);
+    } else {
+      // Modos A e B: Risco:Retorno 1:2
+      slDist = 1.8 * atr15m;
+      tpDist = 2.0 * slDist;
+      slPrice = ladoOp === 'LONG' ? (curPrice - slDist) : (curPrice + slDist);
+      tpPrice = ladoOp === 'LONG' ? (curPrice + tpDist) : (curPrice - tpDist);
+    }
+
     const slPctReal = (slDist / curPrice) * 100;
     const slRoe = slPctReal * leverageSugerida;
-    const slPrice = isLongSugerido ? (curPrice - slDist) : (curPrice + slDist);
-
-    const tpDist = 2.0 * slDist; // 1:2 R:R
     const tpPctReal = (tpDist / curPrice) * 100;
     const tpRoe = tpPctReal * leverageSugerida;
-    const tpPrice = isLongSugerido ? (curPrice + tpDist) : (curPrice - tpDist);
 
-    const beTriggerDist = Math.max(curPrice * 0.012, slDist); // min 1.2% real price ou 1x SL
+    const beTriggerDist = Math.max(curPrice * 0.012, slDist);
     const beTriggerPctReal = (beTriggerDist / curPrice) * 100;
     const beTriggerRoe = beTriggerPctReal * leverageSugerida;
-    const beTriggerPrice = isLongSugerido ? (curPrice + beTriggerDist) : (curPrice - beTriggerDist);
+    const beTriggerPrice = ladoOp === 'LONG' ? (curPrice + beTriggerDist) : (curPrice - beTriggerDist);
 
     return {
       symbol,
@@ -346,6 +458,7 @@ async function analisarEstruturaEMercado(symbol) {
       emaAlignStatus, qualidadeSetup, qualidadeCor,
       deltaOI, takerRatioVal, fundingRate, oiVal,
       flatCandles5m, spreadPct,
+      modoDetectado, modoLabel, direcaoModo, motivoModo, directionalScore,
       leverageSugerida,
       slDist, slPctReal, slRoe, slPrice,
       tpDist, tpPctReal, tpRoe, tpPrice,
@@ -357,33 +470,40 @@ async function analisarEstruturaEMercado(symbol) {
   }
 }
 
-// ── GATEKEEPER HARDCODED (ETAPA 5 - 0 TOKENS) ──────────────────────────
+// ── GATEKEEPER DINÂMICO 3 MODOS (ETAPA 5 - 0 TOKENS) ─────────────────
 function verificarGatekeeper(dados) {
   if (!dados) return { passou: false, motivo: 'Dados indisponíveis' };
 
-  // Regra 1: 1h e 15m na mesma direção na EMA 50
-  const dir1h = dados.curPrice >= dados.ema50_1h ? 'BULL' : 'BEAR';
-  const dir15m = dados.curPrice >= dados.ema50_15 ? 'BULL' : 'BEAR';
-  if (dir1h !== dir15m) {
-    return { passou: false, motivo: `Gatekeeper: 1h (${dir1h}) e 15m (${dir15m}) desalinhados na EMA 50` };
-  }
-
-  // Regra 2: Distância da EMA 21 > 1.5 * ATR (preço esticado)
-  if (dados.distEma21Atr > 1.5) {
-    return { passou: false, motivo: `Gatekeeper: Preço esticado (${dados.distEma21Atr.toFixed(2)}x ATR > 1.5x) da EMA 21` };
-  }
-
-  // Regra 3: ADX(14) do 15m menor que 20 (mercado lateral/sem força)
-  if (dados.adx15m < 20) {
-    return { passou: false, motivo: `Gatekeeper: ADX fraco (${dados.adx15m.toFixed(1)} < 20)` };
-  }
-
-  // Regra 4: Moeda com variação 0.0% em mais de 2 das últimas 10 velas de 5m
   if (dados.flatCandles5m > 2) {
     return { passou: false, motivo: `Gatekeeper: Moeda zumbi (${dados.flatCandles5m} velas 0% no 5m)` };
   }
+  if (dados.spreadPct > 0.15) {
+    return { passou: false, motivo: `Gatekeeper: Spread excessivo (${dados.spreadPct.toFixed(3)}%)` };
+  }
 
-  return { passou: true, direcaoSugerida: dir1h === 'BULL' ? 'LONG' : 'SHORT' };
+  // Verifica se a moeda se enquadra em algum dos 3 modos dinâmicos
+  if (!dados.modoDetectado) {
+    return { passou: false, motivo: 'Gatekeeper: Nenhum setup ativo (nem Pullback, nem Momentum, nem Exaustão)' };
+  }
+
+  // Validação direcional por modo
+  if (dados.modoDetectado === 'PULLBACK' || dados.modoDetectado === 'MOMENTUM') {
+    if (dados.direcaoModo === 'LONG' && dados.directionalScore < 55) {
+      return { passou: false, motivo: `Gatekeeper: Score direcional insuficiente para LONG (${dados.directionalScore} < +55)` };
+    }
+    if (dados.direcaoModo === 'SHORT' && dados.directionalScore > -55) {
+      return { passou: false, motivo: `Gatekeeper: Score direcional insuficiente para SHORT (${dados.directionalScore} > -55)` };
+    }
+  }
+
+  return {
+    passou: true,
+    modo: dados.modoDetectado,
+    modoLabel: dados.modoLabel,
+    direcao: dados.direcaoModo,
+    directionalScore: dados.directionalScore,
+    motivo: dados.motivoModo
+  };
 }
 
 // ── DECISÃO QUANTITATIVA VIA GEMINI FLASH (ETAPA 6) ───────────────────
@@ -393,9 +513,12 @@ async function consultarGeminiQuant(symbol, dados) {
     return { action: 'WAIT', confidence: 0, reason_short: 'Sem chave 9Router' };
   }
 
-  const prompt = `Você é um Gestor Quantitativo Institucional de Futuros da Binance. Sua decisão padrão é WAIT (ficar de fora).
-Nunca autorize LONG após grandes altas esticadas longe da EMA 21, e nunca autorize SHORT após quedas extremas (>20% no dia) quando o 5m/15m já mostra exaustão vendedora ou divergência.
-Só aprove uma entrada (LONG ou SHORT) se houver alinhamento entre Tendência (1h/15m), Pullback na EMA 21, Fluxo Positivo (Delta OI subindo + Taker Ratio a favor) e Risco/Retorno mínimo de 1:2.
+  const prompt = `Você é um Gestor Quantitativo Institucional de Futuros da Binance.
+Avalie a oportunidade baseando-se no Modo Quantitativo Detectado:
+MODO ATIVO: ${dados.modoLabel || dados.modoDetectado}
+DIREÇÃO SUGERIDA: ${dados.direcaoModo}
+SCORE DIRECIONAL: ${dados.directionalScore} (-100 venda máxima a +100 compra máxima)
+MOTIVO DO MODO: ${dados.motivoModo}
 
 DADOS TÉCNICOS DA MOEDA ${symbol}:
 - Preço Atual: ${dados.curPrice}
@@ -412,8 +535,8 @@ DADOS TÉCNICOS DA MOEDA ${symbol}:
 
 Responda EXCLUSIVAMENTE em formato JSON (sem bloco de markdown):
 {
-  "action": "WAIT",
-  "confidence": 85,
+  "action": "LONG" | "SHORT" | "WAIT",
+  "confidence": 75,
   "leverage": ${dados.leverageSugerida},
   "stop_loss_price": ${dados.slPrice},
   "take_profit_price": ${dados.tpPrice},
@@ -450,6 +573,7 @@ Responda EXCLUSIVAMENTE em formato JSON (sem bloco de markdown):
     return { action: 'WAIT', confidence: 0, reason_short: 'Falha na IA' };
   }
 }
+
 
 // ── REGRA DE PERDÃO AOS 30 MINUTOS (ESTAGNAÇÃO) ────────────────────────
 async function consultarIAPerdao30m(symbol, pos, duracaoMinutos) {
@@ -741,18 +865,15 @@ setInterval(async () => {
         continue;
       }
 
-      const k5m = await fut.klines(cand, '5m', 10).catch(() => []);
-      if (!k5m || k5m.length < 2) continue;
-
-      const last5mOpenTime = k5m[k5m.length - 1][0];
-      if (slot.lastChecked5mTime === last5mOpenTime) {
-        // Vela de 5m atual já foi avaliada; aguarda o fechamento
-        slot.status = `MONITORANDO: ${cand} (AGUARDANDO VELA 5M)`;
+      // Ciclo ágil de avaliação a cada 60 segundos
+      if (now - (slot.lastChecked60sTime || 0) < 60000) {
+        const restSec = Math.round((60000 - (now - (slot.lastChecked60sTime || 0))) / 1000);
+        slot.status = `MONITORANDO: ${cand} (REAVALIA EM ${restSec}s)`;
         continue;
       }
 
-      slot.lastChecked5mTime = last5mOpenTime;
-      console.log(`[AUTOBOT] Slot ${slotNum}: Fechamento de vela 5m detectado em ${cand}. Analisando...`);
+      slot.lastChecked60sTime = now;
+      console.log(`[AUTOBOT] Slot ${slotNum}: Avaliando ${cand} no ciclo de 60s...`);
 
       const dados = await analisarEstruturaEMercado(cand);
       if (!dados) {
@@ -779,7 +900,7 @@ setInterval(async () => {
 
       console.log(`[AUTOBOT-IA] Decisão para ${cand}:`, dec);
 
-      if ((dec.action === 'LONG' || dec.action === 'SHORT') && dec.confidence >= 80) {
+      if ((dec.action === 'LONG' || dec.action === 'SHORT') && dec.confidence >= 65) {
         const ladoTrade = dec.action === 'LONG' ? 'BUY' : 'SELL';
         const alav = Math.min(5, Math.max(1, dec.leverage || dados.leverageSugerida));
         const valorUSDT = 10;
@@ -850,7 +971,7 @@ setInterval(async () => {
             symbol: cand,
             side: dec.action,
             leverage: alav,
-            mode: 'QUANT_MTF',
+            mode: dados.modoLabel || dados.modoDetectado || 'QUANT_MTF',
             scoreTotal: dec.confidence,
             rsi15m: dados.rsi15m,
             rsi1m: 50.0,
@@ -889,7 +1010,9 @@ setInterval(async () => {
 app.get('/api/saldo', async (req, res) => {
   try {
     const s = await fut.saldoUSDT();
-    res.json({ success: true, saldo: s });
+    const total = (typeof s === 'number') ? s : (s?.total || 0);
+    const disponivel = (typeof s === 'number') ? s : (s?.disponivel || total);
+    res.json({ success: true, saldo: total, disponivel, brl: brlGlobal });
   } catch (err) {
     res.json({ success: false, error: fut.detalheErro(err) });
   }
@@ -969,6 +1092,11 @@ app.get('/api/moeda/:symbol', async (req, res) => {
       tpRoe: dados.tpRoe,
       beTriggerPrice: dados.beTriggerPrice,
       beTriggerPctReal: dados.beTriggerPctReal,
+      modoDetectado: dados.modoDetectado,
+      modoLabel: dados.modoLabel,
+      direcaoModo: dados.direcaoModo,
+      motivoModo: dados.motivoModo,
+      directionalScore: dados.directionalScore,
       pos
     });
   } catch(err) {
@@ -1281,15 +1409,21 @@ app.get('/api/historico', async (req, res) => {
         </div>
       </div>
 
-      <!-- RSI (15m WILDER) & QUALIDADE DO SETUP -->
-      <div class="setup-quality-box">
-        <div>
-          <div style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase;">RSI (15m Wilder)</div>
-          <div id="rsi-${col}" style="font-weight:bold; font-size:1.1rem; color:var(--text);">--</div>
+      <!-- RSI (15m WILDER) & BÚSSOLA QUANT & MODO ATIVO -->
+      <div class="setup-quality-box" style="flex-direction:column; align-items:stretch; gap:6px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            <div style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase;">RSI (15m Wilder)</div>
+            <div id="rsi-${col}" style="font-weight:bold; font-size:1.1rem; color:var(--text);">--</div>
+          </div>
+          <div style="text-align:right;">
+            <div style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase;">Bússola (-100 a +100)</div>
+            <div id="trend-${col}" style="font-weight:bold; font-size:0.9rem;">--</div>
+          </div>
         </div>
-        <div style="text-align:right;">
-          <div style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase;">Qualidade do Setup</div>
-          <div id="trend-${col}" style="font-weight:bold; font-size:0.75rem;">--</div>
+        <div style="border-top:1px dashed rgba(255,255,255,0.08); padding-top:4px; display:flex; justify-content:space-between; align-items:center;">
+          <span style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase;">Regime:</span>
+          <span id="modo-badge-${col}" style="font-size:0.7rem; font-weight:bold; padding:2px 6px; border-radius:4px; background:rgba(255,255,255,0.05); color:var(--text-muted);">[AGUARDANDO MODO]</span>
         </div>
       </div>
 
@@ -1585,7 +1719,7 @@ app.get('/', (req, res) => {
         const res = await fetch('/api/saldo');
         const data = await res.json();
         if (data.success) {
-          saldoGlobal = data.saldo;
+          saldoGlobal = typeof data.saldo === 'number' ? data.saldo : (data.saldo?.total || 0);
           document.getElementById('saldo-total').innerText = '$ ' + saldoGlobal.toFixed(2);
         }
       } catch (e) {}
@@ -1672,11 +1806,34 @@ app.get('/', (req, res) => {
         document.getElementById('atr-pct-' + col).innerText = (data.atrPct15m ? data.atrPct15m.toFixed(2) + '%' : '--') + (data.atr15m ? ' ($ ' + data.atr15m.toFixed(4) + ')' : '');
         document.getElementById('adx-rvol-' + col).innerText = 'ADX: ' + (data.adx15m ? data.adx15m.toFixed(1) : '--') + ' | RVOL: ' + (data.rvol15m ? data.rvol15m.toFixed(1) + 'x' : '--');
 
-        // RSI 15m Wilder & Qualidade do Setup
+        // RSI 15m Wilder & Bússola Quant
         document.getElementById('rsi-' + col).innerText = data.rsi || '--';
         const trendEl = document.getElementById('trend-' + col);
-        trendEl.innerText = data.qualidadeSetup || '--';
-        trendEl.style.color = data.qualidadeCor || 'gray';
+        const scoreSign = (data.directionalScore > 0 ? '+' : '');
+        let scoreColor = 'var(--text-muted)';
+        if (data.directionalScore >= 55) scoreColor = 'var(--green)';
+        else if (data.directionalScore <= -55) scoreColor = 'var(--red)';
+        trendEl.innerHTML = '<span style="color:' + scoreColor + '; font-weight:bold;">' + scoreSign + (data.directionalScore || 0) + '</span>';
+
+        // Badge do Modo Ativo
+        const modoBadge = document.getElementById('modo-badge-' + col);
+        if (modoBadge) {
+          if (data.modoDetectado) {
+            let corModo = 'var(--gold)';
+            if (data.modoDetectado === 'MOMENTUM') corModo = 'var(--blue)';
+            else if (data.modoDetectado === 'PULLBACK') corModo = 'var(--green)';
+            else if (data.modoDetectado === 'EXAUSTAO_REVERSAO') corModo = 'var(--red)';
+            modoBadge.innerText = '[MODO: ' + data.modoLabel + ']';
+            modoBadge.style.color = corModo;
+            modoBadge.style.border = '1px solid ' + corModo;
+            modoBadge.style.background = 'rgba(255,255,255,0.06)';
+          } else {
+            modoBadge.innerText = '[SEM SETUP ATIVO]';
+            modoBadge.style.color = 'var(--text-muted)';
+            modoBadge.style.border = '1px solid var(--border)';
+            modoBadge.style.background = 'transparent';
+          }
+        }
 
         // Projeção de Risco
         document.getElementById('proj-alav-' + col).innerText = (data.leverageSugerida || 3) + 'x';
