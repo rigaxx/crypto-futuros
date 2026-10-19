@@ -692,9 +692,18 @@ setInterval(async () => {
         const vetados = await rag.consultarParesVetados(45).catch(() => []);
         const vetadosSet = new Set(vetados.map(v => v.symbol));
 
-        // Ordena por volatilidade excluindo pares vetados pelo Gatekeeper recentemente
+        // Ordena por volatilidade excluindo pares ativos em qualquer slot ou vetados recentemente
         const candidatos = volData
-          .filter(t => t.symbol.match(/^[A-Z0-9]+USDT$/) && t.symbol !== 'HEMIUSDT' && t.symbol !== moedaOutroSlot && !vetadosSet.has(t.symbol) && (!gatekeeperVetoedUntil[t.symbol] || now >= gatekeeperVetoedUntil[t.symbol]) && parseFloat(t.count || 0) > 1000)
+          .filter(t => {
+            const sym = t.symbol;
+            if (!sym.match(/^[A-Z0-9]+USDT$/) || sym === 'HEMIUSDT') return false;
+            if (sym === autoBotState.slots[1].symbol || sym === autoBotState.slots[1].targetSymbol) return false;
+            if (sym === autoBotState.slots[2].symbol || sym === autoBotState.slots[2].targetSymbol) return false;
+            if (vetadosSet.has(sym)) return false;
+            if (gatekeeperVetoedUntil[sym] && now < gatekeeperVetoedUntil[sym]) return false;
+            if (parseFloat(t.count || 0) <= 1000) return false;
+            return true;
+          })
           .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)))
           .slice(0, 15);
 
@@ -863,7 +872,8 @@ setInterval(async () => {
       } else {
         slot.status = `IA_WAIT: ${dec.reason_short || 'Sem confluência'}`;
         autoBotState.lastLog = `Slot ${slotNum} (${cand}) IA: ${dec.reason_short || 'Aguardar confluência'}`;
-        // Se a IA rejeitar, troca de alvo
+        // Cooldown de 5 minutos para que nenhum slot reavalie a mesma moeda rejeitada
+        gatekeeperVetoedUntil[cand] = now + 5 * 60 * 1000;
         slot.targetSymbol = null;
       }
     }
