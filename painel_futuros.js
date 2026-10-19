@@ -721,6 +721,17 @@ setInterval(async () => {
 
       // 4. Analisar no fechamento da vela de 5 minutos
       const cand = slot.targetSymbol;
+      const outroSlotNum = (slotNum === 1 ? 2 : 1);
+      const outroMoedaAtiva = autoBotState.slots[outroSlotNum].symbol;
+      const outroMoedaAlvo = autoBotState.slots[outroSlotNum].targetSymbol;
+
+      // Trava estrita anti-conflito: Slot 1 e Slot 2 NUNCA operam a mesma moeda
+      if (cand === outroMoedaAtiva || (outroMoedaAlvo && cand === outroMoedaAlvo && slotNum > outroSlotNum)) {
+        console.log(`[AUTOBOT-CONFLITO] Slot ${slotNum} abortou ${cand}: já em uso pelo Slot ${outroSlotNum}`);
+        slot.targetSymbol = null;
+        continue;
+      }
+
       const k5m = await fut.klines(cand, '5m', 10).catch(() => []);
       if (!k5m || k5m.length < 2) continue;
 
@@ -763,6 +774,14 @@ setInterval(async () => {
         const ladoTrade = dec.action === 'LONG' ? 'BUY' : 'SELL';
         const alav = Math.min(5, Math.max(1, dec.leverage || dados.leverageSugerida));
         const valorUSDT = 10;
+
+        // Garantia absoluta: não abre se já houver posição ativa na Binance
+        const posAtual = await fut.posicao(cand).catch(() => null);
+        if (posAtual && posAtual.quantidade > 0) {
+          console.log(`[AUTOBOT-CONFLITO] ${cand} já possui posição aberta. Abortando.`);
+          slot.targetSymbol = null;
+          continue;
+        }
 
         await fut.garantirAlavancagem(cand, alav, 'ISOLATED');
         const book = await fut.livroOfertas(cand, 5);
