@@ -2440,6 +2440,42 @@ app.get('/', (req, res) => {
   try {
     await fut.sincronizarRelogio('boot');
     await fut.carregarExchangeInfo();
+
+    // Sincroniza posições ativas da Binance nos slots autônomos
+    try {
+      const posAtivas = await fut.todasPosicoes();
+      if (Array.isArray(posAtivas) && posAtivas.length > 0) {
+        posAtivas.slice(0, 2).forEach((p, idx) => {
+          const sNum = idx + 1;
+          autoBotState.slots[sNum].symbol = p.symbol;
+          autoBotState.slots[sNum].targetSymbol = p.symbol;
+          autoBotState.slots[sNum].side = p.lado;
+          autoBotState.slots[sNum].leverage = p.alavancagem;
+          autoBotState.slots[sNum].openTime = p.atualizadoEm || Date.now();
+          autoBotState.slots[sNum].status = `[POSIÇÃO ATIVA] ${p.symbol} (${p.lado} ${p.alavancagem}x)`;
+          console.log(`[BOOT] Slot ${sNum} sincronizado com posição existente: ${p.symbol} (${p.lado} ${p.alavancagem}x)`);
+
+          if (!localAlvos[p.symbol]) {
+            const pEntrada = parseFloat(p.precoEntrada);
+            const isLong = p.lado === 'LONG';
+            localAlvos[p.symbol] = {
+              side: p.lado,
+              entryPrice: pEntrada,
+              slPrice: isLong ? pEntrada * 0.98 : pEntrada * 1.02,
+              tpPrice: isLong ? pEntrada * 1.04 : pEntrada * 0.96,
+              beTriggerPrice: isLong ? pEntrada * 1.015 : pEntrada * 0.985,
+              slDistPct: 0.02,
+              beArmed: false,
+              leverage: p.alavancagem
+            };
+            salvarAlvos();
+          }
+        });
+      }
+    } catch(e) {
+      console.error('[BOOT] Erro ao sincronizar posições:', e.message);
+    }
+
     app.listen(PORT, () => console.log('Painel Quant Institucional rodando na porta ' + PORT));
   } catch (e) {
     console.error("Erro no boot:", e);
