@@ -94,6 +94,7 @@ function salvarAutoBotConfig() {
 let maxPriceTracker = {};
 let minPriceTracker = {};
 let gatekeeperVetoedUntil = {};
+let lastEvaluatedCandle = {}; // Cache Anti-Spam por vela de 5m
 
 // Cotação USD/BRL
 let brlGlobal = 5.20;
@@ -443,9 +444,11 @@ async function analisarEstruturaEMercado(symbol) {
     const beTriggerRoe = beTriggerPctReal * leverageSugerida;
     const beTriggerPrice = ladoOp === 'LONG' ? (curPrice + beTriggerDist) : (curPrice - beTriggerDist);
 
+    const last5mOpenTime = (k5m && k5m.length > 0) ? k5m[k5m.length - 1][0] : 0;
     return {
       symbol,
       curPrice,
+      last5mOpenTime,
       p15, p5, p1h, p4h,
       ema9_15, ema21_15, ema50_15, ema200_15,
       ema9_5, ema21_5, ema50_5,
@@ -743,6 +746,67 @@ setInterval(async () => {
   try {
     const now = Date.now();
 
+    // ── OTIMIZAÇÃO 2: PAUSA TOTAL DE CONSULTAS DE ENTRADA COM SLOTS CHEIOS ──
+    const slot1Ocupado = !!autoBotState.slots[1].symbol;
+    const slot2Ocupado = !!autoBotState.slots[2].symbol;
+
+    if (slot1Ocupado && slot2Ocupado) {
+      autoBotState.lastLog = `[SLOTS OCUPADOS - MONITORANDO POSIÇÕES] Slot 1: ${autoBotState.slots[1].symbol} | Slot 2: ${autoBotState.slots[2].symbol}`;
+      for (const slotNum of [1, 2]) {
+        const slot = autoBotState.slots[slotNum];
+        slot.status = `[SLOTS OCUPADOS - MONITORANDO POSIÇÕES] (${slot.symbol})`;
+        try {
+          const pos = await fut.posicao(slot.symbol);
+          if (!pos || pos.quantidade === 0) {
+            slot.symbol = null;
+            slot.targetSymbol = null;
+            slot.side = null;
+            slot.status = 'LIVRE';
+            continue;
+          }
+
+          const duracaoMs = now - (slot.openTime || now);
+          if (duracaoMs >= 30 * 60 * 1000) {
+            if (now - (slot.last30mCheck || 0) >= 5 * 60 * 1000) {
+              slot.last30mCheck = now;
+              const duracaoMin = Math.round(duracaoMs / 60000);
+              console.log(`[AUTOBOT-30M] Slot ${slotNum} (${slot.symbol}): ${duracaoMin} min aberto. Avaliando estagnação...`);
+              const decisao30m = await consultarIAPerdao30m(slot.symbol, pos, duracaoMin);
+              if (decisao30m === 'FECHAR') {
+                console.log(`[AUTOBOT-30M] Slot ${slotNum}: IA recomendou FECHAR PERDÃO em ${slot.symbol}!`);
+                await fut.cancelarTodasOrdens(slot.symbol);
+                await fut.fecharMercado(slot.symbol, pos.lado, pos.quantidade);
+
+                const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
+                const roiFinal = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
+                await rag.salvarSaidaRAG({
+                  symbol: slot.symbol,
+                  exitPrice: pos.precoMarca || pos.precoEntrada,
+                  exitReason: 'PERDAO_30M',
+                  roiPct: roiFinal,
+                  pnlUsdt: pos.pnlNaoRealizado
+                }).catch(() => {});
+
+                delete localAlvos[slot.symbol];
+                delete maxPriceTracker[slot.symbol];
+                delete minPriceTracker[slot.symbol];
+                salvarAlvos();
+
+                const symFechado = slot.symbol;
+                slot.symbol = null;
+                slot.side = null;
+                slot.targetSymbol = null;
+                slot.searchCooldownUntil = now + 45000;
+                slot.status = 'PERDAO_COOLDOWN_45S';
+                autoBotState.lastLog = `Slot ${slotNum}: Fechado com perdão aos 30m em ${symFechado}. Cooldown 45s.`;
+              }
+            }
+          }
+        } catch(e) {}
+      }
+      return; // ZERO TOKENS GASTOS! NENHUMA CHAMADA DE IA PARA ENTRADA ENQUANTO SLOTS ESTIVEREM OCUPADOS!
+    }
+
     for (const slotNum of [1, 2]) {
       const slot = autoBotState.slots[slotNum];
       const outroSlot = autoBotState.slots[slotNum === 1 ? 2 : 1];
@@ -759,6 +823,8 @@ setInterval(async () => {
             slot.status = 'LIVRE';
             continue;
           }
+
+          slot.status = `[POSIÇÃO ATIVA] ${slot.symbol} (${slot.side || pos.lado} ${slot.leverage || pos.alavancagem}x)`;
 
           const duracaoMs = now - (slot.openTime || now);
           if (duracaoMs >= 30 * 60 * 1000) {
@@ -805,7 +871,7 @@ setInterval(async () => {
       // 2. Slot vago: respeitar cooldown 45s
       if (slot.searchCooldownUntil && now < slot.searchCooldownUntil) {
         const restSec = Math.round((slot.searchCooldownUntil - now) / 1000);
-        slot.status = `COOLDOWN_RESPIRADA (${restSec}s)`;
+        slot.status = `[COOLDOWN PÓS-SAÍDA] Aguardando ${restSec}s`;
         continue;
       }
 
@@ -847,12 +913,12 @@ setInterval(async () => {
 
         slot.targetSymbol = moedaEscolhida;
         slot.targetAssignedTime = now;
-        slot.lastChecked5mTime = 0;
-        slot.status = `CANDIDATO: ${moedaEscolhida} (AGUARDANDO FECHAMENTO 5M)`;
-        console.log(`[AUTOBOT] Slot ${slotNum} escolheu candidato: ${moedaEscolhida}`);
+        slot.lastChecked60sTime = 0;
+        slot.status = `CANDIDATO: ${moedaEscolhida} (AVALIANDO FLUXO)`;
+        console.log(`[AUTOBOT] Slot ${slotNum} escolheu candidato líquido: ${moedaEscolhida}`);
       }
 
-      // 4. Analisar no fechamento da vela de 5 minutos
+      // 4. Analisar candidato
       const cand = slot.targetSymbol;
       const outroSlotNum = (slotNum === 1 ? 2 : 1);
       const outroMoedaAtiva = autoBotState.slots[outroSlotNum].symbol;
@@ -873,32 +939,56 @@ setInterval(async () => {
       }
 
       slot.lastChecked60sTime = now;
-      console.log(`[AUTOBOT] Slot ${slotNum}: Avaliando ${cand} no ciclo de 60s...`);
 
       const dados = await analisarEstruturaEMercado(cand);
       if (!dados) {
         slot.status = 'ERRO_INDICADORES';
-        continue;
-      }
-
-      // ETAPA 5: GATEKEEPER HARDCODED (0 TOKENS)
-      const gk = verificarGatekeeper(dados);
-      if (!gk.passou) {
-        console.log(`[AUTOBOT-GATEKEEPER] Slot ${slotNum} (${cand}) VETADO: ${gk.motivo} (0 tokens gastos)`);
-        slot.status = `GATEKEEPER_VETO: ${gk.motivo}`;
-        autoBotState.lastLog = `Slot ${slotNum} (${cand}): ${gk.motivo}`;
-        gatekeeperVetoedUntil[cand] = now + 120000; // 2 min de respiro para testar outros pares da lista
-        // Se a moeda não passou no Gatekeeper, descarta para testar próximo candidato líquido
         slot.targetSymbol = null;
         continue;
       }
 
-      // Passou no Gatekeeper! Consulta Gemini Flash Quant
-      console.log(`[AUTOBOT] Slot ${slotNum}: ${cand} passou no Gatekeeper! Consultando Gemini Flash...`);
-      slot.status = `CONSULTANDO_IA (${cand})`;
+      const scoreTxt = (dados.directionalScore > 0 ? '+' : '') + dados.directionalScore;
+      const modoTxt = dados.modoLabel || 'SEM SETUP';
+
+      // ── OTIMIZAÇÃO: GATEKEEPER HARDCODED (0 TOKENS) ──
+      const gk = verificarGatekeeper(dados);
+      if (!gk.passou) {
+        console.log(`[GATEKEEPER-RECUSA] Slot ${slotNum} (${cand}) [${modoTxt} | Score: ${scoreTxt}]: ${gk.motivo}`);
+        slot.status = `[RECUSADO: ${gk.motivo}]`;
+        autoBotState.lastLog = `Slot ${slotNum} (${cand}): ${gk.motivo}`;
+        gatekeeperVetoedUntil[cand] = now + 120000; // 2 min de respiro para testar outros pares
+        slot.targetSymbol = null;
+        continue;
+      }
+
+      // ── OTIMIZAÇÃO 1: CACHE ANTI-SPAM POR VELA DE 5 MINUTOS ──
+      const candle5mTime = dados.last5mOpenTime || (Math.floor(now / 300000) * 300000);
+      const cached = lastEvaluatedCandle[cand];
+      if (cached && cached.candleTime === candle5mTime) {
+        const scoreDiff = Math.abs(dados.directionalScore - cached.score);
+        if (cached.action === 'WAIT' && scoreDiff < 15) {
+          console.log(`[CACHE-5M] Slot ${slotNum} (${cand}) [${modoTxt}]: Vela 5m inalterada (${new Date(candle5mTime).toLocaleTimeString('pt-BR')}), Score: ${scoreTxt} (diff: ${scoreDiff} < 15). Pulando IA (0 tokens). Motivo anterior: ${cached.reason}`);
+          slot.status = `[AGUARDANDO NOVA VELA 5M] ${cand} (Score: ${scoreTxt})`;
+          autoBotState.lastLog = `Slot ${slotNum} (${cand}): [AGUARDANDO NOVA VELA 5M] (Score: ${scoreTxt})`;
+          gatekeeperVetoedUntil[cand] = now + 60000; // 60s antes de testar de novo
+          slot.targetSymbol = null;
+          continue;
+        }
+      }
+
+      // ── CONSULTA GEMINI FLASH QUANT (CONFLUÊNCIA CONFIRMADA) ──
+      console.log(`[CONSULTANDO-IA] Slot ${slotNum} (${cand}) [${modoTxt} | Score: ${scoreTxt}] -> Chamando Gemini Flash...`);
+      slot.status = `[${modoTxt} - SCORE: ${scoreTxt}] CONSULTANDO IA...`;
       const dec = await consultarGeminiQuant(cand, dados);
 
-      console.log(`[AUTOBOT-IA] Decisão para ${cand}:`, dec);
+      // Salva no Cache Anti-Spam por vela de 5m
+      lastEvaluatedCandle[cand] = {
+        candleTime: candle5mTime,
+        score: dados.directionalScore,
+        action: dec.action,
+        reason: dec.reason_short,
+        evaluatedAt: now
+      };
 
       if ((dec.action === 'LONG' || dec.action === 'SHORT') && dec.confidence >= 65) {
         const ladoTrade = dec.action === 'LONG' ? 'BUY' : 'SELL';
@@ -932,7 +1022,6 @@ setInterval(async () => {
         let filledQty = parseFloat(st.executedQty) || 0;
 
         if (filledQty === 0) {
-          // Tenta segunda vez se não derrapou > 0.3%
           const book2 = await fut.livroOfertas(cand, 5);
           const precoExec2 = parseFloat(ladoTrade === 'BUY' ? (book2.asks[0] || [])[0] : (book2.bids[0] || [])[0]);
           if (precoExec2 && Math.abs(precoExec2 - precoExec) / precoExec <= 0.003) {
@@ -945,13 +1034,13 @@ setInterval(async () => {
         }
 
         if (filledQty > 0) {
-          console.log(`[AUTOBOT] Slot ${slotNum}: Ordem EXECUTADA em ${cand} (${dec.action} ${alav}x, Qty: ${filledQty})!`);
+          console.log(`[ORDEM-EXECUTADA] Slot ${slotNum} (${cand}) [${modoTxt}]: ${dec.action} ${alav}x a $${precoExec} | Qty: ${filledQty} | SL: $${dec.stop_loss_price || dados.slPrice} | TP: $${dec.take_profit_price || dados.tpPrice}`);
           slot.symbol = cand;
           slot.side = dec.action;
           slot.leverage = alav;
           slot.openTime = now;
           slot.last30mCheck = now;
-          slot.status = `ATIVO: ${cand} ${dec.action} ${alav}x`;
+          slot.status = `[ATIVO: ${cand} ${dec.action} ${alav}x]`;
 
           // Armar alvos em código
           localAlvos[cand] = {
@@ -988,12 +1077,12 @@ setInterval(async () => {
 
           autoBotState.lastLog = `Slot ${slotNum}: Entrou ${dec.action} em ${cand} (${alav}x). Conf: ${dec.confidence}%. ${dec.reason_short}`;
         } else {
-          slot.status = `ESCORREGOU: ${cand} (Não preencheu)`;
+          slot.status = `[ESCORREGOU: ${cand} (Não preencheu)]`;
         }
       } else {
-        slot.status = `IA_WAIT: ${dec.reason_short || 'Sem confluência'}`;
+        console.log(`[IA-RECUSA] Slot ${slotNum} (${cand}) [${modoTxt} | Score: ${scoreTxt} | Conf: ${dec.confidence}%]: ${dec.reason_short}`);
+        slot.status = `[IA RECUSOU: ${dec.reason_short || 'Sem confluência'}]`;
         autoBotState.lastLog = `Slot ${slotNum} (${cand}) IA: ${dec.reason_short || 'Aguardar confluência'}`;
-        // Cooldown de 5 minutos para que nenhum slot reavalie a mesma moeda rejeitada
         gatekeeperVetoedUntil[cand] = now + 5 * 60 * 1000;
         slot.targetSymbol = null;
       }
@@ -1004,6 +1093,7 @@ setInterval(async () => {
     autoBotLoopRunning = false;
   }
 }, 3000);
+
 
 // ── ROTAS DE API DO BACKEND ───────────────────────────────────────────
 
@@ -2104,7 +2194,17 @@ app.get('/', (req, res) => {
                 const st = document.getElementById('status-' + col);
                 if (st && sl.status) {
                   st.innerText = '🤖 ' + sl.status;
-                  st.style.color = sl.status.startsWith('ATIVO') ? 'var(--green)' : 'var(--gold)';
+                  if (sl.status.includes('ATIVO')) {
+                    st.style.color = 'var(--green)';
+                  } else if (sl.status.includes('SLOTS OCUPADOS')) {
+                    st.style.color = 'var(--blue)';
+                  } else if (sl.status.includes('AGUARDANDO')) {
+                    st.style.color = 'var(--gold)';
+                  } else if (sl.status.includes('RECUSADO') || sl.status.includes('VETO')) {
+                    st.style.color = 'var(--red)';
+                  } else {
+                    st.style.color = 'var(--text-muted)';
+                  }
                 }
               }
             });
