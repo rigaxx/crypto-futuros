@@ -1991,7 +1991,7 @@ app.get('/', (req, res) => {
             const pct = parseFloat(item.priceChangePercent);
             const cor = pct >= 0 ? 'var(--green)' : 'var(--red)';
             const sinal = pct >= 0 ? '+' : '';
-            html += '<div class="vol-item" onclick="aplicarMoeda(\'' + item.symbol + '\')">' +
+            html += '<div class="vol-item" data-sym="' + item.symbol + '" onclick="aplicarMoeda(this.dataset.sym)">' +
               '<span class="sym">' + item.symbol.replace('USDT','') + '</span>' +
               '<span class="pct" style="color:' + cor + ';">' + sinal + pct.toFixed(1) + '%</span>' +
             '</div>';
@@ -2256,7 +2256,7 @@ app.get('/', (req, res) => {
       let sym = document.getElementById('sym-' + col).value.trim().toUpperCase();
       if (!sym.endsWith('USDT')) sym += 'USDT';
 
-      if (!(await askConfirm('Fechar Posição', 'Deseja encerrar 100% da posição de <b style=\'color:var(--gold);\'>' + sym + '</b> a mercado?'))) return;
+      if (!(await askConfirm('Fechar Posição', 'Deseja encerrar 100% da posição de <b style="color:var(--gold);">' + sym + '</b> a mercado?'))) return;
 
       const st = document.getElementById('status-' + col);
       st.innerText = "Fechando...";
@@ -2287,7 +2287,7 @@ app.get('/', (req, res) => {
       let sym = document.getElementById('sym-' + col).value.trim().toUpperCase();
       if (!sym.endsWith('USDT')) sym += 'USDT';
 
-      if (!(await askConfirm('Reverter Posição', 'Deseja <b style=\'color:var(--gold);\'>REVERTER</b> a posição de ' + sym + '?'))) return;
+      if (!(await askConfirm('Reverter Posição', 'Deseja <b style="color:var(--gold);">REVERTER</b> a posição de ' + sym + '?'))) return;
 
       const st = document.getElementById('status-' + col);
       st.innerText = "Revertendo...";
