@@ -51,7 +51,7 @@ function registrarUsoTokens(usage) {
 
 const maxRoiTracker = {};
 
-// Loop de monitoramento de alvos (Soft TP/SL inteligente com Trailing de Lucro)
+// Loop de monitoramento de alvos (Proteção Contínua em Código - 0 Tokens, 0ms Delay)
 setInterval(async () => {
   for (const sym of Object.keys(localAlvos)) {
     try {
@@ -72,9 +72,9 @@ setInterval(async () => {
       else if (roi > maxRoiTracker[sym]) maxRoiTracker[sym] = roi;
       const peakRoi = maxRoiTracker[sym];
       
-      // 1. Take Profit Fixo (padrão 8%)
+      // 1. Take Profit Fixo (+8.0% ROI)
       const targetTp = alvo.tp || 8;
-      // 2. Stop Loss Fixo (padrão 10%)
+      // 2. Stop Loss Fixo (-10.0% ROI)
       const targetSl = alvo.sl || 10;
 
       let deveFechar = false;
@@ -87,13 +87,17 @@ setInterval(async () => {
         deveFechar = true;
         motivoFechamento = `[SOFT SL] Atingiu ${roi.toFixed(2)}% <= -${targetSl}%`;
       } else if (peakRoi >= 4.0 && (peakRoi - roi) >= 1.0) {
-        // Trailing Dinâmico: só ativa após o lucro atingir pelo menos 4%. Se recuar 1% do topo, garante o lucro
+        // Nível 3: Trailing Dinâmico no topo (Pico >= 4.0% e recuou 1.0% do topo)
         deveFechar = true;
         motivoFechamento = `[TRAILING 1%] Pico foi ${peakRoi.toFixed(2)}% (>=4%) e recuou 1% para ${roi.toFixed(2)}%`;
-      } else if (peakRoi >= 2.5 && roi <= 0.4) {
-        // Breakeven 0 a 0: Atingiu pelo menos +2.5% de ROI. Se recuar para +0.4% (taxas Binance pagas), fecha sem prejuízo!
+      } else if (peakRoi >= 2.5 && roi <= 1.2) {
+        // Nível 2: Lucro em expansão (Pico >= 2.5% e recuou para 1.2% -> fecha garantindo pelo menos +1.2% líquido no bolso!)
         deveFechar = true;
-        motivoFechamento = `[BREAKEVEN 0.4%] Pico foi ${peakRoi.toFixed(2)}% (>=2.5%) e recuou para ${roi.toFixed(2)}% (0 a 0 com taxas pagas)`;
+        motivoFechamento = `[LUCRO PROTEGIDO] Pico foi ${peakRoi.toFixed(2)}% (>=2.5%) e recuou para ${roi.toFixed(2)}% (garantindo lucro)`;
+      } else if (peakRoi >= 1.5 && roi <= 0.3) {
+        // Nível 1: Breakeven Seguro (Pico >= 1.5% e recuou para 0.3% -> fecha no 0 a 0 com taxas pagas, NUNCA deixa virar prejuízo!)
+        deveFechar = true;
+        motivoFechamento = `[BREAKEVEN SEGURO] Pico foi ${peakRoi.toFixed(2)}% (>=1.5%) e recuou para ${roi.toFixed(2)}% (0 a 0 com taxas pagas)`;
       }
 
       if (deveFechar) {
@@ -130,7 +134,7 @@ setInterval(async () => {
       // ignora erro de rede temporario
     }
   }
-}, 3000); // 3 segundos
+}, 1500); // 1.5 segundos
 
 const app = express();
 app.use(cors());
@@ -662,23 +666,11 @@ function calcularScoreGamificado(dados, sideDesejado = 'BUY', tesePlano = 'TENDE
     }
   }
 
-  // 7. DETECÇÃO DE ARMADILHA (Contrarian / Smart Money)
+  // 7. Cautela de multiplicação se armadilha ou funding adverso
   const fundRate = parseFloat(dados.fundingRate || 0);
-  // Se varejo berrando COMPRA (score alto), mas funding caro e RSI alto -> Armadilha de Long
-  if ((sideDesejado === 'BUY' && score >= 70 && fundRate > 0.0002) || tesePlano === 'ARMADILHA_CONTRARIA') {
-    if (tesePlano === 'ARMADILHA_CONTRARIA' || (score >= 70 && fundRate > 0.0002)) {
-      modoDetectado = 'ARMADILHA_CONTRARIA';
-      sideExecucao = sideDesejado === 'BUY' ? 'SELL' : 'BUY';
-      cautelaMultiplicacao = true;
-      score = 80;
-      detalhes.push('ARMADILHA DETECTADA! Invertendo com cautela de multiplicação');
-    }
-  } else if ((sideDesejado === 'SELL' && score >= 70 && fundRate < -0.0002)) {
-    modoDetectado = 'ARMADILHA_CONTRARIA';
-    sideExecucao = 'BUY';
+  if (tesePlano === 'ARMADILHA_CONTRARIA' || (sideDesejado === 'BUY' && fundRate > 0.0002) || (sideDesejado === 'SELL' && fundRate < -0.0002)) {
     cautelaMultiplicacao = true;
-    score = 80;
-    detalhes.push('ARMADILHA VENDA DETECTADA! Invertendo com cautela de multiplicação');
+    detalhes.push('Cautela multiplicação');
   }
 
   score = Math.max(0, Math.min(100, score));
@@ -731,7 +723,7 @@ async function buscarMelhorMoedaParaSlot(slotNum) {
 
     // Filtra pares USDT, ignora lixo da testnet, moeda do outro slot e pares vetados pelo RAG
     const top = volData
-      .filter(t => t.symbol.endsWith('USDT') && t.symbol !== 'HEMIUSDT' && t.symbol !== moedaOutroSlot && !vetadosSet.has(t.symbol))
+      .filter(t => t.symbol.match(/^[A-Z0-9]+USDT$/) && t.symbol !== 'HEMIUSDT' && t.symbol !== moedaOutroSlot && !vetadosSet.has(t.symbol) && parseFloat(t.count || 0) > 1000)
       .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)))
       .slice(0, 5);
 
@@ -1162,13 +1154,7 @@ async function executarOrdemRobo(symbol, lado, valorUSDT, alavancagem) {
     try {
       localAlvos[symbol] = { tp: null, sl: 10 };
       salvarAlvos();
-      const pos = await fut.posicao(symbol);
-      if (pos && pos.quantidade > 0) {
-        const pEntrada = pos.precoEntrada;
-        const pctSL = 0.10 / alav; // 10% de ROI
-        const pStop = pos.lado === 'LONG' ? pEntrada * (1 - pctSL) : pEntrada * (1 + pctSL);
-        await fut.colocarStopLoss(symbol, pos.lado, pStop).catch(() => {});
-      }
+      await fut.cancelarTodasOrdens(symbol).catch(() => {});
     } catch(e) { console.error('[AUTOBOT] Erro SL:', e.message); }
   };
 
@@ -1231,49 +1217,11 @@ setInterval(async () => {
           const roiAtual = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
           slot.status = `ATIVO_${pos.lado}_${pos.alavancagem}X (ROI ${roiAtual.toFixed(1)}%)`;
 
-          // CAMADA INTELIGENTE DE SEGURANÇA DO LUCRO:
-          // Se ROI >= +2.0%, avalia a cada 30s se continua surfando ou protege o ganho
-          // Se perda (negativo) ou < 2%, a IA NÃO corta (deixa oscilar até -10% SL)
-          if (roiAtual >= 2.0) {
-            if (now - (slot.lastIaProfitCheck || 0) >= 30000) {
-              slot.lastIaProfitCheck = now;
-              const peakRoi = maxRoiTracker[slot.symbol] || roiAtual;
-              console.log(`[AUTOBOT-LUCRO] Slot ${slotNum} (${slot.symbol}): ROI em +${roiAtual.toFixed(2)}% (>=2%). Consultando IA...`);
-              const decisaoLucro = await consultarIASegurancaLucro(slot.symbol, pos, roiAtual, peakRoi);
-              if (decisaoLucro === 'FECHAR') {
-                console.log(`[AUTOBOT-LUCRO] Slot ${slotNum}: IA recomendou FECHAR e proteger ganho em ${slot.symbol} (+${roiAtual.toFixed(2)}% ROI)!`);
-                await fut.cancelarTodasOrdens(slot.symbol);
-                await fut.fecharMercado(slot.symbol, pos.lado, pos.quantidade);
-
-                await rag.salvarSaidaRAG({
-                  symbol: slot.symbol,
-                  exitPrice: pos.precoEntrada ? (pos.precoEntrada * (1 + (roiAtual / 100 / (pos.alavancagem || 1)))) : 0,
-                  exitReason: 'IA_PROFIT_PROTECTION',
-                  roiPct: roiAtual,
-                  pnlUsdt: pos.pnlNaoRealizado
-                }).catch(() => {});
-
-                delete localAlvos[slot.symbol];
-                delete maxRoiTracker[slot.symbol];
-                salvarAlvos();
-
-                const symFechado = slot.symbol;
-                slot.symbol = null;
-                slot.side = null;
-                slot.targetSymbol = null;
-                slot.plano = null;
-                slot.searchCooldownUntil = now + 45000; // Cooldown 45s pós-saída
-                slot.status = 'LUCRO_PROTEGIDO_COOLDOWN_45S';
-                autoBotState.lastLog = `Slot ${slotNum}: IA protegeu lucro em ${symFechado} (+${roiAtual.toFixed(1)}% ROI). Cooldown 45s ativado.`;
-                continue;
-              } else {
-                console.log(`[AUTOBOT-LUCRO] Slot ${slotNum}: IA autorizou CONTINUAR em ${slot.symbol} (+${roiAtual.toFixed(2)}% ROI).`);
-              }
-            }
-          }
+          // A proteção de lucro (Breakeven +0.3%, Piso +1.2%, Trailing Topo e TP +8%)
+          // roda 100% no loop de código de 1.5s com 0ms de delay (sem lag de IA).
 
           // REGRA DE PERDÃO APÓS 30 MINUTOS:
-          // Se a ordem estiver aberta há mais de 30 minutos, avalia a cada 5 minutos
+          // Se a ordem estiver aberta há mais de 30 minutos, avalia a cada 5 minutos via IA
           const duracaoMs = now - (slot.openTime || now);
           if (duracaoMs >= 30 * 60 * 1000) {
             if (now - (slot.last30mCheck || 0) >= 5 * 60 * 1000) {
@@ -1531,36 +1479,7 @@ app.get('/api/win-loss', async (req, res) => {
       }
     });
 
-    // Agrupamento temporal para cálculo de Dobradinhas (janela de 10 min)
-    // Quando 2 trades ocorrem na mesma janela temporal:
-    // Ambos > 0 -> Dobradinha Win (+1)
-    // Ambos < 0 -> Dobradinha Loss (+1)
-    let sortedTrades = groups.filter(g => g.hasPnl && Math.abs(g.pnl) > 0.0001).sort((a,b) => a.time - b.time);
-    let winDobradinha = 0;
-    let lossDobradinha = 0;
-    let usedIndices = new Set();
-
-    for (let i = 0; i < sortedTrades.length; i++) {
-      if (usedIndices.has(i)) continue;
-      for (let j = i + 1; j < sortedTrades.length; j++) {
-        if (usedIndices.has(j)) continue;
-        if (Math.abs(sortedTrades[j].time - sortedTrades[i].time) <= 12 * 60 * 1000) {
-          if (sortedTrades[i].pnl > 0 && sortedTrades[j].pnl > 0) {
-            winDobradinha++;
-            usedIndices.add(i);
-            usedIndices.add(j);
-            break;
-          } else if (sortedTrades[i].pnl < 0 && sortedTrades[j].pnl < 0) {
-            lossDobradinha++;
-            usedIndices.add(i);
-            usedIndices.add(j);
-            break;
-          }
-        }
-      }
-    }
-
-    res.json({ success: true, wins, losses, winDobradinha, lossDobradinha, total: wins + losses });
+    res.json({ success: true, wins, losses, total: wins + losses });
   } catch(e) {
     res.json({ success: false, wins: 0, losses: 0, winDobradinha: 0, lossDobradinha: 0, error: e.message });
   }
@@ -1760,17 +1679,12 @@ app.get('/', (req, res) => {
        <div id="saldo-brl" style="font-size:0.75rem; color:var(--text-muted); margin-top:3px;"></div>
     </div>
 
-    <!-- PLACAR DE ACERTOS / ERROS E DOBRADINHA -->
+    <!-- PLACAR DE ACERTOS / ERROS -->
     <div style="display:flex; align-items:center; gap:8px; background:rgba(0,0,0,0.35); border:1px solid var(--border); padding:5px 10px; border-radius:8px; flex-wrap:wrap;">
        <span style="font-size:0.7rem; color:var(--text-muted); text-transform:uppercase; letter-spacing:1px;">Trades:</span>
        <span id="placar-wins" style="font-size:0.85rem; font-weight:bold; color:var(--green); background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.3); padding:2px 6px; border-radius:5px;">0 W</span>
        <span style="color:var(--text-muted); font-size:0.75rem;">/</span>
        <span id="placar-losses" style="font-size:0.85rem; font-weight:bold; color:var(--red); background:rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.3); padding:2px 6px; border-radius:5px;">0 L</span>
-
-       <span style="font-size:0.7rem; color:var(--gold); text-transform:uppercase; letter-spacing:1px; margin-left:6px; border-left:1px solid rgba(255,255,255,0.15); padding-left:8px;">Dobradinha:</span>
-       <span id="dobradinha-wins" title="Quando ambos acertaram no ciclo" style="font-size:0.85rem; font-weight:bold; color:var(--green); background:rgba(16,185,129,0.25); border:1px solid var(--green); padding:2px 6px; border-radius:5px;">0 2W</span>
-       <span style="color:var(--text-muted); font-size:0.75rem;">/</span>
-       <span id="dobradinha-losses" title="Quando ambos erraram no ciclo" style="font-size:0.85rem; font-weight:bold; color:var(--red); background:rgba(239,68,68,0.25); border:1px solid var(--red); padding:2px 6px; border-radius:5px;">0 2L</span>
 
        <button onclick="zerarPlacar()" title="Zerar contadores" style="padding:2px 6px; font-size:0.65rem; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); color:var(--text-muted); border-radius:4px; margin-left:4px; cursor:pointer;">ZERAR</button>
     </div>
@@ -2743,16 +2657,12 @@ app.get('/', (req, res) => {
         if (d.success) {
           document.getElementById('placar-wins').innerText = d.wins + ' W';
           document.getElementById('placar-losses').innerText = d.losses + ' L';
-          const dwEl = document.getElementById('dobradinha-wins');
-          const dlEl = document.getElementById('dobradinha-losses');
-          if (dwEl) dwEl.innerText = (d.winDobradinha || 0) + ' 2W';
-          if (dlEl) dlEl.innerText = (d.lossDobradinha || 0) + ' 2L';
         }
       } catch(e) {}
     }
 
     async function zerarPlacar() {
-      if (!(await askConfirm('Zerar Placar', 'Deseja reiniciar a contagem de acertos, erros e dobradinha a partir deste momento?'))) return;
+      if (!(await askConfirm('Zerar Placar', 'Deseja reiniciar a contagem de acertos e erros a partir deste momento?'))) return;
       try {
         const r = await fetch('/api/limpar-placar', { method: 'POST' });
         const d = await r.json();
