@@ -1,0 +1,20 @@
+{
+  "name": "crypto",
+  "version": "1.0.0",
+  "description": "Robô de trading Binance Futuros USDⓈ-M (mercado Spot desativado em 2026-07-27)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "axios": "^1.18.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^4.22.2",
+    "node-cron": "^4.5.0",
+    "sqlite3": "^6.0.1",
+    "technicalindicators": "^3.1.0",
+    "ws": "^8.21.1"
+  }
+}

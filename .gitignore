@@ -1,0 +1,26 @@
+# Dependências
+node_modules/
+
+# Variáveis de ambiente e segredos
+.env
+.env.local
+.env.*.local
+
+# Banco de dados e logs
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+
+# Arquivos de estado e metadados locais
+.auto_bot_config.json
+.dobradinha_stats.json
+.marco_zero_painel
+.tokens_usage.json
+.trades_metadata.json
+alvos_painel.json
+
+# Backups e arquivos temporários
+*.bak*
+_backup_*
+.DS_Store
