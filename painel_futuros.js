@@ -490,9 +490,20 @@ async function analisarEstruturaEMercado(symbol) {
     let slPctReal = (slDist / curPrice) * 100;
     let slRoe = slPctReal * leverageSugerida;
 
-    // Trava rígida em ROI para o Stop Loss: máximo -12.0% de ROI (maxSlRoi = -12.0%)
+    // Banda Saudável de Stop Loss em ROI: Piso Mínimo de 6.0% e Teto Máximo de 12.0%
+    const minSlRoi = 6.0;
     const maxSlRoi = 12.0;
-    if (slRoe > maxSlRoi) {
+
+    if (slRoe < minSlRoi) {
+      slRoe = minSlRoi;
+      slDist = curPrice * ((minSlRoi / leverageSugerida) / 100);
+      slPctReal = (slDist / curPrice) * 100;
+      slPrice = ladoOp === 'LONG' ? (curPrice - slDist) : (curPrice + slDist);
+      if (modoDetectado !== 'EXAUSTAO_REVERSAO') {
+        tpDist = 2.0 * slDist;
+        tpPrice = ladoOp === 'LONG' ? (curPrice + tpDist) : (curPrice - tpDist);
+      }
+    } else if (slRoe > maxSlRoi) {
       slRoe = maxSlRoi;
       slDist = curPrice * ((maxSlRoi / leverageSugerida) / 100);
       slPctReal = (slDist / curPrice) * 100;
@@ -1205,24 +1216,34 @@ setInterval(async () => {
           slot.last30mCheck = now;
           slot.status = `[ATIVO: ${cand} ${dec.action} ${alav}x]`;
 
-          let slPrecoDefinido = dec.stop_loss_price || dados.slPrice;
-          const slDistExec = Math.abs(precoExec - slPrecoDefinido);
-          const slRoeProj = (slDistExec / precoExec) * alav * 100;
-          if (slRoeProj > 12.0) {
-            slPrecoDefinido = dec.action === 'LONG'
-              ? (precoExec * (1 - (12.0 / alav) / 100))
-              : (precoExec * (1 + (12.0 / alav) / 100));
-          }
+          // SL e TP 100% matemáticos pelo código (IA NÃO define preços de SL ou TP)
+          let slDistExec = precoExec * (dados.slPctReal / 100);
+          let slRoeExec = (slDistExec / precoExec) * alav * 100;
 
-          let tpPrecoDefinido = dec.take_profit_price || dados.tpPrice;
-          const tpRoeProj = (Math.abs(tpPrecoDefinido - precoExec) / precoExec) * alav * 100;
+          // Banda saudável de ROI no SL: piso -6.0% e teto -12.0%
+          if (slRoeExec < 6.0) {
+            slRoeExec = 6.0;
+            slDistExec = precoExec * ((6.0 / alav) / 100);
+          } else if (slRoeExec > 12.0) {
+            slRoeExec = 12.0;
+            slDistExec = precoExec * ((12.0 / alav) / 100);
+          }
+          const slPrecoDefinido = dec.action === 'LONG' ? (precoExec - slDistExec) : (precoExec + slDistExec);
+
+          // Take Profit no dobro da distância do SL (R:R 1:2), respeitando teto dinâmico de 10.0% ROI
+          let tpDistExec = (dados.modoDetectado === 'EXAUSTAO_REVERSAO' && dados.tpPrice)
+            ? Math.abs(precoExec - dados.tpPrice)
+            : 2.0 * slDistExec;
+          let tpRoeProj = (tpDistExec / precoExec) * alav * 100;
           if (tpRoeProj > 10.0) {
-            tpPrecoDefinido = dec.action === 'LONG'
-              ? (precoExec * (1 + 0.10 / alav))
-              : (precoExec * (1 - 0.10 / alav));
+            tpDistExec = precoExec * (0.10 / alav);
           }
+          const tpPrecoDefinido = dec.action === 'LONG' ? (precoExec + tpDistExec) : (precoExec - tpDistExec);
 
-          console.log(`[ORDEM-EXECUTADA] Slot ${slotNum} (${cand}) [${modoTxt}]: ${dec.action} ${alav}x a $${formatarPrecoAtivo(cand, precoExec)} | Qty: ${filledQty} | SL: $${formatarPrecoAtivo(cand, slPrecoDefinido)} | TP: $${formatarPrecoAtivo(cand, tpPrecoDefinido)}`);
+          const beTriggerDist = precoExec * ((0.80 / alav) / 100);
+          const beTriggerPrice = dec.action === 'LONG' ? (precoExec + beTriggerDist) : (precoExec - beTriggerDist);
+
+          console.log(`[ORDEM-EXECUTADA] Slot ${slotNum} (${cand}) [${modoTxt}]: ${dec.action} ${alav}x a $${formatarPrecoAtivo(cand, precoExec)} | Qty: ${filledQty} | SL: $${formatarPrecoAtivo(cand, slPrecoDefinido)} (-${slRoeExec.toFixed(1)}% ROI) | TP: $${formatarPrecoAtivo(cand, tpPrecoDefinido)}`);
 
           // Armar alvos em código
           localAlvos[cand] = {
@@ -1230,8 +1251,8 @@ setInterval(async () => {
             entryPrice: precoExec,
             slPrice: slPrecoDefinido,
             tpPrice: tpPrecoDefinido,
-            beTriggerPrice: dec.breakeven_trigger_price || dados.beTriggerPrice,
-            slDistPct: (Math.abs(precoExec - slPrecoDefinido) / precoExec),
+            beTriggerPrice: beTriggerPrice,
+            slDistPct: (slDistExec / precoExec),
             beArmed: false,
             beStage: 0,
             beStopPrice: null,
@@ -1451,9 +1472,9 @@ app.get('/api/ia-advise/:symbol', async (req, res) => {
       decisao: dec.action,
       confianca: dec.confidence,
       alavancagem: dec.leverage || dados.leverageSugerida,
-      slPrice: dec.stop_loss_price || dados.slPrice,
-      tpPrice: dec.take_profit_price || dados.tpPrice,
-      beTriggerPrice: dec.breakeven_trigger_price || dados.beTriggerPrice,
+      slPrice: dados.slPrice,
+      tpPrice: dados.tpPrice,
+      beTriggerPrice: dados.beTriggerPrice,
       motivo: dec.reason_short
     });
   } catch(e) {
@@ -1495,26 +1516,36 @@ app.post('/api/trade', async (req, res) => {
 
     if (fill > 0) {
       const dados = await analisarEstruturaEMercado(symbol);
-      let slCalc = dados ? dados.slPrice : (lado === 'BUY' ? (preco * (1 - (12.0 / alav) / 100)) : (preco * (1 + (12.0 / alav) / 100)));
-      const slDistMan = Math.abs(preco - slCalc);
-      const slRoeProj = (slDistMan / preco) * alav * 100;
-      if (slRoeProj > 12.0) {
-        slCalc = lado === 'BUY' ? (preco * (1 - (12.0 / alav) / 100)) : (preco * (1 + (12.0 / alav) / 100));
+      let slDistMan = dados ? (dados.slPctReal / 100 * preco) : (preco * ((6.0 / alav) / 100));
+      let slRoeMan = (slDistMan / preco) * alav * 100;
+      if (slRoeMan < 6.0) {
+        slRoeMan = 6.0;
+        slDistMan = preco * ((6.0 / alav) / 100);
+      } else if (slRoeMan > 12.0) {
+        slRoeMan = 12.0;
+        slDistMan = preco * ((12.0 / alav) / 100);
       }
+      let slCalc = lado === 'BUY' ? (preco - slDistMan) : (preco + slDistMan);
 
-      let tpCalc = dados ? dados.tpPrice : (lado === 'BUY' ? (preco * (1 + 0.10 / alav)) : (preco * (1 - 0.10 / alav)));
-      const tpRoeProj = (Math.abs(tpCalc - preco) / preco) * alav * 100;
-      if (tpRoeProj > 10.0) {
-        tpCalc = lado === 'BUY' ? (preco * (1 + 0.10 / alav)) : (preco * (1 - 0.10 / alav));
+      let tpDistMan = (dados && dados.modoDetectado === 'EXAUSTAO_REVERSAO' && dados.tpPrice)
+        ? Math.abs(preco - dados.tpPrice)
+        : 2.0 * slDistMan;
+      let tpRoeMan = (tpDistMan / preco) * alav * 100;
+      if (tpRoeMan > 10.0) {
+        tpDistMan = preco * (0.10 / alav);
       }
+      let tpCalc = lado === 'BUY' ? (preco + tpDistMan) : (preco - tpDistMan);
+
+      const beTriggerDist = preco * ((0.80 / alav) / 100);
+      const beTriggerPrice = lado === 'BUY' ? (preco + beTriggerDist) : (preco - beTriggerDist);
 
       localAlvos[symbol] = {
         side: lado === 'BUY' ? 'LONG' : 'SHORT',
         entryPrice: preco,
         slPrice: slCalc,
         tpPrice: tpCalc,
-        beTriggerPrice: dados ? dados.beTriggerPrice : (lado === 'BUY' ? (preco * (1 + (0.80 / alav) / 100)) : (preco * (1 - (0.80 / alav) / 100))),
-        slDistPct: (Math.abs(preco - slCalc) / preco),
+        beTriggerPrice: beTriggerPrice,
+        slDistPct: (slDistMan / preco),
         beArmed: false,
         beStage: 0,
         beStopPrice: null,
