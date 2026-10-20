@@ -656,7 +656,7 @@ Responda APENAS JSON:
         'Authorization': `Bearer ${ROUTER_API_KEY}`,
         'Content-Type': 'application/json'
       },
-      timeout: 25000
+      timeout: 35000
     });
 
     if (resp.data?.usage) {
