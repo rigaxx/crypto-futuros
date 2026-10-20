@@ -158,11 +158,23 @@ async function atualizarBRL() {
 setInterval(atualizarBRL, 600000);
 atualizarBRL();
 
+const BLOQUEADOS_SYNTHETIC = ['SAMSUNG', 'COIN', 'SOXL', 'MVLL', 'QNTX', 'TSLA', 'AAPL', 'NVDA', 'HEMI'];
+
+function isSimboloValido(symbol) {
+  if (!symbol || typeof symbol !== 'string') return false;
+  if (!symbol.match(/^[A-Z0-9]+USDT$/)) return false;
+  if (BLOQUEADOS_SYNTHETIC.some(b => symbol.startsWith(b))) return false;
+  const f = fut.filtrosDe(symbol);
+  if (!f) return false;
+  if (!f.stepSize || !(f.minQty >= 0)) return false;
+  return true;
+}
+
 // ── FILTRO DE LIQUIDEZ E QUALIDADE (ETAPA 2) ──────────────────────────
 async function validarLiquidezMoeda(symbol) {
   try {
-    if (!symbol || !symbol.match(/^[A-Z0-9]+USDT$/) || symbol === 'HEMIUSDT') {
-      return { ok: false, motivo: 'SIMBOLO_INVALIDO' };
+    if (!isSimboloValido(symbol)) {
+      return { ok: false, motivo: 'SIMBOLO_INVALIDO_OU_SINTETICO' };
     }
 
     const [oiData, klines5m, book] = await Promise.all([
@@ -586,6 +598,25 @@ function verificarGatekeeper(dados) {
     }
   }
 
+  // Filtro Anti-Zona Morta no Modo A (Pullback) - Baseado na assinatura de SL vs TP
+  if (dados.modoDetectado === 'PULLBACK') {
+    if (dados.distEma21Atr < 0.40 && dados.rsi15m >= 46 && dados.rsi15m <= 55) {
+      return { passou: false, motivo: `Gatekeeper: Zona morta lateral (Dist EMA21 ${dados.distEma21Atr.toFixed(2)}x < 0.40x e RSI ${dados.rsi15m.toFixed(1)} entre 46 e 55)` };
+    }
+    if (dados.direcaoModo === 'LONG') {
+      if (dados.deltaOI < 0.0) {
+        return { passou: false, motivo: `Gatekeeper: Delta OI negativo para LONG (${dados.deltaOI.toFixed(2)}% < 0)` };
+      }
+      if (dados.takerRatioVal < 1.02) {
+        return { passou: false, motivo: `Gatekeeper: Taker Ratio insuficiente para LONG (${dados.takerRatioVal.toFixed(3)} < 1.02)` };
+      }
+    } else if (dados.direcaoModo === 'SHORT') {
+      if (dados.takerRatioVal > 0.96) {
+        return { passou: false, motivo: `Gatekeeper: Taker Ratio insuficiente para SHORT (${dados.takerRatioVal.toFixed(3)} > 0.96)` };
+      }
+    }
+  }
+
   return {
     passou: true,
     modo: dados.modoDetectado,
@@ -603,43 +634,21 @@ async function consultarGeminiQuant(symbol, dados) {
     return { action: 'WAIT', confidence: 0, reason_short: 'Sem chave 9Router' };
   }
 
-  const prompt = `Você é um Gestor Quantitativo Institucional de Futuros da Binance.
-Avalie a oportunidade baseando-se no Modo Quantitativo Detectado:
-MODO ATIVO: ${dados.modoLabel || dados.modoDetectado}
-DIREÇÃO SUGERIDA: ${dados.direcaoModo}
-SCORE DIRECIONAL: ${dados.directionalScore} (-100 venda máxima a +100 compra máxima)
-MOTIVO DO MODO: ${dados.motivoModo}
-
-DADOS TÉCNICOS DA MOEDA ${symbol}:
-- Preço Atual: ${dados.curPrice}
-- Tendência MTF: 1h=${dados.dir1h === 'green' ? 'ALTA' : 'BAIXA'}, 15m=${dados.dir15m === 'green' ? 'ALTA' : 'BAIXA'}, 5m=${dados.dir5m === 'green' ? 'ALTA' : 'BAIXA'}
-- EMAs 15m: EMA9=${dados.ema9_15.toFixed(4)}, EMA21=${dados.ema21_15.toFixed(4)}, EMA50=${dados.ema50_15.toFixed(4)}
-- Distância EMA21: ${dados.distEma21Atr.toFixed(2)}x ATR (ATR 15m: ${dados.atr15m.toFixed(4)} | ${dados.atrPct15m.toFixed(2)}%)
-- Força: ADX(15m)=${dados.adx15m.toFixed(1)}, RVOL(15m)=${dados.rvol15m.toFixed(2)}x, RSI(15m Wilder)=${dados.rsi15m}
-- Fluxo: Funding Rate=${(dados.fundingRate * 100).toFixed(4)}%, Δ OI(15m)=${dados.deltaOI.toFixed(2)}%, Taker Ratio=${dados.takerRatioVal.toFixed(3)}
-- Projeção de Níveis:
-  * Alavancagem Sugerida: ${dados.leverageSugerida}x
-  * Stop Loss Projetado: ${dados.slPrice.toFixed(4)} (Risco: -${dados.slPctReal.toFixed(2)}% preço, -${dados.slRoe.toFixed(1)}% ROE)
-  * Take Profit Projetado: ${dados.tpPrice.toFixed(4)} (Alvo: +${dados.tpPctReal.toFixed(2)}% preço, +${dados.tpRoe.toFixed(1)}% ROE)
-  * Breakeven Trigger: ${dados.beTriggerPrice.toFixed(4)} (+${dados.beTriggerPctReal.toFixed(2)}% preço)
-
-Responda EXCLUSIVAMENTE em formato JSON (sem bloco de markdown):
-{
-  "action": "LONG" | "SHORT" | "WAIT",
-  "confidence": 75,
-  "leverage": ${dados.leverageSugerida},
-  "stop_loss_price": ${dados.slPrice},
-  "take_profit_price": ${dados.tpPrice},
-  "breakeven_trigger_price": ${dados.beTriggerPrice},
-  "reason_short": "máximo 15 palavras explicando decisão"
-}`;
+  const prompt = `Gestor Quant Futuros. Avalie setup em ${symbol}:
+Modo: ${dados.modoLabel || dados.modoDetectado} | Dir: ${dados.direcaoModo} | Score: ${dados.directionalScore}
+Preco: ${dados.curPrice} | MTF: 1h=${dados.dir1h === 'green' ? 'ALTA' : 'BAIXA'}, 15m=${dados.dir15m === 'green' ? 'ALTA' : 'BAIXA'}
+DistEMA21: ${dados.distEma21Atr.toFixed(2)}x ATR | ATR%: ${dados.atrPct15m.toFixed(2)}% | RSI15m: ${dados.rsi15m}
+ADX: ${dados.adx15m.toFixed(1)} | RVOL: ${dados.rvol15m.toFixed(2)}x | TakerRatio: ${dados.takerRatioVal.toFixed(2)} | DeltaOI: ${dados.deltaOI.toFixed(2)}%
+Alavancagem: ${dados.leverageSugerida}x | SL: ${dados.slPrice.toFixed(4)} | TP: ${dados.tpPrice.toFixed(4)}
+Responda APENAS JSON:
+{"action":"LONG"|"SHORT"|"WAIT","confidence":0-100,"reason_short":"motivo max 10 palavras"}`;
 
   try {
     const payload = {
-      model: 'ag/gemini-3.5-flash-low',
+      model: 'ag/gemini-3.8-flash-low',
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.1,
-      max_tokens: 1800
+      max_tokens: 300
     };
 
     const resp = await axios.post('http://127.0.0.1:20128/v1/chat/completions', payload, {
@@ -647,7 +656,7 @@ Responda EXCLUSIVAMENTE em formato JSON (sem bloco de markdown):
         'Authorization': `Bearer ${ROUTER_API_KEY}`,
         'Content-Type': 'application/json'
       },
-      timeout: 15000
+      timeout: 25000
     });
 
     if (resp.data?.usage) {
@@ -668,36 +677,50 @@ Responda EXCLUSIVAMENTE em formato JSON (sem bloco de markdown):
 }
 
 
-// ── REGRA DE PERDÃO AOS 30 MINUTOS (ESTAGNAÇÃO) ────────────────────────
-async function consultarIAPerdao30m(symbol, pos, duracaoMinutos) {
-  if (!ROUTER_API_KEY) return 'MANTER';
+// ── REGRA DE PERDÃO AOS 30 MINUTOS (ESTAGNAÇÃO - CÓDIGO MATEMÁTICO 0 TOKENS) ──
+async function avaliarPerdao30mMatematico(symbol, pos, duracaoMinutos) {
   try {
+    if (duracaoMinutos < 30) return { fechar: false };
     const dados = await analisarEstruturaEMercado(symbol);
-    const prompt = `Você é um gestor de risco quantitativo. Uma ordem em ${symbol} (${pos.lado} ${pos.alavancagem}x) está aberta há ${duracaoMinutos} minutos e estagnada (sem volume).
-Preço Entrada: ${pos.precoEntrada}, Preço Atual: ${pos.precoMarca || pos.precoEntrada}, PnL: $${pos.pnlNaoRealizado}.
-RVOL: ${dados ? dados.rvol15m.toFixed(2) : 1}x, ADX: ${dados ? dados.adx15m.toFixed(1) : 20}.
-Responda JSON: {"decisao": "FECHAR" ou "MANTER", "motivo": "explicacao curta"}`;
+    if (!dados) return { fechar: false };
 
-    const resp = await axios.post('http://127.0.0.1:20128/v1/chat/completions', {
-      model: 'ag/gemini-3.5-flash-low',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1,
-      max_tokens: 1200
-    }, {
-      headers: { 'Authorization': `Bearer ${ROUTER_API_KEY}`, 'Content-Type': 'application/json' },
-      timeout: 12000
-    });
+    const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
+    const roiAtual = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
+    const alvo = localAlvos[symbol];
+    const maxRoi = alvo?.maxRoiReached || 0;
+    const isLong = pos.lado === 'LONG';
 
-    if (resp.data?.usage) registrarUsoTokens(resp.data.usage);
-    const raw = resp.data?.choices?.[0]?.message?.content?.trim() || '';
-    let jsonStr = raw;
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (jsonMatch) jsonStr = jsonMatch[0];
-    else jsonStr = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
-    const parsed = JSON.parse(jsonStr);
-    return parsed.decisao === 'FECHAR' ? 'FECHAR' : 'MANTER';
+    // 1. Perdão 30m Positivo (Lucro Estagnado): roi >= +3.00% e fluxo perdendo força ou preço cruzando EMA9 de 5m contra
+    if (roiAtual >= 3.00) {
+      const fluxoPerdeuForca = isLong
+        ? (dados.takerRatioVal < 0.98 || dados.curPrice < dados.ema9_5)
+        : (dados.takerRatioVal > 1.02 || dados.curPrice > dados.ema9_5);
+      if (fluxoPerdeuForca) {
+        return {
+          fechar: true,
+          motivo: 'PERDAO_30M_LUCRO',
+          desc: `Lucro Estagnado aos 30m (+${roiAtual.toFixed(2)}% ROI | Taker: ${dados.takerRatioVal.toFixed(2)})`
+        };
+      }
+    }
+
+    // 2. Perdão 30m Negativo (Soft Stop): roi <= -1.50% e nunca engrenou (< 1.50%) e contra EMA21 de 15m
+    if (roiAtual <= -1.50 && maxRoi < 1.50) {
+      const contraEma21 = isLong
+        ? (dados.curPrice < dados.ema21_15)
+        : (dados.curPrice > dados.ema21_15);
+      if (contraEma21) {
+        return {
+          fechar: true,
+          motivo: 'PERDAO_30M_SOFT_STOP',
+          desc: `Soft Stop aos 30m (${roiAtual.toFixed(2)}% ROI | Contra EMA21 15m)`
+        };
+      }
+    }
+
+    return { fechar: false };
   } catch(e) {
-    return 'MANTER';
+    return { fechar: false };
   }
 }
 
@@ -736,25 +759,35 @@ setInterval(async () => {
         }
         const maxRoi = alvo.maxRoiReached || 0;
 
-        // ── NOVO GERENCIAMENTO DE BREAKEVEN (3 ESTÁGIOS FIXOS EM ROI) ──
+        // ── GERENCIAMENTO DE BREAKEVEN (5 ESTÁGIOS COM COFRE EM ROI) ──
         const prevStage = alvo.beStage || 0;
         let novoEstagio = 0;
         let lockedRoi = 0;
 
-        // Estágio 3: Atingiu +3.00% de ROI em diante -> trava fixo garantindo exatamente +0.70% de ROI
-        if (maxRoi >= 3.00) {
-          novoEstagio = 3;
-          lockedRoi = 0.70;
+        // NOVO Estágio 5: Atingiu +7.50% de ROI -> sobe e trava em +5.00% ROI (garante metade do TP)
+        if (maxRoi >= 7.50) {
+          novoEstagio = 5;
+          lockedRoi = 5.00;
         }
-        // Estágio 2: Atingiu +1.50% de ROI (< 3.00) -> posiciona stop garantindo exatamente +0.50% de ROI
+        // NOVO Estágio 4: Atingiu +5.00% de ROI -> sobe e trava em +2.50% ROI (cofre contra reversões)
+        else if (maxRoi >= 5.00) {
+          novoEstagio = 4;
+          lockedRoi = 2.50;
+        }
+        // Estágio 3: Atingiu +3.00% de ROI -> trava garantindo +0.80% de ROI
+        else if (maxRoi >= 3.00) {
+          novoEstagio = 3;
+          lockedRoi = 0.80;
+        }
+        // Estágio 2: Atingiu +1.50% de ROI -> trava garantindo +0.55% de ROI
         else if (maxRoi >= 1.50) {
           novoEstagio = 2;
-          lockedRoi = 0.50;
+          lockedRoi = 0.55;
         }
-        // Estágio 1: Passou de +0.80% de ROI (< 1.50) -> posiciona stop garantindo exatamente +0.30% de ROI
+        // Estágio 1: Passou de +0.80% de ROI -> trava garantindo +0.35% de ROI (cobre slippage)
         else if (maxRoi >= 0.80) {
           novoEstagio = 1;
-          lockedRoi = 0.30;
+          lockedRoi = 0.35;
         }
         // Antes de +0.80% de ROI: Breakeven desligado. Opera apenas com SL e TP originais.
         else {
@@ -858,6 +891,13 @@ setInterval(async () => {
 
             registrarDesfechoTrade(sym, exitTipo, roi, pos.pnlNaoRealizado);
 
+            // Cooldown Pós-Breakeven: Quando uma moeda fechar no Breakeven (Estágios 1 a 5),
+            // aplique 15 minutos de cooldown para evitar recompra imediata pagando taxas
+            if (exitTipo === 'BREAKEVEN') {
+              gatekeeperVetoedUntil[sym] = Date.now() + 15 * 60 * 1000;
+              console.log(`[COOLDOWN-BREAKEVEN] ${sym} fechou em Breakeven (Estágio ${alvoBackup.beStage || 1}). Cooldown de 15 min ativado.`);
+            }
+
             // Libera slot com cooldown 45s
             [1, 2].forEach(s => {
               if (autoBotState.slots[s].symbol === sym) {
@@ -888,6 +928,7 @@ setInterval(async () => {
 
 // ── ROBÔ AUTÔNOMO CONTÍNUO (ETAPA 5: GATEKEEPER + CANDLE 5M) ───────────
 let autoBotLoopRunning = false;
+let lastAiCallTimestamp = 0; // Limita consultas de IA para no máximo 1 por ciclo de 90s
 setInterval(async () => {
   if (!autoBotState.enabled || autoBotLoopRunning) return;
   autoBotLoopRunning = true;
@@ -919,10 +960,9 @@ setInterval(async () => {
             if (now - (slot.last30mCheck || 0) >= 5 * 60 * 1000) {
               slot.last30mCheck = now;
               const duracaoMin = Math.round(duracaoMs / 60000);
-              console.log(`[AUTOBOT-30M] Slot ${slotNum} (${slot.symbol}): ${duracaoMin} min aberto. Avaliando estagnação...`);
-              const decisao30m = await consultarIAPerdao30m(slot.symbol, pos, duracaoMin);
-              if (decisao30m === 'FECHAR') {
-                console.log(`[AUTOBOT-30M] Slot ${slotNum}: IA recomendou FECHAR PERDÃO em ${slot.symbol}!`);
+              const decisao30m = await avaliarPerdao30mMatematico(slot.symbol, pos, duracaoMin);
+              if (decisao30m.fechar) {
+                console.log(`[AUTOBOT-30M] Slot ${slotNum}: ${decisao30m.desc}! Fechando a mercado.`);
                 await fut.cancelarTodasOrdens(slot.symbol);
                 await fut.fecharMercado(slot.symbol, pos.lado, pos.quantidade);
 
@@ -931,12 +971,12 @@ setInterval(async () => {
                 await rag.salvarSaidaRAG({
                   symbol: slot.symbol,
                   exitPrice: pos.precoMarca || pos.precoEntrada,
-                  exitReason: 'PERDAO_30M',
+                  exitReason: decisao30m.motivo,
                   roiPct: roiFinal,
                   pnlUsdt: pos.pnlNaoRealizado
                 }).catch(() => {});
 
-                registrarDesfechoTrade(slot.symbol, 'PERDAO_30M', roiFinal, pos.pnlNaoRealizado);
+                registrarDesfechoTrade(slot.symbol, decisao30m.motivo, roiFinal, pos.pnlNaoRealizado);
 
                 delete localAlvos[slot.symbol];
                 delete maxPriceTracker[slot.symbol];
@@ -949,7 +989,7 @@ setInterval(async () => {
                 slot.targetSymbol = null;
                 slot.searchCooldownUntil = now + 45000;
                 slot.status = 'PERDAO_COOLDOWN_45S';
-                autoBotState.lastLog = `Slot ${slotNum}: Fechado com perdão aos 30m em ${symFechado}. Cooldown 45s.`;
+                autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 30m em ${symFechado}. Cooldown 45s.`;
               }
             }
           }
@@ -982,10 +1022,9 @@ setInterval(async () => {
             if (now - (slot.last30mCheck || 0) >= 5 * 60 * 1000) {
               slot.last30mCheck = now;
               const duracaoMin = Math.round(duracaoMs / 60000);
-              console.log(`[AUTOBOT-30M] Slot ${slotNum} (${slot.symbol}): ${duracaoMin} min aberto. Avaliando estagnação...`);
-              const decisao30m = await consultarIAPerdao30m(slot.symbol, pos, duracaoMin);
-              if (decisao30m === 'FECHAR') {
-                console.log(`[AUTOBOT-30M] Slot ${slotNum}: IA recomendou FECHAR PERDÃO em ${slot.symbol}!`);
+              const decisao30m = await avaliarPerdao30mMatematico(slot.symbol, pos, duracaoMin);
+              if (decisao30m.fechar) {
+                console.log(`[AUTOBOT-30M] Slot ${slotNum}: ${decisao30m.desc}! Fechando a mercado.`);
                 await fut.cancelarTodasOrdens(slot.symbol);
                 await fut.fecharMercado(slot.symbol, pos.lado, pos.quantidade);
 
@@ -994,12 +1033,12 @@ setInterval(async () => {
                 await rag.salvarSaidaRAG({
                   symbol: slot.symbol,
                   exitPrice: pos.precoMarca || pos.precoEntrada,
-                  exitReason: 'PERDAO_30M',
+                  exitReason: decisao30m.motivo,
                   roiPct: roiFinal,
                   pnlUsdt: pos.pnlNaoRealizado
                 }).catch(() => {});
 
-                registrarDesfechoTrade(slot.symbol, 'PERDAO_30M', roiFinal, pos.pnlNaoRealizado);
+                registrarDesfechoTrade(slot.symbol, decisao30m.motivo, roiFinal, pos.pnlNaoRealizado);
 
                 delete localAlvos[slot.symbol];
                 delete maxPriceTracker[slot.symbol];
@@ -1012,7 +1051,7 @@ setInterval(async () => {
                 slot.targetSymbol = null;
                 slot.searchCooldownUntil = now + 45000;
                 slot.status = 'PERDAO_COOLDOWN_45S';
-                autoBotState.lastLog = `Slot ${slotNum}: Fechado com perdão aos 30m em ${symFechado}. Cooldown 45s.`;
+                autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 30m em ${symFechado}. Cooldown 45s.`;
                 continue;
               }
             }
@@ -1047,7 +1086,7 @@ setInterval(async () => {
         const candidatos = volData
           .filter(t => {
             const sym = t.symbol;
-            if (!sym.match(/^[A-Z0-9]+USDT$/) || sym === 'HEMIUSDT') return false;
+            if (!isSimboloValido(sym)) return false;
             if (openingOrActiveSymbols.has(sym)) return false;
             if (vetadosSet.has(sym)) return false;
             if (gatekeeperVetoedUntil[sym] && now < gatekeeperVetoedUntil[sym]) return false;
@@ -1057,25 +1096,40 @@ setInterval(async () => {
           .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)))
           .slice(0, 15);
 
-        let moedaEscolhida = null;
+        let melhorCandidato = null;
+        let maiorScore = -999;
         for (const c of candidatos) {
           const liq = await validarLiquidezMoeda(c.symbol);
-          if (liq.ok) {
-            moedaEscolhida = c.symbol;
-            break;
+          if (!liq.ok) continue;
+
+          const dados = await analisarEstruturaEMercado(c.symbol);
+          if (!dados) continue;
+
+          const gk = verificarGatekeeper(dados);
+          if (!gk.passou) {
+            gatekeeperVetoedUntil[c.symbol] = now + 120000;
+            continue;
+          }
+
+          // Prioridade para Modo B (Momentum) e Modo C (Exaustão): +15 pontos de bônus
+          const bonusModo = (dados.modoDetectado === 'MOMENTUM' || dados.modoDetectado === 'EXAUSTAO_REVERSAO') ? 15 : 0;
+          const scoreEfetivo = Math.abs(dados.directionalScore) + bonusModo;
+          if (scoreEfetivo > maiorScore) {
+            maiorScore = scoreEfetivo;
+            melhorCandidato = { symbol: c.symbol, dados, scoreEfetivo, bonusModo };
           }
         }
 
-        if (!moedaEscolhida) {
+        if (!melhorCandidato) {
           slot.status = 'SEM_MOEDAS_LIQUIDAS';
           continue;
         }
 
-        slot.targetSymbol = moedaEscolhida;
+        slot.targetSymbol = melhorCandidato.symbol;
         slot.targetAssignedTime = now;
         slot.lastChecked60sTime = 0;
-        slot.status = `CANDIDATO: ${moedaEscolhida} (AVALIANDO FLUXO)`;
-        console.log(`[AUTOBOT] Slot ${slotNum} escolheu candidato líquido: ${moedaEscolhida}`);
+        slot.status = `CANDIDATO: ${melhorCandidato.symbol} [${melhorCandidato.dados.modoLabel} | Score: ${melhorCandidato.scoreEfetivo}]`;
+        console.log(`[AUTOBOT] Slot ${slotNum} escolheu Top 1 candidato: ${melhorCandidato.symbol} (Score: ${melhorCandidato.scoreEfetivo}${melhorCandidato.bonusModo ? ' c/ bônus +15' : ''})`);
       }
 
       // 4. Analisar candidato
@@ -1136,9 +1190,17 @@ setInterval(async () => {
         }
       }
 
-      // ── CONSULTA GEMINI FLASH QUANT (CONFLUÊNCIA CONFIRMADA) ──
+      // ── LIMITAÇÃO ESTRITA: NO MÁXIMO 1 CONSULTA DE IA A CADA 90 SEGUNDOS ──
+      if (now - lastAiCallTimestamp < 90000) {
+        const restSec = Math.round((90000 - (now - lastAiCallTimestamp)) / 1000);
+        slot.status = `[CICLO IA 90S] Aguardando ${restSec}s para consultar IA (${cand})`;
+        continue;
+      }
+
+      // ── CONSULTA GEMINI FLASH QUANT (CONFLUÊNCIA CONFIRMADA - 1 MOEDA/90S) ──
       console.log(`[CONSULTANDO-IA] Slot ${slotNum} (${cand}) [${modoTxt} | Score: ${scoreTxt}] -> Chamando Gemini Flash...`);
       slot.status = `[${modoTxt} - SCORE: ${scoreTxt}] CONSULTANDO IA...`;
+      lastAiCallTimestamp = now;
       const dec = await consultarGeminiQuant(cand, dados);
 
       // Salva no Cache Anti-Spam por vela de 5m
@@ -1154,6 +1216,12 @@ setInterval(async () => {
         const ladoTrade = dec.action === 'LONG' ? 'BUY' : 'SELL';
         const alav = Math.min(5, Math.max(1, dec.leverage || dados.leverageSugerida));
         const valorUSDT = 10;
+
+        // Declaração segura com escopo prévio para evitar Temporal Dead Zone
+        let slPrecoDefinido = 0;
+        let tpPrecoDefinido = 0;
+        let slDistExec = 0;
+        let slRoeExec = 6.0;
 
         // Garantia absoluta: não abre se já houver posição ativa na Binance
         const posAtual = await fut.posicao(cand).catch(() => null);
@@ -1217,8 +1285,8 @@ setInterval(async () => {
           slot.status = `[ATIVO: ${cand} ${dec.action} ${alav}x]`;
 
           // SL e TP 100% matemáticos pelo código (IA NÃO define preços de SL ou TP)
-          let slDistExec = precoExec * (dados.slPctReal / 100);
-          let slRoeExec = (slDistExec / precoExec) * alav * 100;
+          slDistExec = precoExec * (dados.slPctReal / 100);
+          slRoeExec = (slDistExec / precoExec) * alav * 100;
 
           // Banda saudável de ROI no SL: piso -6.0% e teto -12.0%
           if (slRoeExec < 6.0) {
@@ -1228,7 +1296,7 @@ setInterval(async () => {
             slRoeExec = 12.0;
             slDistExec = precoExec * ((12.0 / alav) / 100);
           }
-          const slPrecoDefinido = dec.action === 'LONG' ? (precoExec - slDistExec) : (precoExec + slDistExec);
+          slPrecoDefinido = dec.action === 'LONG' ? (precoExec - slDistExec) : (precoExec + slDistExec);
 
           // Take Profit no dobro da distância do SL (R:R 1:2), respeitando teto dinâmico de 10.0% ROI
           let tpDistExec = (dados.modoDetectado === 'EXAUSTAO_REVERSAO' && dados.tpPrice)
@@ -1238,7 +1306,7 @@ setInterval(async () => {
           if (tpRoeProj > 10.0) {
             tpDistExec = precoExec * (0.10 / alav);
           }
-          const tpPrecoDefinido = dec.action === 'LONG' ? (precoExec + tpDistExec) : (precoExec - tpDistExec);
+          tpPrecoDefinido = dec.action === 'LONG' ? (precoExec + tpDistExec) : (precoExec - tpDistExec);
 
           const beTriggerDist = precoExec * ((0.80 / alav) / 100);
           const beTriggerPrice = dec.action === 'LONG' ? (precoExec + beTriggerDist) : (precoExec - beTriggerDist);
@@ -1263,7 +1331,7 @@ setInterval(async () => {
           };
           salvarAlvos();
 
-          // Salvar entrada no RAG
+          // Salvar entrada no RAG com sincronização completa de dados
           await rag.salvarEntradaRAG({
             symbol: cand,
             side: dec.action,
@@ -1280,7 +1348,19 @@ setInterval(async () => {
             fiboPos: `${dados.distEma21Atr.toFixed(1)}x ATR`,
             patterns: dados.qualidadeSetup,
             aiThesis: dec.reason_short,
-            entryPrice: precoExec
+            entryPrice: precoExec,
+            dadosMercado: {
+              rsi: dados.rsi15m,
+              rsi1m: 50.0,
+              emaStatus: dados.emaAlignStatus,
+              sarTendencia: dados.mtfStatus,
+              volRatio: dados.rvol15m,
+              fundingRate: dados.fundingRate,
+              longPct: dados.takerRatioVal,
+              fiboPos: `${dados.distEma21Atr.toFixed(1)}x ATR`,
+              padroesDetectados: Array.isArray(dados.qualidadeSetup) ? dados.qualidadeSetup : [dados.qualidadeSetup || 'Nenhum'],
+              preco: precoExec
+            }
           }).catch(() => {});
 
           autoBotState.lastLog = `Slot ${slotNum}: Entrou ${dec.action} em ${cand} (${alav}x). Conf: ${dec.confidence}%. ${dec.reason_short}`;
@@ -1334,7 +1414,7 @@ app.get('/api/volateis', async (req, res) => {
   try {
     const data = await fut.ticker24h();
     const candidatos = data
-      .filter(t => t.symbol.match(/^[A-Z0-9]+USDT$/) && t.symbol !== 'HEMIUSDT' && parseFloat(t.count || 0) > 1000)
+      .filter(t => isSimboloValido(t.symbol) && parseFloat(t.count || 0) > 1000)
       .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)))
       .slice(0, 20);
 
