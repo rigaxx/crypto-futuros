@@ -318,30 +318,33 @@ async function analisarEstruturaEMercado(symbol) {
     // Status da Distância da EMA 21
     let distEmaText = '';
     let distEmaColor = 'var(--gold)';
-    if (distEma21Atr <= 1.2) {
+    if (distEma21Atr >= 0.25 && distEma21Atr <= 2.2) {
       distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Zona de Pullback - OK]`;
       distEmaColor = 'var(--green)';
-    } else if (distEma21Atr <= 1.5) {
-      distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Moderado]`;
+    } else if (distEma21Atr < 0.25) {
+      distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Colado na EMA21]`;
+      distEmaColor = 'var(--gold)';
+    } else if (distEma21Atr <= 3.2) {
+      distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Zona Momentum]`;
       distEmaColor = 'var(--gold)';
     } else {
-      distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Esticado - BLOQUEADO]`;
+      distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Esticado - Exaustão]`;
       distEmaColor = 'var(--red)';
     }
 
     // Qualidade do Setup
     let qualidadeSetup = 'CONTRA-TENDÊNCIA (BLOQUEADO)';
     let qualidadeCor = 'var(--red)';
-    if (distEma21Atr > 1.5) {
+    if (distEma21Atr > 3.2) {
       qualidadeSetup = 'ESTICADO (AGUARDAR RECUO)';
       qualidadeCor = 'var(--red)';
-    } else if (aptoLong && curPrice >= ema21_15 && distEma21Atr <= 1.2) {
+    } else if (aptoLong && distEma21Atr >= 0.25 && distEma21Atr <= 2.2) {
       qualidadeSetup = 'PULLBACK A FAVOR DA TENDÊNCIA';
       qualidadeCor = 'var(--green)';
-    } else if (aptoShort && curPrice <= ema21_15 && distEma21Atr <= 1.2) {
+    } else if (aptoShort && distEma21Atr >= 0.25 && distEma21Atr <= 2.2) {
       qualidadeSetup = 'PULLBACK A FAVOR DA TENDÊNCIA';
       qualidadeCor = 'var(--green)';
-    } else if (rvol15m >= 1.5 && ((aptoLong && curPrice > ema9_15) || (aptoShort && curPrice < ema9_15))) {
+    } else if (rvol15m >= 1.4 && ((aptoLong && curPrice > ema9_15) || (aptoShort && curPrice < ema9_15))) {
       qualidadeSetup = 'ROMPIMENTO COM VOLUME';
       qualidadeCor = 'var(--blue)';
     }
@@ -405,12 +408,18 @@ async function analisarEstruturaEMercado(symbol) {
     let motivoModo = 'Aguardando confluência quantitativa';
 
     // MODO A: PULLBACK DE TENDÊNCIA (Continuidade)
-    if (isBull1h && isBull15m && distEma21Atr >= 0.2 && distEma21Atr <= 2.2 && isGreen5m) {
+    // Condição Limpa: APTO PARA OPERAR no MTF (1h e 15m alinhados e 5m verde para Long ou vermelho para Short) + EMAs Alinhadas + Distância EMA 21 entre 0.25x e 2.20x ATR + ADX >= 18
+    const mtfAptoPullbackLong = (dir1h === 'green' && dir15m === 'green' && (dir5m === 'green' || isGreen5m));
+    const mtfAptoPullbackShort = (dir1h === 'red' && dir15m === 'red' && (dir5m === 'red' || isRed5m));
+    const emasAlinhadasAlta = (ema9_15 > ema21_15 && ema21_15 > ema50_15) || (isBull1h && isBull15m);
+    const emasAlinhadasBaixa = (ema9_15 < ema21_15 && ema21_15 < ema50_15) || (isBear1h && isBear15m);
+
+    if (mtfAptoPullbackLong && emasAlinhadasAlta && distEma21Atr >= 0.25 && distEma21Atr <= 2.20 && adx15m >= 18) {
       modoDetectado = 'PULLBACK';
       modoLabel = 'PULLBACK LONG';
       direcaoModo = 'LONG';
       motivoModo = 'Pullback na EMA 21 (15m) a favor da tendência de alta';
-    } else if (isBear1h && isBear15m && distEma21Atr >= 0.2 && distEma21Atr <= 2.2 && isRed5m) {
+    } else if (mtfAptoPullbackShort && emasAlinhadasBaixa && distEma21Atr >= 0.25 && distEma21Atr <= 2.20 && adx15m >= 18) {
       modoDetectado = 'PULLBACK';
       modoLabel = 'PULLBACK SHORT';
       direcaoModo = 'SHORT';
@@ -449,30 +458,85 @@ async function analisarEstruturaEMercado(symbol) {
 
     // ── SCORE DIRECIONAL AUTOMÁTICO (-100 A +100) ──
     let directionalScore = 0;
-    // 1. Posição das EMAs (-35 a +35)
-    if (curPrice > ema9_15) directionalScore += 10; else directionalScore -= 10;
-    if (ema9_15 > ema21_15) directionalScore += 10; else directionalScore -= 10;
-    if (ema21_15 > ema50_15) directionalScore += 10; else directionalScore -= 10;
-    if (curPrice > ema21_5) directionalScore += 5; else directionalScore -= 5;
 
-    // 2. Taker Buy/Sell Ratio (-35 a +35)
-    if (takerRatioVal >= 1.30) directionalScore += 35;
-    else if (takerRatioVal >= 1.15) directionalScore += 25;
-    else if (takerRatioVal >= 1.05) directionalScore += 15;
-    else if (takerRatioVal <= 0.70) directionalScore -= 35;
-    else if (takerRatioVal <= 0.85) directionalScore -= 25;
-    else if (takerRatioVal <= 0.95) directionalScore -= 15;
-
-    // 3. Delta OI vs Preço (-30 a +30)
-    if (curPrice > ema9_15) {
-      if (deltaOI > 1.0) directionalScore += 30;
-      else if (deltaOI > 0.3) directionalScore += 20;
-      else if (deltaOI < -0.5) directionalScore += 10;
+    // 1. Alinhamento MTF (1h, 15m, 5m na EMA 50) + Alinhamento EMAs (9/21/50): peso 50 pontos (+50 para Alta, -50 para Baixa)
+    let mtfScore = 0;
+    if (dir1h === 'green' && dir15m === 'green' && dir5m === 'green') {
+      mtfScore = 30;
+    } else if (dir1h === 'red' && dir15m === 'red' && dir5m === 'red') {
+      mtfScore = -30;
     } else {
-      if (deltaOI > 1.0) directionalScore -= 30;
-      else if (deltaOI > 0.3) directionalScore -= 20;
-      else if (deltaOI < -0.5) directionalScore -= 10;
+      const gCount = (dir1h === 'green' ? 1 : 0) + (dir15m === 'green' ? 1 : 0) + (dir5m === 'green' ? 1 : 0);
+      if (gCount === 2) mtfScore = 15;
+      else if (gCount === 1) mtfScore = -15;
     }
+
+    let emaScore = 0;
+    if (ema9_15 > ema21_15 && ema21_15 > ema50_15) {
+      emaScore = 20;
+    } else if (ema9_15 < ema21_15 && ema21_15 < ema50_15) {
+      emaScore = -20;
+    } else if (ema9_15 > ema21_15) {
+      emaScore = 10;
+    } else if (ema9_15 < ema21_15) {
+      emaScore = -10;
+    }
+    directionalScore += (mtfScore + emaScore);
+
+    // 2. ADX >= 20 + RSI favorável (52 a 72 para Long, 28 a 48 para Short): peso 20 pontos (+20 ou -20)
+    let adxRsiScore = 0;
+    if (adx15m >= 20) {
+      if (rsi15m >= 52 && rsi15m <= 72) {
+        adxRsiScore = 20;
+      } else if (rsi15m >= 28 && rsi15m <= 48) {
+        adxRsiScore = -20;
+      } else if (rsi15m > 72) {
+        adxRsiScore = 10;
+      } else if (rsi15m < 28) {
+        adxRsiScore = -10;
+      }
+    } else if (adx15m >= 15) {
+      if (rsi15m >= 52 && rsi15m <= 72) {
+        adxRsiScore = 10;
+      } else if (rsi15m >= 28 && rsi15m <= 48) {
+        adxRsiScore = -10;
+      }
+    }
+    directionalScore += adxRsiScore;
+
+    // 3. Delta OI e RVOL >= 1.0x: peso 15 pontos
+    let flowScore = 0;
+    const isTrendAlta = (directionalScore > 0) || (curPrice > ema21_15);
+    if (isTrendAlta) {
+      if (deltaOI >= 0.2 && rvol15m >= 1.0) flowScore = 15;
+      else if (deltaOI > 0 || rvol15m >= 1.0) flowScore = 10;
+      else if (rvol15m >= 0.85) flowScore = 5;
+      else if (deltaOI < -1.0) flowScore = -5;
+    } else {
+      if (deltaOI >= 0.2 && rvol15m >= 1.0) flowScore = -15;
+      else if (deltaOI > 0 || rvol15m >= 1.0) flowScore = -10;
+      else if (rvol15m >= 0.85) flowScore = -5;
+      else if (deltaOI < -1.0) flowScore = 5;
+    }
+    directionalScore += flowScore;
+
+    // 4. Taker Ratio: peso máximo de 15 pontos (se a favor soma +15; se contra no pullback desconta no máx -10, nunca zerando!)
+    let takerScore = 0;
+    if (isTrendAlta) {
+      if (takerRatioVal >= 1.15) takerScore = 15;
+      else if (takerRatioVal >= 1.02) takerScore = 10;
+      else if (takerRatioVal >= 0.95) takerScore = 0;
+      else if (takerRatioVal >= 0.85) takerScore = -5;
+      else takerScore = -10;
+    } else {
+      if (takerRatioVal <= 0.85) takerScore = -15;
+      else if (takerRatioVal <= 0.98) takerScore = -10;
+      else if (takerRatioVal <= 1.05) takerScore = 0;
+      else if (takerRatioVal <= 1.15) takerScore = 5;
+      else takerScore = 10;
+    }
+    directionalScore += takerScore;
+
     directionalScore = Math.max(-100, Math.min(100, directionalScore));
 
     // Projeções Dinâmicas de Risco (SL / TP / BE / Alavancagem)
@@ -583,12 +647,25 @@ function verificarGatekeeper(dados) {
     return { passou: false, motivo: `Gatekeeper: Spread excessivo (${dados.spreadPct.toFixed(3)}%)` };
   }
 
-  // Verifica se a moeda se enquadra em algum dos 3 modos dinâmicos
+  // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.80% a 2.50%)
+  if (dados.atrPct15m < 0.80) {
+    return { passou: false, motivo: `Gatekeeper: Volatilidade insuficiente (ATR 15m ${dados.atrPct15m.toFixed(2)}% < 0.80% - Moeda Lenta)` };
+  }
+  if (dados.atrPct15m > 2.50) {
+    return { passou: false, motivo: `Gatekeeper: Volatilidade excessiva (ATR 15m ${dados.atrPct15m.toFixed(2)}% > 2.50%)` };
+  }
+
+  // 2. Piso de Volume (RVOL >= 0.85x)
+  if (dados.rvol15m < 0.85) {
+    return { passou: false, motivo: `Gatekeeper: Volume insuficiente (RVOL ${dados.rvol15m.toFixed(2)}x < 0.85x - Sem Fluxo)` };
+  }
+
+  // 3. Verifica se a moeda se enquadra em algum dos 3 modos dinâmicos
   if (!dados.modoDetectado) {
     return { passou: false, motivo: 'Gatekeeper: Nenhum setup ativo (nem Pullback, nem Momentum, nem Exaustão)' };
   }
 
-  // Validação direcional por modo
+  // 4. Validação direcional por modo
   if (dados.modoDetectado === 'PULLBACK' || dados.modoDetectado === 'MOMENTUM') {
     if (dados.direcaoModo === 'LONG' && dados.directionalScore < 55) {
       return { passou: false, motivo: `Gatekeeper: Score direcional insuficiente para LONG (${dados.directionalScore} < +55)` };
@@ -598,22 +675,10 @@ function verificarGatekeeper(dados) {
     }
   }
 
-  // Filtro Anti-Zona Morta no Modo A (Pullback) - Baseado na assinatura de SL vs TP
+  // 5. Filtro Modo A (Pullback): Proteção de distância colada (< 0.25x ATR)
   if (dados.modoDetectado === 'PULLBACK') {
-    if (dados.distEma21Atr < 0.40 && dados.rsi15m >= 46 && dados.rsi15m <= 55) {
-      return { passou: false, motivo: `Gatekeeper: Zona morta lateral (Dist EMA21 ${dados.distEma21Atr.toFixed(2)}x < 0.40x e RSI ${dados.rsi15m.toFixed(1)} entre 46 e 55)` };
-    }
-    if (dados.direcaoModo === 'LONG') {
-      if (dados.deltaOI < 0.0) {
-        return { passou: false, motivo: `Gatekeeper: Delta OI negativo para LONG (${dados.deltaOI.toFixed(2)}% < 0)` };
-      }
-      if (dados.takerRatioVal < 1.02) {
-        return { passou: false, motivo: `Gatekeeper: Taker Ratio insuficiente para LONG (${dados.takerRatioVal.toFixed(3)} < 1.02)` };
-      }
-    } else if (dados.direcaoModo === 'SHORT') {
-      if (dados.takerRatioVal > 0.96) {
-        return { passou: false, motivo: `Gatekeeper: Taker Ratio insuficiente para SHORT (${dados.takerRatioVal.toFixed(3)} > 0.96)` };
-      }
+    if (dados.distEma21Atr < 0.25) {
+      return { passou: false, motivo: `Gatekeeper: Preço colado na EMA 21 (${dados.distEma21Atr.toFixed(2)}x < 0.25x ATR)` };
     }
   }
 
@@ -898,6 +963,12 @@ setInterval(async () => {
               console.log(`[COOLDOWN-BREAKEVEN] ${sym} fechou em Breakeven (Estágio ${alvoBackup.beStage || 1}). Cooldown de 15 min ativado.`);
             }
 
+            // Cooldown Pós-Perdão 30m: 30 minutos (1800000ms) para forçar o robô a buscar novas moedas voláteis
+            if (motivoFechamento.includes('PERDAO_30M') || motivoFechamento.includes('PERDAO')) {
+              gatekeeperVetoedUntil[sym] = Date.now() + 30 * 60 * 1000;
+              console.log(`[COOLDOWN-PERDAO-30M] ${sym} fechou por estagnação 30m. Cooldown de 30 min ativado na moeda.`);
+            }
+
             // Libera slot com cooldown 45s
             [1, 2].forEach(s => {
               if (autoBotState.slots[s].symbol === sym) {
@@ -925,6 +996,89 @@ setInterval(async () => {
     isMonitoringTick = false;
   }
 }, 1500);
+
+// ── SCANNER INTELIGENTE DE CANDIDATOS DO CARROSSEL ───────────────────
+let topCandidatosComSetup = [];
+let ultimoScanSetups = 0;
+
+async function atualizarTopSetups() {
+  const now = Date.now();
+  if (now - ultimoScanSetups < 20000 && topCandidatosComSetup.length > 0) {
+    return topCandidatosComSetup;
+  }
+  try {
+    const volData = await fut.ticker24h().catch(() => []);
+    const vetados = await rag.consultarParesVetados(45).catch(() => []);
+    const vetadosSet = new Set(vetados.map(v => v.symbol));
+
+    // Top 15 moedas mais voláteis do carrossel (24h)
+    const candidatos = volData
+      .filter(t => {
+        const sym = t.symbol;
+        if (!isSimboloValido(sym)) return false;
+        if (vetadosSet.has(sym)) return false;
+        if (gatekeeperVetoedUntil[sym] && now < gatekeeperVetoedUntil[sym]) return false;
+        if (parseFloat(t.count || 0) <= 1000) return false;
+        return true;
+      })
+      .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)))
+      .slice(0, 15);
+
+    const setups = [];
+    for (const c of candidatos) {
+      const liq = await validarLiquidezMoeda(c.symbol);
+      if (!liq.ok) continue;
+
+      const dados = await analisarEstruturaEMercado(c.symbol);
+      if (!dados) continue;
+
+      // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.80% a 2.50%)
+      if (dados.atrPct15m < 0.80 || dados.atrPct15m > 2.50) {
+        if (dados.atrPct15m < 0.80) {
+          gatekeeperVetoedUntil[c.symbol] = now + 15 * 60 * 1000; // Moeda lenta (ex: KASUSDT): 15m de veto
+        }
+        continue;
+      }
+
+      // 2. Piso de Volume (RVOL >= 0.85x)
+      if (dados.rvol15m < 0.85) {
+        gatekeeperVetoedUntil[c.symbol] = now + 120000;
+        continue;
+      }
+
+      // 3. Gatekeeper (exige setup ativo MODO A, B ou C e directionalScore condizente)
+      const gk = verificarGatekeeper(dados);
+      if (!gk.passou) {
+        gatekeeperVetoedUntil[c.symbol] = now + 120000;
+        continue;
+      }
+
+      // Bônus por modo para o ranking inteligente: Momentum +15, Exaustão +12, Pullback +10
+      const bonusModo = (dados.modoDetectado === 'MOMENTUM') ? 15 : ((dados.modoDetectado === 'EXAUSTAO_REVERSAO') ? 12 : 10);
+      const scoreEfetivo = Math.abs(dados.directionalScore) + bonusModo;
+
+      setups.push({
+        symbol: c.symbol,
+        dados,
+        modoDetectado: dados.modoDetectado,
+        modoLabel: dados.modoLabel,
+        direcaoModo: dados.direcaoModo,
+        directionalScore: dados.directionalScore,
+        scoreEfetivo,
+        atrPct15m: dados.atrPct15m,
+        rvol15m: dados.rvol15m,
+        bonusModo
+      });
+    }
+
+    setups.sort((a, b) => b.scoreEfetivo - a.scoreEfetivo);
+    topCandidatosComSetup = setups;
+    ultimoScanSetups = now;
+    return topCandidatosComSetup;
+  } catch(e) {
+    return topCandidatosComSetup;
+  }
+}
 
 // ── ROBÔ AUTÔNOMO CONTÍNUO (ETAPA 5: GATEKEEPER + CANDLE 5M) ───────────
 let autoBotLoopRunning = false;
@@ -984,12 +1138,14 @@ setInterval(async () => {
                 salvarAlvos();
 
                 const symFechado = slot.symbol;
+                gatekeeperVetoedUntil[symFechado] = now + 30 * 60 * 1000; // Cooldown 30m (1800000ms) na moeda
+                console.log(`[COOLDOWN-PERDAO-30M] ${symFechado} fechado por estagnação 30m (${decisao30m.motivo}). Cooldown de 30 min ativado na moeda.`);
                 slot.symbol = null;
                 slot.side = null;
                 slot.targetSymbol = null;
                 slot.searchCooldownUntil = now + 45000;
                 slot.status = 'PERDAO_COOLDOWN_45S';
-                autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 30m em ${symFechado}. Cooldown 45s.`;
+                autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 30m em ${symFechado}. Cooldown de 30m na moeda ativado.`;
               }
             }
           }
@@ -1046,12 +1202,14 @@ setInterval(async () => {
                 salvarAlvos();
 
                 const symFechado = slot.symbol;
+                gatekeeperVetoedUntil[symFechado] = now + 30 * 60 * 1000; // Cooldown 30m (1800000ms) na moeda
+                console.log(`[COOLDOWN-PERDAO-30M] ${symFechado} fechado por estagnação 30m (${decisao30m.motivo}). Cooldown de 30 min ativado na moeda.`);
                 slot.symbol = null;
                 slot.side = null;
                 slot.targetSymbol = null;
                 slot.searchCooldownUntil = now + 45000;
                 slot.status = 'PERDAO_COOLDOWN_45S';
-                autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 30m em ${symFechado}. Cooldown 45s.`;
+                autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 30m em ${symFechado}. Cooldown de 30m na moeda ativado.`;
                 continue;
               }
             }
@@ -1070,9 +1228,6 @@ setInterval(async () => {
       // 3. Buscar moeda candidata líquida se não tiver
       if (!slot.targetSymbol) {
         slot.status = 'ESCANEANDO_MERCADO';
-        const volData = await fut.ticker24h().catch(() => []);
-        const vetados = await rag.consultarParesVetados(45).catch(() => []);
-        const vetadosSet = new Set(vetados.map(v => v.symbol));
 
         // Conjunto global de símbolos ativos ou em avaliação nos 2 slots
         const openingOrActiveSymbols = new Set();
@@ -1082,43 +1237,12 @@ setInterval(async () => {
         });
         Object.keys(localAlvos).forEach(s => openingOrActiveSymbols.add(s));
 
-        // Ordena por volatilidade excluindo pares ativos em qualquer slot ou vetados recentemente
-        const candidatos = volData
-          .filter(t => {
-            const sym = t.symbol;
-            if (!isSimboloValido(sym)) return false;
-            if (openingOrActiveSymbols.has(sym)) return false;
-            if (vetadosSet.has(sym)) return false;
-            if (gatekeeperVetoedUntil[sym] && now < gatekeeperVetoedUntil[sym]) return false;
-            if (parseFloat(t.count || 0) <= 1000) return false;
-            return true;
-          })
-          .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)))
-          .slice(0, 15);
-
-        let melhorCandidato = null;
-        let maiorScore = -999;
-        for (const c of candidatos) {
-          const liq = await validarLiquidezMoeda(c.symbol);
-          if (!liq.ok) continue;
-
-          const dados = await analisarEstruturaEMercado(c.symbol);
-          if (!dados) continue;
-
-          const gk = verificarGatekeeper(dados);
-          if (!gk.passou) {
-            gatekeeperVetoedUntil[c.symbol] = now + 120000;
-            continue;
-          }
-
-          // Prioridade para Modo B (Momentum) e Modo C (Exaustão): +15 pontos de bônus
-          const bonusModo = (dados.modoDetectado === 'MOMENTUM' || dados.modoDetectado === 'EXAUSTAO_REVERSAO') ? 15 : 0;
-          const scoreEfetivo = Math.abs(dados.directionalScore) + bonusModo;
-          if (scoreEfetivo > maiorScore) {
-            maiorScore = scoreEfetivo;
-            melhorCandidato = { symbol: c.symbol, dados, scoreEfetivo, bonusModo };
-          }
-        }
+        // Prioriza as top moedas mais voláteis do carrossel com setup ativo e ATR saudável
+        const setups = await atualizarTopSetups();
+        const melhorCandidato = setups.find(s =>
+          !openingOrActiveSymbols.has(s.symbol) &&
+          (!gatekeeperVetoedUntil[s.symbol] || now >= gatekeeperVetoedUntil[s.symbol])
+        );
 
         if (!melhorCandidato) {
           slot.status = 'SEM_MOEDAS_LIQUIDAS';
@@ -1128,8 +1252,8 @@ setInterval(async () => {
         slot.targetSymbol = melhorCandidato.symbol;
         slot.targetAssignedTime = now;
         slot.lastChecked60sTime = 0;
-        slot.status = `CANDIDATO: ${melhorCandidato.symbol} [${melhorCandidato.dados.modoLabel} | Score: ${melhorCandidato.scoreEfetivo}]`;
-        console.log(`[AUTOBOT] Slot ${slotNum} escolheu Top 1 candidato: ${melhorCandidato.symbol} (Score: ${melhorCandidato.scoreEfetivo}${melhorCandidato.bonusModo ? ' c/ bônus +15' : ''})`);
+        slot.status = `CANDIDATO: ${melhorCandidato.symbol} [${melhorCandidato.modoLabel} | Score: ${melhorCandidato.directionalScore}]`;
+        console.log(`[AUTOBOT] Slot ${slotNum} escolheu Top 1 candidato: ${melhorCandidato.symbol} (Score: ${melhorCandidato.scoreEfetivo} [${melhorCandidato.modoLabel}])`);
       }
 
       // 4. Analisar candidato
@@ -1716,6 +1840,15 @@ app.get('/api/auto-status', (req, res) => {
     enabled: autoBotState.enabled,
     slots: autoBotState.slots,
     lastLog: autoBotState.lastLog,
+    topCandidatos: topCandidatosComSetup.map(c => ({
+      symbol: c.symbol,
+      modoDetectado: c.modoDetectado,
+      modoLabel: c.modoLabel,
+      directionalScore: c.directionalScore,
+      scoreEfetivo: c.scoreEfetivo,
+      atrPct15m: c.atrPct15m,
+      rvol15m: c.rvol15m
+    })),
     tokensGastos: tokensGastos.total_tokens || 0,
     placar: {
       wins: placarStats.wins || 0,
@@ -1787,7 +1920,7 @@ app.get('/api/historico', async (req, res) => {
       <!-- TOPO DO CARD: MOEDA INPUT, VARIAÇÃO 24H E MODO DINÂMICO ATIVO -->
       <div class="card-top-row">
         <div class="coin-input-group">
-          <input type="text" id="sym-${col}" placeholder="MOEDA (EX: BTC)" oninput="debouncedLoad(${col})" autocomplete="off">
+          <input type="text" id="sym-${col}" placeholder="MOEDA (EX: BTC)" oninput="onUserType(${col})" onfocus="onUserType(${col})" autocomplete="off">
           <span class="pct-badge" id="pct-24h-${col}">--%</span>
         </div>
         <div class="modo-badge" id="modo-badge-${col}">[AGUARDANDO SETUP]</div>
@@ -2365,7 +2498,18 @@ app.get('/', (req, res) => {
       } catch(e) {}
     }
 
+    let lastUserInteraction = { 1: 0, 2: 0 };
+    let cardHasPosition = { 1: false, 2: false };
+    let cardHasActiveSetup = { 1: false, 2: false };
+    let lastAutoRotateTime = { 1: 0, 2: 0 };
+
+    function onUserType(col) {
+      lastUserInteraction[col] = Date.now();
+      debouncedLoad(col);
+    }
+
     function aplicarMoeda(sym) {
+      lastUserInteraction[colunaAtiva] = Date.now();
       document.getElementById('sym-' + colunaAtiva).value = sym;
       debouncedLoad(colunaAtiva);
     }
@@ -2460,11 +2604,13 @@ app.get('/', (req, res) => {
             modoBadge.style.color = corModo;
             modoBadge.style.borderColor = corModo;
             modoBadge.style.background = 'rgba(255,255,255,0.06)';
+            cardHasActiveSetup[col] = true;
           } else {
             modoBadge.innerText = '[SEM SETUP ATIVO]';
             modoBadge.style.color = 'var(--text-muted)';
             modoBadge.style.borderColor = 'var(--border)';
             modoBadge.style.background = 'transparent';
+            cardHasActiveSetup[col] = false;
           }
         }
 
@@ -2485,7 +2631,8 @@ app.get('/', (req, res) => {
         // ── POSIÇÃO ABERTA (ALTO DESTAQUE VISUAL COM GLOW) ──
         const posBox = document.getElementById('pos-' + col);
         const cardEl = document.getElementById('card-' + col);
-        if (data.pos) {
+        if (data.pos && parseFloat(data.pos.quantidade) !== 0) {
+          cardHasPosition[col] = true;
           posBox.style.display = 'block';
           const p = data.pos;
           const ladoEl = document.getElementById('pos-lado-' + col);
@@ -2546,6 +2693,7 @@ app.get('/', (req, res) => {
             }
           }
         } else {
+          cardHasPosition[col] = false;
           posBox.style.display = 'none';
           if (cardEl) {
             cardEl.style.borderColor = (colunaAtiva === col ? 'rgba(212, 175, 55, 0.55)' : 'var(--card-border)');
@@ -2818,6 +2966,38 @@ app.get('/', (req, res) => {
             statusTxt.innerText = 'Robô Desligado';
             statusTxt.style.color = 'var(--text-muted)';
           }
+
+          // ── AUTO-ROTAÇÃO VISUAL DOS 2 CARDS NA TELA (Item 4) ──
+          const nowTime = Date.now();
+          [1, 2].forEach(col => {
+            const sl = d.slots ? d.slots[col] : null;
+            const temPosicaoAberta = cardHasPosition[col] || !!(sl && sl.symbol);
+            const semSetupAtivo = !cardHasActiveSetup[col];
+            const tempoSemEdicao = nowTime - (lastUserInteraction[col] || 0);
+            const tempoDesdeRotacao = nowTime - (lastAutoRotateTime[col] || 0);
+
+            // Condição: Slot SEM posição aberta na Binance + Card com [SEM SETUP ATIVO] + Usuário sem digitar nos últimos 2 minutos
+            if (!temPosicaoAberta && semSetupAtivo && tempoSemEdicao >= 120000 && tempoDesdeRotacao >= 15000) {
+              if (d.topCandidatos && d.topCandidatos.length > 0) {
+                const outroCol = (col === 1 ? 2 : 1);
+                const outroSym = (document.getElementById('sym-' + outroCol)?.value || '').trim().toUpperCase();
+                const curSym = (document.getElementById('sym-' + col)?.value || '').trim().toUpperCase();
+
+                const candIdeal = d.topCandidatos.find(c => c.symbol !== outroSym && c.symbol !== curSym) ||
+                                  d.topCandidatos.find(c => c.symbol !== outroSym);
+
+                if (candIdeal && candIdeal.symbol && candIdeal.symbol !== curSym) {
+                  console.log('[AUTO-ROTAÇÃO] Card ' + col + ' [SEM SETUP: ' + curSym + '] -> Rotacionando para: ' + candIdeal.symbol + ' (' + candIdeal.modoLabel + ')');
+                  const symInput = document.getElementById('sym-' + col);
+                  if (symInput) {
+                    symInput.value = candIdeal.symbol;
+                    lastAutoRotateTime[col] = nowTime;
+                    debouncedLoad(col);
+                  }
+                }
+              }
+            }
+          });
 
           if (d.lastLog) logEl.innerText = d.lastLog;
           const tokEl = document.getElementById('total-tokens-val');
@@ -3134,6 +3314,12 @@ app.get('/', (req, res) => {
     } catch(e) {
       console.error('[BOOT] Erro ao sincronizar posições:', e.message);
     }
+
+    // Inicializa scanner inteligente de setups do carrossel
+    atualizarTopSetups().catch(() => {});
+    setInterval(() => {
+      atualizarTopSetups().catch(() => {});
+    }, 30000);
 
     app.listen(PORT, () => console.log('Painel Quant Institucional rodando na porta ' + PORT));
   } catch (e) {
