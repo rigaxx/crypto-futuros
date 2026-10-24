@@ -144,7 +144,11 @@ function salvarAutoBotConfig() {
 let maxPriceTracker = {};
 let minPriceTracker = {};
 let klines5mCache = {};
-let gatekeeperVetoedUntil = {};
+let gatekeeperVetoedUntil = {
+  'USELESSUSDT': Date.now() + 7200000,
+  'ZECUSDT': Date.now() + 7200000,
+  'ARCUSDT': Date.now() + 7200000
+};
 let lastEvaluatedCandle = {}; // Cache Anti-Spam por vela de 5m
 
 // Cotação USD/BRL
@@ -158,7 +162,7 @@ async function atualizarBRL() {
 setInterval(atualizarBRL, 600000);
 atualizarBRL();
 
-const BLOQUEADOS_SYNTHETIC = ['SAMSUNG', 'COIN', 'SOXL', 'MVLL', 'QNTX', 'TSLA', 'AAPL', 'NVDA', 'HEMI'];
+const BLOQUEADOS_SYNTHETIC = ['SAMSUNG', 'COIN', 'SOXL', 'MVLL', 'QNTX', 'TSLA', 'AAPL', 'NVDA', 'HEMI', 'ZECUSDT'];
 
 function isSimboloValido(symbol) {
   if (!symbol || typeof symbol !== 'string') return false;
@@ -291,9 +295,9 @@ async function analisarEstruturaEMercado(symbol) {
     const adxArr = ti.ADX.calculate({ period: 14, high: p15.highs, low: p15.lows, close: p15.closes });
     const adx15m = (adxArr && adxArr.length > 0) ? (adxArr[adxArr.length - 1].adx || 0) : 0;
 
-    // RVOL 15m (última vela vs média 20)
-    const avgVol20 = p15.vols.slice(-21, -1).reduce((a, b) => a + b, 0) / 20;
-    const rvol15m = (p15.vols[p15.vols.length - 1] / (avgVol20 || 1)) || 1.0;
+    // RVOL 15m (última vela fechada vs média 20 fechadas - elimina bug do 0.0x no início da vela)
+    const avgVol20 = p15.vols.slice(-22, -2).reduce((a, b) => a + b, 0) / 20;
+    const rvol15m = (p15.vols[p15.vols.length - 2] / (avgVol20 || 1)) || 1.0;
 
     // Wilder RSI 14 (15m) calculado com 100 velas (elimina o bug do 0.0)
     const rsiArr = ti.RSI.calculate({ period: 14, values: p15.closes });
@@ -566,9 +570,9 @@ async function analisarEstruturaEMercado(symbol) {
     let slPctReal = (slDist / curPrice) * 100;
     let slRoe = slPctReal * leverageSugerida;
 
-    // Banda Saudável de Stop Loss em ROI: Piso Mínimo de 6.0% e Teto Máximo de 12.0%
-    const minSlRoi = 6.0;
-    const maxSlRoi = 12.0;
+    // Banda Saudável de Stop Loss em ROI: Piso Mínimo de 5.0% e Teto Máximo de 7.5%
+    const minSlRoi = 5.0;
+    const maxSlRoi = 7.5;
 
     if (slRoe < minSlRoi) {
       slRoe = minSlRoi;
@@ -593,17 +597,17 @@ async function analisarEstruturaEMercado(symbol) {
     let tpPctReal = (tpDist / curPrice) * 100;
     let tpRoe = tpPctReal * leverageSugerida;
 
-    // Teto Dinâmico de Take Profit: se projetar > 10.0% ROI, limita no alvo de 10.0% ROI
-    if (tpRoe > 10.0) {
-      tpDist = curPrice * (0.10 / leverageSugerida);
+    // Teto Dinâmico de Take Profit: se projetar > 8.0% ROI, limita no alvo de 8.0% ROI
+    if (tpRoe > 8.0) {
+      tpDist = curPrice * (0.08 / leverageSugerida);
       tpPrice = ladoOp === 'LONG' ? (curPrice + tpDist) : (curPrice - tpDist);
       tpPctReal = (tpDist / curPrice) * 100;
-      tpRoe = 10.0;
+      tpRoe = 8.0;
     }
 
-    const beTriggerDist = curPrice * ((0.80 / leverageSugerida) / 100);
+    const beTriggerDist = curPrice * ((3.20 / leverageSugerida) / 100);
     const beTriggerPctReal = (beTriggerDist / curPrice) * 100;
-    const beTriggerRoe = 0.80;
+    const beTriggerRoe = 3.20;
     const beTriggerPrice = ladoOp === 'LONG' ? (curPrice + beTriggerDist) : (curPrice - beTriggerDist);
 
     const last5mOpenTime = (k5m && k5m.length > 0) ? k5m[k5m.length - 1][0] : 0;
@@ -612,6 +616,8 @@ async function analisarEstruturaEMercado(symbol) {
       curPrice,
       priceChangePercent,
       last5mOpenTime,
+      rawKlines5m: k5m,
+      rawKlines15m: k15m,
       p15, p5, p1h, p4h,
       ema9_15, ema21_15, ema50_15, ema200_15,
       ema9_5, ema21_5, ema50_5,
@@ -636,8 +642,124 @@ async function analisarEstruturaEMercado(symbol) {
   }
 }
 
+// ── IMPLANTAÇÃO /trader-timemachine (REPLAY HISTÓRICO LOCAL 15M - 0 TOKENS) ──
+function validarTimeMachineLocal(k15m, direcao, atrAtual) {
+  if (!k15m || k15m.length < 60) return { passou: true, winRateLocal: 100, toques: 0, sucessos: 0 };
+
+  const closes = k15m.map(v => parseFloat(v[4]));
+  const highs = k15m.map(v => parseFloat(v[2]));
+  const lows = k15m.map(v => parseFloat(v[3]));
+
+  const ema21 = ti.EMA.calculate({ period: 21, values: closes });
+  const ema50 = ti.EMA.calculate({ period: 50, values: closes });
+
+  const totalCandles = closes.length;
+  const startIdx = Math.max(50, totalCandles - 96);
+  const endIdx = totalCandles - 5; // deixa 4 a 5 velas subsequentes para validação
+
+  let toques = 0;
+  let sucessos = 0;
+  let inTouch = false;
+
+  for (let i = startIdx; i <= endIdx; i++) {
+    const e21 = ema21[i - 20];
+    const e50 = ema50[i - 49];
+    if (!e21 || !e50) continue;
+
+    const h = highs[i];
+    const l = lows[i];
+
+    if (direcao === 'LONG') {
+      const isTouching = (e21 > e50 && l <= e21 && h >= e21);
+      if (isTouching) {
+        if (!inTouch) {
+          inTouch = true;
+          toques++;
+          let maxFavor = 0;
+          for (let f = 1; f <= 5; f++) {
+            if (i + f < closes.length) {
+              const move = highs[i + f] - e21;
+              if (move > maxFavor) maxFavor = move;
+            }
+          }
+          if (maxFavor >= 0.7 * (atrAtual || (closes[i] * 0.01))) {
+            sucessos++;
+          }
+        }
+      } else {
+        inTouch = false;
+      }
+    } else if (direcao === 'SHORT') {
+      const isTouching = (e21 < e50 && h >= e21 && l <= e21);
+      if (isTouching) {
+        if (!inTouch) {
+          inTouch = true;
+          toques++;
+          let maxFavor = 0;
+          for (let f = 1; f <= 5; f++) {
+            if (i + f < closes.length) {
+              const move = e21 - lows[i + f];
+              if (move > maxFavor) maxFavor = move;
+            }
+          }
+          if (maxFavor >= 0.7 * (atrAtual || (closes[i] * 0.01))) {
+            sucessos++;
+          }
+        }
+      } else {
+        inTouch = false;
+      }
+    }
+  }
+
+  if (toques < 3) {
+    return { passou: true, winRateLocal: 100, toques, sucessos };
+  }
+
+  const winRateLocal = (sucessos / toques) * 100;
+  return {
+    passou: winRateLocal >= 50.0,
+    winRateLocal,
+    sucessos,
+    toques
+  };
+}
+
+// ── IMPLANTAÇÃO /trader-entry (CONFIRMAÇÃO VELA 5M NO GATILHO DE ENTRADA) ──
+function verificarConfirmacao5m(dados) {
+  const k5 = dados.rawKlines5m;
+  if (!k5 || k5.length < 2) {
+    return { confirmou: false, motivo: 'Velas de 5m insuficientes para confirmação' };
+  }
+  const lastClosed5m = k5[k5.length - 2];
+  const currentOpen5m = k5[k5.length - 1];
+
+  const c5_open = parseFloat(lastClosed5m[1]);
+  const c5_close = parseFloat(lastClosed5m[4]);
+  const curr5_open = parseFloat(currentOpen5m[1]);
+  const curr5_price = dados.curPrice;
+
+  if (dados.direcaoModo === 'LONG') {
+    if (c5_close <= c5_open) {
+      return { confirmou: false, motivo: `Última vela 5m fechou negativa ($${c5_close} <= $${c5_open})` };
+    }
+    if (curr5_price < curr5_open) {
+      return { confirmou: false, motivo: `Vela 5m atual derretendo vermelha ($${curr5_price} < $${curr5_open})` };
+    }
+  } else if (dados.direcaoModo === 'SHORT') {
+    if (c5_close >= c5_open) {
+      return { confirmou: false, motivo: `Última vela 5m fechou positiva ($${c5_close} >= $${c5_open})` };
+    }
+    if (curr5_price > curr5_open) {
+      return { confirmou: false, motivo: `Vela 5m atual subindo verde ($${curr5_price} > $${curr5_open})` };
+    }
+  }
+
+  return { confirmou: true };
+}
+
 // ── GATEKEEPER DINÂMICO 3 MODOS (ETAPA 5 - 0 TOKENS) ─────────────────
-function verificarGatekeeper(dados) {
+function verificarGatekeeper(dados, isEntryCheck = false) {
   if (!dados) return { passou: false, motivo: 'Dados indisponíveis' };
 
   if (dados.flatCandles5m > 2) {
@@ -660,6 +782,24 @@ function verificarGatekeeper(dados) {
     return { passou: false, motivo: `Gatekeeper: Volume insuficiente (RVOL ${dados.rvol15m.toFixed(2)}x < 0.85x - Sem Fluxo)` };
   }
 
+  // 2.1 Bloqueio de Funding Tóxico (Proíbe SHORT se Funding < -0.15% e LONG se Funding > +0.15%)
+  const frGk = dados.fundingRate || 0;
+  if (dados.direcaoModo === 'SHORT' && frGk < -0.0015) {
+    return { passou: false, motivo: `Gatekeeper: Funding rate tóxico para SHORT (${(frGk * 100).toFixed(3)}% < -0.15% - Risco Short Squeeze e taxas)` };
+  }
+  if (dados.direcaoModo === 'LONG' && frGk > 0.0015) {
+    return { passou: false, motivo: `Gatekeeper: Funding rate tóxico para LONG (${(frGk * 100).toFixed(3)}% > +0.15% - Risco Long Squeeze e taxas)` };
+  }
+
+  // 2.2 Filtro de Exaustão 24h (Não vender fundo derretido nem comprar topo esticado)
+  const p24Gk = dados.priceChangePercent || 0;
+  if (dados.direcaoModo === 'SHORT' && p24Gk < -22.0 && dados.modoDetectado !== 'EXAUSTAO_REVERSAO') {
+    return { passou: false, motivo: `Gatekeeper: Moeda já derretida no dia (${p24Gk.toFixed(1)}% < -22%) - Veto a vender fundo` };
+  }
+  if (dados.direcaoModo === 'LONG' && p24Gk > 35.0 && dados.modoDetectado !== 'EXAUSTAO_REVERSAO') {
+    return { passou: false, motivo: `Gatekeeper: Moeda já esticada no dia (+${p24Gk.toFixed(1)}% > +35%) - Veto a comprar topo` };
+  }
+
   // 3. Verifica se a moeda se enquadra em algum dos 3 modos dinâmicos
   if (!dados.modoDetectado) {
     return { passou: false, motivo: 'Gatekeeper: Nenhum setup ativo (nem Pullback, nem Momentum, nem Exaustão)' };
@@ -675,10 +815,26 @@ function verificarGatekeeper(dados) {
     }
   }
 
-  // 5. Filtro Modo A (Pullback): Proteção de distância colada (< 0.25x ATR)
+  // 5. Filtro Modo A (Pullback): Proteção de distância colada (< 0.25x ATR) e TimeMachine
   if (dados.modoDetectado === 'PULLBACK') {
     if (dados.distEma21Atr < 0.25) {
       return { passou: false, motivo: `Gatekeeper: Preço colado na EMA 21 (${dados.distEma21Atr.toFixed(2)}x < 0.25x ATR)` };
+    }
+
+    // Replay Histórico TimeMachine apenas para PULLBACK
+    const tm = validarTimeMachineLocal(dados.rawKlines15m, dados.direcaoModo, dados.atr15m);
+    if (!tm.passou) {
+      gatekeeperVetoedUntil[dados.symbol] = Date.now() + 600000; // Veto de 10 minutos
+      console.log(`[VETO-TIMEMACHINE] ${dados.symbol} (${dados.direcaoModo}): WinRate 24h em toques EMA21 foi ${tm.winRateLocal.toFixed(1)}% < 50% (${tm.sucessos}/${tm.toques} toques). Veto de 10m ativado.`);
+      return { passou: false, motivo: `Gatekeeper [/trader-timemachine]: Histórico 24h com falhas de continuidade (${tm.winRateLocal.toFixed(1)}% < 50% em ${tm.toques} toques)` };
+    }
+  }
+
+  // 6. Confirmação /trader-entry na vela 5m (apenas durante tentativa de disparo do slot)
+  if (isEntryCheck) {
+    const conf5m = verificarConfirmacao5m(dados);
+    if (!conf5m.confirmou) {
+      return { passou: false, is5mAwaiting: true, motivo: `Gatekeeper [/trader-entry]: ${conf5m.motivo}` };
     }
   }
 
@@ -705,6 +861,7 @@ Preco: ${dados.curPrice} | MTF: 1h=${dados.dir1h === 'green' ? 'ALTA' : 'BAIXA'}
 DistEMA21: ${dados.distEma21Atr.toFixed(2)}x ATR | ATR%: ${dados.atrPct15m.toFixed(2)}% | RSI15m: ${dados.rsi15m}
 ADX: ${dados.adx15m.toFixed(1)} | RVOL: ${dados.rvol15m.toFixed(2)}x | TakerRatio: ${dados.takerRatioVal.toFixed(2)} | DeltaOI: ${dados.deltaOI.toFixed(2)}%
 Alavancagem: ${dados.leverageSugerida}x | SL: ${dados.slPrice.toFixed(4)} | TP: ${dados.tpPrice.toFixed(4)}
+Diretriz: Se MTF e Score forem solidos e alinhados ao modo (${dados.modoLabel}), aprove (${dados.direcaoModo}) com confianca >= 65. Em PULLBACK taker moderado e normal na retracao; em MOMENTUM expansao e esperada no rompimento.
 Responda APENAS JSON:
 {"action":"LONG"|"SHORT"|"WAIT","confidence":0-100,"reason_short":"motivo max 10 palavras"}`;
 
@@ -742,44 +899,68 @@ Responda APENAS JSON:
 }
 
 
-// ── REGRA DE PERDÃO AOS 30 MINUTOS (ESTAGNAÇÃO - CÓDIGO MATEMÁTICO 0 TOKENS) ──
+// ── REGRA DE GESTÃO TEMPORAL E SOFT STOP (15m, 30m, 90m - 0 TOKENS) ──
 async function avaliarPerdao30mMatematico(symbol, pos, duracaoMinutos) {
   try {
-    if (duracaoMinutos < 30) return { fechar: false };
-    const dados = await analisarEstruturaEMercado(symbol);
-    if (!dados) return { fechar: false };
-
-    const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
-    const roiAtual = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
     const alvo = localAlvos[symbol];
     const maxRoi = alvo?.maxRoiReached || 0;
     const isLong = pos.lado === 'LONG';
+    const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
+    const roiAtual = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
 
-    // 1. Perdão 30m Positivo (Lucro Estagnado): roi >= +3.00% e fluxo perdendo força ou preço cruzando EMA9 de 5m contra
-    if (roiAtual >= 3.00) {
-      const fluxoPerdeuForca = isLong
-        ? (dados.takerRatioVal < 0.98 || dados.curPrice < dados.ema9_5)
-        : (dados.takerRatioVal > 1.02 || dados.curPrice > dados.ema9_5);
-      if (fluxoPerdeuForca) {
-        return {
-          fechar: true,
-          motivo: 'PERDAO_30M_LUCRO',
-          desc: `Lucro Estagnado aos 30m (+${roiAtual.toFixed(2)}% ROI | Taker: ${dados.takerRatioVal.toFixed(2)})`
-        };
+    // 0. Hard Timeout Máximo de 90 minutos para qualquer trade negativo
+    if (duracaoMinutos >= 90 && roiAtual < 0) {
+      return {
+        fechar: true,
+        motivo: 'TIMEOUT_MAXIMO_90M',
+        desc: `Hard Timeout 90m (${roiAtual.toFixed(2)}% ROI | Duração ${duracaoMinutos}m >= 90m)`
+      };
+    }
+
+    // 1. Correção Posições Zumbis / Soft Stop aos 30 minutos:
+    // TODA posição com duracaoMin >= 30 e roiAtual <= -2.00% (cujo maxRoiReached < 2.50%) é encerrada incondicionalmente!
+    if (duracaoMinutos >= 30 && roiAtual <= -2.00 && maxRoi < 2.50) {
+      return {
+        fechar: true,
+        motivo: 'PERDAO_30M_SOFT_STOP',
+        desc: `Soft Stop aos 30m (${roiAtual.toFixed(2)}% ROI <= -2.0% | Pico: +${maxRoi.toFixed(2)}% < 2.5% | Duração ${duracaoMinutos}m)`
+      };
+    }
+
+    // 2. Corte Rápido de Falha de Ignição aos 15 minutos:
+    // Posição com duracaoMin >= 15, maxRoiReached < 0.50% e roiAtual <= -2.50% com vela de 15m contra posição
+    if (duracaoMinutos >= 15 && maxRoi < 0.50 && roiAtual <= -2.50) {
+      const k15 = await fut.klines(symbol, '15m', 2).catch(() => []);
+      if (k15 && k15.length > 0) {
+        const last15 = k15[k15.length - 1]; // vela atual de 15m
+        const o15 = parseFloat(last15[1]);
+        const c15 = parseFloat(last15[4]);
+        const contra15m = isLong ? (c15 < o15) : (c15 > o15);
+        if (contra15m) {
+          return {
+            fechar: true,
+            motivo: 'CORTE_FALHA_IGNICAO_15M',
+            desc: `Falha de Ignição 15m (${roiAtual.toFixed(2)}% ROI <= -2.50% | Pico: +${maxRoi.toFixed(2)}% < 0.50% | 15m contra posição)`
+          };
+        }
       }
     }
 
-    // 2. Perdão 30m Negativo (Soft Stop): roi <= -1.50% e nunca engrenou (< 1.50%) e contra EMA21 de 15m
-    if (roiAtual <= -1.50 && maxRoi < 1.50) {
-      const contraEma21 = isLong
-        ? (dados.curPrice < dados.ema21_15)
-        : (dados.curPrice > dados.ema21_15);
-      if (contraEma21) {
-        return {
-          fechar: true,
-          motivo: 'PERDAO_30M_SOFT_STOP',
-          desc: `Soft Stop aos 30m (${roiAtual.toFixed(2)}% ROI | Contra EMA21 15m)`
-        };
+    // 3. Perdão Positivo (Deixar Vencedores Correrem): se >= +3.20% ROI e tendência a favor da EMA21 de 15m, NÃO fecha!
+    // Apenas mantém a proteção de retração ativa p/ buscar TP. Só encerra se perder EMA 9 (5m) ou EMA 21 (15m) contra a posição.
+    if (roiAtual >= 3.20 && duracaoMinutos >= 25) {
+      const dados = await analisarEstruturaEMercado(symbol);
+      if (dados) {
+        const perdeuTendencia = isLong
+          ? (dados.curPrice < dados.ema9_5 || dados.curPrice < dados.ema21_15)
+          : (dados.curPrice > dados.ema9_5 || dados.curPrice > dados.ema21_15);
+        if (perdeuTendencia) {
+          return {
+            fechar: true,
+            motivo: 'PERDAO_30M_LUCRO',
+            desc: `Lucro aos 25m com Perda de Média (+${roiAtual.toFixed(2)}% ROI | Perdeu EMA9/21)`
+          };
+        }
       }
     }
 
@@ -792,6 +973,7 @@ async function avaliarPerdao30mMatematico(symbol, pos, duracaoMinutos) {
 // ── MONITORAMENTO DE RISCO EM CÓDIGO (1.5s - 0 Tokens, 0ms Delay) ─────
 let isMonitoringTick = false;
 const closingInProgress = new Set();
+const beBreachedTicks = {};
 setInterval(async () => {
   if (isMonitoringTick) return;
   isMonitoringTick = true;
@@ -805,11 +987,14 @@ setInterval(async () => {
           delete localAlvos[sym];
           delete maxPriceTracker[sym];
           delete minPriceTracker[sym];
+          delete beBreachedTicks[sym];
           salvarAlvos();
           continue;
         }
 
-        const curPrice = parseFloat(pos.precoMarca) || parseFloat(pos.precoEntrada);
+        // Item 1: Last Price real do livro (NUNCA markPrice, evitando falso stop de descolamento de base)
+        const ticker = await fut.tickerPreco(sym).catch(() => null);
+        const curPrice = (ticker && ticker.price) ? parseFloat(ticker.price) : (parseFloat(pos.precoMarca) || parseFloat(pos.precoEntrada));
         const entryPrice = parseFloat(pos.precoEntrada);
         const alav = pos.alavancagem || 1;
         const isLong = pos.lado === 'LONG';
@@ -824,60 +1009,60 @@ setInterval(async () => {
         }
         const maxRoi = alvo.maxRoiReached || 0;
 
-        // ── GERENCIAMENTO DE BREAKEVEN (5 ESTÁGIOS COM COFRE EM ROI) ──
-        const prevStage = alvo.beStage || 0;
-        let novoEstagio = 0;
-        let lockedRoi = 0;
+        // ── NOVA RÉGUA DE RESPIRO NA SAÍDA (ETAPA 3 - DESTRAVA TAKE PROFITS) ──
+        const prevArmed = alvo.beArmed || false;
+        const prevLockedRoi = alvo.lockedRoi || 0;
 
-        // NOVO Estágio 5: Atingiu +7.50% de ROI -> sobe e trava em +5.00% ROI (garante metade do TP)
-        if (maxRoi >= 7.50) {
-          novoEstagio = 5;
-          lockedRoi = 5.00;
-        }
-        // NOVO Estágio 4: Atingiu +5.00% de ROI -> sobe e trava em +2.50% ROI (cofre contra reversões)
-        else if (maxRoi >= 5.00) {
-          novoEstagio = 4;
-          lockedRoi = 2.50;
-        }
-        // Estágio 3: Atingiu +3.00% de ROI -> trava garantindo +0.80% de ROI
-        else if (maxRoi >= 3.00) {
-          novoEstagio = 3;
-          lockedRoi = 0.80;
-        }
-        // Estágio 2: Atingiu +1.50% de ROI -> trava garantindo +0.55% de ROI
-        else if (maxRoi >= 1.50) {
-          novoEstagio = 2;
-          lockedRoi = 0.55;
-        }
-        // Estágio 1: Passou de +0.80% de ROI -> trava garantindo +0.35% de ROI (cobre slippage)
-        else if (maxRoi >= 0.80) {
-          novoEstagio = 1;
-          lockedRoi = 0.35;
-        }
-        // Antes de +0.80% de ROI: Breakeven desligado. Opera apenas com SL e TP originais.
-        else {
-          novoEstagio = 0;
-          lockedRoi = 0;
-        }
-
-        if (novoEstagio > 0) {
-          alvo.beArmed = true;
-          alvo.beStage = novoEstagio;
-          alvo.lockedRoi = lockedRoi;
-          alvo.beStopPrice = entryPrice * (1 + (isLong ? 1 : -1) * ((lockedRoi / alav) / 100));
-          const stopFmt = formatarPrecoAtivo(sym, alvo.beStopPrice);
-          alvo.beLabel = `🛡️ BREAKEVEN ATIVO: GARANTIDO +${lockedRoi.toFixed(1)}% ROI ($${stopFmt}) | PICO: +${maxRoi.toFixed(2)}% ROI`;
-
-          if (novoEstagio !== prevStage) {
-            salvarAlvos();
-            console.log(`[BREAKEVEN-E${novoEstagio}] ${sym} (${pos.lado}): Pico +${maxRoi.toFixed(2)}% ROI -> Stop garantido em +${lockedRoi.toFixed(1)}% ROI ($${stopFmt})`);
-          }
-        } else {
+        // Abaixo de +3.20% de ROI: Trava DESLIGADA. Respiro livre total para desenvolvimento do pullback
+        if (maxRoi < 3.20) {
           alvo.beArmed = false;
           alvo.beStage = 0;
           alvo.lockedRoi = 0;
           alvo.beStopPrice = null;
-          alvo.beLabel = '';
+          alvo.beLabel = `[🌱 RESPIRO LIVRE ATÉ +3.20% ROI (PICO ATUAL: +${maxRoi.toFixed(2)}%)]`;
+        } else {
+          alvo.beArmed = true;
+          let targetLocked = 1.50;
+          let stageNum = 1;
+          let stageLabel = 'ESTÁGIO 1 (+1.50%)';
+
+          if (maxRoi >= 6.40) {
+            // Estágio 3 (+6.40% ao TP): Sombra curta de 1.00% abaixo do pico (garante >= +5.40% ROI)
+            targetLocked = Number((maxRoi - 1.00).toFixed(2));
+            stageNum = 3;
+            stageLabel = 'ESTÁGIO 3 (-1.0% DO PICO)';
+          } else if (maxRoi >= 4.80) {
+            // Estágio 2 (+4.80% a +6.39% ROI): Trava fixa em +3.00% ROI
+            targetLocked = 3.00;
+            stageNum = 2;
+            stageLabel = 'ESTÁGIO 2 (+3.00%)';
+          } else {
+            // Estágio 1 (+3.20% a +4.79% ROI): Trava fixa em +1.50% ROI
+            targetLocked = 1.50;
+            stageNum = 1;
+            stageLabel = 'ESTÁGIO 1 (+1.50%)';
+          }
+
+          alvo.beStage = stageNum;
+          // Regra Inegociável: a trava NUNCA recua
+          const novoLockedRoi = Math.max(alvo.lockedRoi || 0, targetLocked);
+          alvo.lockedRoi = novoLockedRoi;
+
+          const calcStopPrice = entryPrice * (1 + (isLong ? 1 : -1) * ((novoLockedRoi / alav) / 100));
+          if (alvo.beStopPrice === null || alvo.beStopPrice === undefined) {
+            alvo.beStopPrice = calcStopPrice;
+          } else {
+            // beStopPrice nunca pode recuar
+            alvo.beStopPrice = isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice);
+          }
+
+          const stopFmt = formatarPrecoAtivo(sym, alvo.beStopPrice);
+          alvo.beLabel = `[🛡️ TRAVA ${stageLabel}: GARANTIDO +${alvo.lockedRoi.toFixed(2)}% ROI ($${stopFmt}) | PICO +${maxRoi.toFixed(2)}%]`;
+
+          if (!prevArmed || Math.abs(alvo.lockedRoi - prevLockedRoi) >= 0.05) {
+            salvarAlvos();
+            console.log(`[TRAVA-ESCADA-E${stageNum}] ${sym} (${pos.lado}): Pico +${maxRoi.toFixed(2)}% ROI -> Trava em +${alvo.lockedRoi.toFixed(2)}% ROI ($${stopFmt})`);
+          }
         }
 
         let deveFechar = false;
@@ -897,14 +1082,20 @@ setInterval(async () => {
             deveFechar = true;
             motivoFechamento = `[STOP LOSS ATR] Preço ${formatarPrecoAtivo(sym, curPrice)} <= SL ${formatarPrecoAtivo(sym, alvo.slPrice)} (${roi.toFixed(2)}% ROI)`;
           }
-          else if (!deveFechar && roi <= -12.0) {
+          else if (!deveFechar && roi <= -7.50) {
             deveFechar = true;
-            motivoFechamento = `[SAFETY SL -12%] ROI atingiu ${roi.toFixed(2)}% (Teto -12.0% ROI)`;
+            motivoFechamento = `[SAFETY SL -7.5%] ROI atingiu ${roi.toFixed(2)}% (Teto -7.5% ROI)`;
           }
-          // 3. Breakeven (Só aciona se o ROI atual cair de volta e tocar ou cruzar para baixo do lockedRoi ativo)
+          // 3. Breakeven / Retração (com Filtro Anti-Pavio: 3 ticks consecutivos ou furo direto >= 0.60% abaixo)
           else if (!deveFechar && alvo.beArmed && (roi <= alvo.lockedRoi || (alvo.beStopPrice && curPrice <= alvo.beStopPrice))) {
-            deveFechar = true;
-            motivoFechamento = `[BREAKEVEN] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(1)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}%)`;
+            const furouForte = roi <= (alvo.lockedRoi - 0.60);
+            beBreachedTicks[sym] = (beBreachedTicks[sym] || 0) + 1;
+            if (furouForte || beBreachedTicks[sym] >= 3) {
+              deveFechar = true;
+              motivoFechamento = `[BREAKEVEN] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(2)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}% | Ticks: ${beBreachedTicks[sym]}${furouForte ? ' [FURO RAPIDO]' : ''})`;
+            }
+          } else if (!deveFechar) {
+            beBreachedTicks[sym] = 0;
           }
         } else {
           // SHORT
@@ -921,14 +1112,70 @@ setInterval(async () => {
             deveFechar = true;
             motivoFechamento = `[STOP LOSS ATR] Preço ${formatarPrecoAtivo(sym, curPrice)} >= SL ${formatarPrecoAtivo(sym, alvo.slPrice)} (${roi.toFixed(2)}% ROI)`;
           }
-          else if (!deveFechar && roi <= -12.0) {
+          else if (!deveFechar && roi <= -7.50) {
             deveFechar = true;
-            motivoFechamento = `[SAFETY SL -12%] ROI atingiu ${roi.toFixed(2)}% (Teto -12.0% ROI)`;
+            motivoFechamento = `[SAFETY SL -7.5%] ROI atingiu ${roi.toFixed(2)}% (Teto -7.5% ROI)`;
           }
-          // 3. Breakeven (Só aciona se o ROI atual cair de volta e tocar ou cruzar para baixo do lockedRoi ativo)
+          // 3. Breakeven / Retração (com Filtro Anti-Pavio: 3 ticks consecutivos ou furo direto >= 0.60% abaixo)
           else if (!deveFechar && alvo.beArmed && (roi <= alvo.lockedRoi || (alvo.beStopPrice && curPrice >= alvo.beStopPrice))) {
-            deveFechar = true;
-            motivoFechamento = `[BREAKEVEN] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(1)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}%)`;
+            const furouForte = roi <= (alvo.lockedRoi - 0.60);
+            beBreachedTicks[sym] = (beBreachedTicks[sym] || 0) + 1;
+            if (furouForte || beBreachedTicks[sym] >= 3) {
+              deveFechar = true;
+              motivoFechamento = `[BREAKEVEN] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(2)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}% | Ticks: ${beBreachedTicks[sym]}${furouForte ? ' [FURO RAPIDO]' : ''})`;
+            }
+          } else if (!deveFechar) {
+            beBreachedTicks[sym] = 0;
+          }
+        }
+
+        // ── IMPLANTAÇÃO /trader-exit (CORTES TEMPORAIS E LIMPEZA DE ZUMBIS) ──
+        const duracaoMs = Date.now() - (alvo.openTime || (pos.atualizadoEm || Date.now()));
+        const duracaoMin = duracaoMs / 60000;
+
+        // 4. Hard Timeout Máximo de 90 minutos para qualquer trade negativo
+        if (!deveFechar && duracaoMin >= 90 && roi < 0) {
+          deveFechar = true;
+          motivoFechamento = `[TIMEOUT_MAXIMO_90M] Posição negativa após 90m (${roi.toFixed(2)}% ROI | Duração ${Math.round(duracaoMin)}m)`;
+        }
+        // 5. Soft Stop aos 30 minutos (Limpeza incondicional de posições zumbis)
+        else if (!deveFechar && duracaoMin >= 30 && roi <= -2.00 && maxRoi < 2.50) {
+          deveFechar = true;
+          motivoFechamento = `[PERDAO_30M_SOFT_STOP] Estagnação aos 30m (${roi.toFixed(2)}% ROI <= -2.00% | Pico: +${maxRoi.toFixed(2)}% < 2.50% | Duração ${Math.round(duracaoMin)}m)`;
+        }
+        // 6. Corte Rápido de Falha de Ignição aos 15 minutos
+        else if (!deveFechar && duracaoMin >= 15 && maxRoi < 0.50 && roi <= -2.50) {
+          const k15 = await fut.klines(sym, '15m', 2).catch(() => []);
+          if (k15 && k15.length > 0) {
+            const last15 = k15[k15.length - 1];
+            const o15 = parseFloat(last15[1]);
+            const c15 = parseFloat(last15[4]);
+            const contra15m = isLong ? (c15 < o15) : (c15 > o15);
+            if (contra15m) {
+              deveFechar = true;
+              motivoFechamento = `[CORTE_FALHA_IGNICAO_15M] Falha de Ignição aos 15m (${roi.toFixed(2)}% ROI <= -2.50% | Pico: +${maxRoi.toFixed(2)}% < 0.50% | 15m contra)`;
+            }
+          }
+        }
+
+        // ── PROTEÇÃO CONTRA FUNDING TÓXICO EM POSIÇÃO ABERTA ──
+        if (!deveFechar && roi >= 1.50) {
+          const prem = await fut.precoMarca(sym).catch(() => null);
+          if (prem) {
+            const fr = parseFloat(prem.lastFundingRate || 0);
+            const nextFt = parseInt(prem.nextFundingTime || 0);
+            const msAteFunding = nextFt - Date.now();
+
+            const pagandoFunding = isLong ? (fr > 0.0005) : (fr < -0.0005);
+            const fundingToxico = isLong ? (fr > 0.0025) : (fr < -0.0025);
+
+            const pertoDaVirada = pagandoFunding && msAteFunding > 0 && msAteFunding <= 5 * 60 * 1000;
+            const tempoEstagnadoComTaxa = fundingToxico && duracaoMs >= 60 * 60 * 1000;
+
+            if (pertoDaVirada || tempoEstagnadoComTaxa) {
+              deveFechar = true;
+              motivoFechamento = `[SAIDA_PROTECAO_FUNDING] Lucro protegido (+${roi.toFixed(2)}% ROI) p/ evitar taxa funding (${(fr * 100).toFixed(4)}% | ${pertoDaVirada ? 'Faltam ' + Math.round(msAteFunding / 60000) + 'm' : 'Aberta > 60m'})`;
+            }
           }
         }
 
@@ -938,6 +1185,7 @@ setInterval(async () => {
           delete localAlvos[sym];
           delete maxPriceTracker[sym];
           delete minPriceTracker[sym];
+          delete beBreachedTicks[sym];
           salvarAlvos();
 
           try {
@@ -945,7 +1193,7 @@ setInterval(async () => {
             await fut.cancelarTodasOrdens(sym);
             await fut.fecharMercado(sym, pos.lado, pos.quantidade);
 
-            const exitTipo = (motivoFechamento.includes('TAKE PROFIT') || motivoFechamento.includes('TETO TP')) ? 'TP' : (motivoFechamento.includes('BREAKEVEN') ? 'BREAKEVEN' : 'SL');
+            const exitTipo = (motivoFechamento.includes('TAKE PROFIT') || motivoFechamento.includes('TETO TP') || motivoFechamento.includes('SAIDA_PROTECAO_FUNDING') || motivoFechamento.includes('PERDAO_30M_LUCRO')) ? 'TP' : (motivoFechamento.includes('BREAKEVEN') ? 'BREAKEVEN' : (motivoFechamento.includes('CORTE_FALHA_IGNICAO_15M') ? 'CORTE_FALHA_IGNICAO_15M' : (motivoFechamento.includes('PERDAO_30M_SOFT_STOP') ? 'PERDAO_30M_SOFT_STOP' : (motivoFechamento.includes('TIMEOUT_MAXIMO_90M') ? 'TIMEOUT_MAXIMO_90M' : 'SL'))));
             await rag.salvarSaidaRAG({
               symbol: sym,
               exitPrice: curPrice,
@@ -956,18 +1204,9 @@ setInterval(async () => {
 
             registrarDesfechoTrade(sym, exitTipo, roi, pos.pnlNaoRealizado);
 
-            // Cooldown Pós-Breakeven: Quando uma moeda fechar no Breakeven (Estágios 1 a 5),
-            // aplique 15 minutos de cooldown para evitar recompra imediata pagando taxas
-            if (exitTipo === 'BREAKEVEN') {
-              gatekeeperVetoedUntil[sym] = Date.now() + 15 * 60 * 1000;
-              console.log(`[COOLDOWN-BREAKEVEN] ${sym} fechou em Breakeven (Estágio ${alvoBackup.beStage || 1}). Cooldown de 15 min ativado.`);
-            }
-
-            // Cooldown Pós-Perdão 30m: 30 minutos (1800000ms) para forçar o robô a buscar novas moedas voláteis
-            if (motivoFechamento.includes('PERDAO_30M') || motivoFechamento.includes('PERDAO')) {
-              gatekeeperVetoedUntil[sym] = Date.now() + 30 * 60 * 1000;
-              console.log(`[COOLDOWN-PERDAO-30M] ${sym} fechou por estagnação 30m. Cooldown de 30 min ativado na moeda.`);
-            }
+            // Bloqueio rigoroso de repetição da mesma moeda por 2 horas (7200000ms) após qualquer fechamento (TP, SL, Trava ou Perdão)
+            gatekeeperVetoedUntil[sym] = Date.now() + 7200000;
+            console.log(`[COOLDOWN-POS-FECHAMENTO-2H] ${sym} fechou por ${exitTipo} (ROI: ${roi.toFixed(2)}%). Bloqueado por 2 horas para impedir reentradas viciosas.`);
 
             // Libera slot com cooldown 45s
             [1, 2].forEach(s => {
@@ -1011,7 +1250,7 @@ async function atualizarTopSetups() {
     const vetados = await rag.consultarParesVetados(45).catch(() => []);
     const vetadosSet = new Set(vetados.map(v => v.symbol));
 
-    // Top 15 moedas mais voláteis do carrossel (24h)
+    // Analisa até 60 moedas mais voláteis (descartando pumps/dumps extremos logo de início)
     const candidatos = volData
       .filter(t => {
         const sym = t.symbol;
@@ -1019,10 +1258,12 @@ async function atualizarTopSetups() {
         if (vetadosSet.has(sym)) return false;
         if (gatekeeperVetoedUntil[sym] && now < gatekeeperVetoedUntil[sym]) return false;
         if (parseFloat(t.count || 0) <= 1000) return false;
+        const p24 = parseFloat(t.priceChangePercent || 0);
+        if (p24 > 40.0 || p24 < -25.0) return false;
         return true;
       })
       .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)))
-      .slice(0, 15);
+      .slice(0, 60);
 
     const setups = [];
     for (const c of candidatos) {
@@ -1031,6 +1272,25 @@ async function atualizarTopSetups() {
 
       const dados = await analisarEstruturaEMercado(c.symbol);
       if (!dados) continue;
+
+      // Filtro prévio de exaustão 24h e funding tóxico no scanner
+      const p24Cand = parseFloat(c.priceChangePercent || dados.priceChangePercent || 0);
+      if (dados.direcaoModo === 'SHORT' && p24Cand < -22.0 && dados.modoDetectado !== 'EXAUSTAO_REVERSAO') {
+        gatekeeperVetoedUntil[c.symbol] = now + 15 * 60 * 1000;
+        continue;
+      }
+      if (dados.direcaoModo === 'LONG' && p24Cand > 35.0 && dados.modoDetectado !== 'EXAUSTAO_REVERSAO') {
+        gatekeeperVetoedUntil[c.symbol] = now + 15 * 60 * 1000;
+        continue;
+      }
+      if (dados.direcaoModo === 'SHORT' && dados.fundingRate < -0.0015) {
+        gatekeeperVetoedUntil[c.symbol] = now + 15 * 60 * 1000;
+        continue;
+      }
+      if (dados.direcaoModo === 'LONG' && dados.fundingRate > 0.0015) {
+        gatekeeperVetoedUntil[c.symbol] = now + 15 * 60 * 1000;
+        continue;
+      }
 
       // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.80% a 2.50%)
       if (dados.atrPct15m < 0.80 || dados.atrPct15m > 2.50) {
@@ -1046,8 +1306,8 @@ async function atualizarTopSetups() {
         continue;
       }
 
-      // 3. Gatekeeper (exige setup ativo MODO A, B ou C e directionalScore condizente)
-      const gk = verificarGatekeeper(dados);
+      // 3. Gatekeeper (exige setup ativo MODO A, B ou C e directionalScore condizente - sem confirmação de vela 5m no scanner de candidatos)
+      const gk = verificarGatekeeper(dados, false);
       if (!gk.passou) {
         gatekeeperVetoedUntil[c.symbol] = now + 120000;
         continue;
@@ -1069,6 +1329,8 @@ async function atualizarTopSetups() {
         rvol15m: dados.rvol15m,
         bonusModo
       });
+
+      if (setups.length >= 15) break;
     }
 
     setups.sort((a, b) => b.scoreEfetivo - a.scoreEfetivo);
@@ -1110,8 +1372,8 @@ setInterval(async () => {
           }
 
           const duracaoMs = now - (slot.openTime || now);
-          if (duracaoMs >= 30 * 60 * 1000) {
-            if (now - (slot.last30mCheck || 0) >= 5 * 60 * 1000) {
+          if (duracaoMs >= 15 * 60 * 1000) {
+            if (now - (slot.last30mCheck || 0) >= 60 * 1000) {
               slot.last30mCheck = now;
               const duracaoMin = Math.round(duracaoMs / 60000);
               const decisao30m = await avaliarPerdao30mMatematico(slot.symbol, pos, duracaoMin);
@@ -1135,11 +1397,12 @@ setInterval(async () => {
                 delete localAlvos[slot.symbol];
                 delete maxPriceTracker[slot.symbol];
                 delete minPriceTracker[slot.symbol];
+                delete beBreachedTicks[slot.symbol];
                 salvarAlvos();
 
                 const symFechado = slot.symbol;
-                gatekeeperVetoedUntil[symFechado] = now + 30 * 60 * 1000; // Cooldown 30m (1800000ms) na moeda
-                console.log(`[COOLDOWN-PERDAO-30M] ${symFechado} fechado por estagnação 30m (${decisao30m.motivo}). Cooldown de 30 min ativado na moeda.`);
+                gatekeeperVetoedUntil[symFechado] = now + 7200000; // Bloqueio 2 horas (7200000ms)
+                console.log(`[COOLDOWN-POS-FECHAMENTO-2H] ${symFechado} fechado por estagnação 30m (${decisao30m.motivo}). Bloqueado por 2 horas.`);
                 slot.symbol = null;
                 slot.side = null;
                 slot.targetSymbol = null;
@@ -1174,8 +1437,8 @@ setInterval(async () => {
           slot.status = `[POSIÇÃO ATIVA] ${slot.symbol} (${slot.side || pos.lado} ${slot.leverage || pos.alavancagem}x)`;
 
           const duracaoMs = now - (slot.openTime || now);
-          if (duracaoMs >= 30 * 60 * 1000) {
-            if (now - (slot.last30mCheck || 0) >= 5 * 60 * 1000) {
+          if (duracaoMs >= 15 * 60 * 1000) {
+            if (now - (slot.last30mCheck || 0) >= 60 * 1000) {
               slot.last30mCheck = now;
               const duracaoMin = Math.round(duracaoMs / 60000);
               const decisao30m = await avaliarPerdao30mMatematico(slot.symbol, pos, duracaoMin);
@@ -1199,11 +1462,12 @@ setInterval(async () => {
                 delete localAlvos[slot.symbol];
                 delete maxPriceTracker[slot.symbol];
                 delete minPriceTracker[slot.symbol];
+                delete beBreachedTicks[slot.symbol];
                 salvarAlvos();
 
                 const symFechado = slot.symbol;
-                gatekeeperVetoedUntil[symFechado] = now + 30 * 60 * 1000; // Cooldown 30m (1800000ms) na moeda
-                console.log(`[COOLDOWN-PERDAO-30M] ${symFechado} fechado por estagnação 30m (${decisao30m.motivo}). Cooldown de 30 min ativado na moeda.`);
+                gatekeeperVetoedUntil[symFechado] = now + 7200000; // Bloqueio 2 horas (7200000ms)
+                console.log(`[COOLDOWN-POS-FECHAMENTO-2H] ${symFechado} fechado por estagnação 30m (${decisao30m.motivo}). Bloqueado por 2 horas.`);
                 slot.symbol = null;
                 slot.side = null;
                 slot.targetSymbol = null;
@@ -1289,8 +1553,20 @@ setInterval(async () => {
       const modoTxt = dados.modoLabel || 'SEM SETUP';
 
       // ── OTIMIZAÇÃO: GATEKEEPER HARDCODED (0 TOKENS) ──
-      const gk = verificarGatekeeper(dados);
+      const gk = verificarGatekeeper(dados, true);
       if (!gk.passou) {
+        if (gk.is5mAwaiting) {
+          const tempoAguardando = Math.round((now - (slot.targetAssignedTime || now)) / 1000);
+          if (tempoAguardando > 600) {
+            console.log(`[TIMEOUT-GATILHO-5M] Slot ${slotNum} (${cand}): Excedeu 10m sem confirmação 5m. Rotacionando.`);
+            gatekeeperVetoedUntil[cand] = now + 60000;
+            slot.targetSymbol = null;
+            continue;
+          }
+          slot.status = `[AGUARDANDO CONFIRMAÇÃO 5M] ${cand} (${gk.motivo.replace('Gatekeeper [/trader-entry]: ', '')}) [${tempoAguardando}s]`;
+          continue;
+        }
+
         console.log(`[GATEKEEPER-RECUSA] Slot ${slotNum} (${cand}) [${modoTxt} | Score: ${scoreTxt}]: ${gk.motivo}`);
         slot.status = `[RECUSADO: ${gk.motivo}]`;
         autoBotState.lastLog = `Slot ${slotNum} (${cand}): ${gk.motivo}`;
@@ -1412,27 +1688,27 @@ setInterval(async () => {
           slDistExec = precoExec * (dados.slPctReal / 100);
           slRoeExec = (slDistExec / precoExec) * alav * 100;
 
-          // Banda saudável de ROI no SL: piso -6.0% e teto -12.0%
-          if (slRoeExec < 6.0) {
-            slRoeExec = 6.0;
-            slDistExec = precoExec * ((6.0 / alav) / 100);
-          } else if (slRoeExec > 12.0) {
-            slRoeExec = 12.0;
-            slDistExec = precoExec * ((12.0 / alav) / 100);
+          // Banda saudável de ROI no SL: piso -5.0% e teto -7.5%
+          if (slRoeExec < 5.0) {
+            slRoeExec = 5.0;
+            slDistExec = precoExec * ((5.0 / alav) / 100);
+          } else if (slRoeExec > 7.5) {
+            slRoeExec = 7.5;
+            slDistExec = precoExec * ((7.5 / alav) / 100);
           }
           slPrecoDefinido = dec.action === 'LONG' ? (precoExec - slDistExec) : (precoExec + slDistExec);
 
-          // Take Profit no dobro da distância do SL (R:R 1:2), respeitando teto dinâmico de 10.0% ROI
+          // Take Profit no dobro da distância do SL (R:R 1:2), respeitando teto dinâmico de 8.0% ROI
           let tpDistExec = (dados.modoDetectado === 'EXAUSTAO_REVERSAO' && dados.tpPrice)
             ? Math.abs(precoExec - dados.tpPrice)
             : 2.0 * slDistExec;
           let tpRoeProj = (tpDistExec / precoExec) * alav * 100;
-          if (tpRoeProj > 10.0) {
-            tpDistExec = precoExec * (0.10 / alav);
+          if (tpRoeProj > 8.0) {
+            tpDistExec = precoExec * (0.08 / alav);
           }
           tpPrecoDefinido = dec.action === 'LONG' ? (precoExec + tpDistExec) : (precoExec - tpDistExec);
 
-          const beTriggerDist = precoExec * ((0.80 / alav) / 100);
+          const beTriggerDist = precoExec * ((3.20 / alav) / 100);
           const beTriggerPrice = dec.action === 'LONG' ? (precoExec + beTriggerDist) : (precoExec - beTriggerDist);
 
           console.log(`[ORDEM-EXECUTADA] Slot ${slotNum} (${cand}) [${modoTxt}]: ${dec.action} ${alav}x a $${formatarPrecoAtivo(cand, precoExec)} | Qty: ${filledQty} | SL: $${formatarPrecoAtivo(cand, slPrecoDefinido)} (-${slRoeExec.toFixed(1)}% ROI) | TP: $${formatarPrecoAtivo(cand, tpPrecoDefinido)}`);
@@ -1448,10 +1724,11 @@ setInterval(async () => {
             beArmed: false,
             beStage: 0,
             beStopPrice: null,
-            beLabel: '',
+            beLabel: '[🌱 RESPIRO LIVRE ATÉ +3.20% ROI (PICO ATUAL: +0.00%)]',
             lockedRoi: 0,
             leverage: alav,
-            maxRoiReached: 0
+            maxRoiReached: 0,
+            openTime: now
           };
           salvarAlvos();
 
@@ -1532,6 +1809,73 @@ app.get('/api/saldo', async (req, res) => {
     res.json({ success: false, error: fut.detalheErro(err) });
   }
 });
+
+// Retorno Líquido Base Capital (20 USDT = 2 slots x 10 USDT)
+app.get('/api/base-capital-pnl', async (req, res) => {
+  try {
+    const now = new Date();
+    const hojeInicio = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).getTime();
+    const ontemInicio = hojeInicio - (24 * 60 * 60 * 1000);
+    const ontemFim = hojeInicio - 1;
+
+    const inc = await fut.income({ startTime: ontemInicio, limit: 1000 }).catch(() => []);
+
+    let pnlBrutoHoje = 0, taxaHoje = 0, fundingHoje = 0, countHoje = 0;
+    let pnlBrutoOntem = 0, taxaOntem = 0, fundingOntem = 0, countOntem = 0;
+
+    for (const r of inc || []) {
+      const t = parseInt(r.time);
+      const val = parseFloat(r.income);
+      if (r.symbol === 'HEMIUSDT') continue;
+
+      if (t >= hojeInicio) {
+        if (r.incomeType === 'REALIZED_PNL') { pnlBrutoHoje += val; countHoje++; }
+        else if (r.incomeType === 'COMMISSION') { taxaHoje += val; }
+        else if (r.incomeType === 'FUNDING_FEE') { fundingHoje += val; }
+      } else if (t >= ontemInicio && t <= ontemFim) {
+        if (r.incomeType === 'REALIZED_PNL') { pnlBrutoOntem += val; countOntem++; }
+        else if (r.incomeType === 'COMMISSION') { taxaOntem += val; }
+        else if (r.incomeType === 'FUNDING_FEE') { fundingOntem += val; }
+      }
+    }
+
+    const pnlLiquidoHoje = pnlBrutoHoje + taxaHoje + fundingHoje;
+    const pnlLiquidoOntem = pnlBrutoOntem + taxaOntem + fundingOntem;
+
+    const baseCapital = 20.0;
+    const roiHoje = (pnlLiquidoHoje / baseCapital) * 100;
+    const roiOntem = (pnlLiquidoOntem / baseCapital) * 100;
+
+    res.json({
+      success: true,
+      baseCapital,
+      brl: brlGlobal,
+      hoje: {
+        dataStr: new Date(hojeInicio).toLocaleDateString('pt-BR'),
+        pnlBruto: pnlBrutoHoje,
+        taxas: taxaHoje,
+        funding: fundingHoje,
+        pnlLiquido: pnlLiquidoHoje,
+        pnlBrl: pnlLiquidoHoje * brlGlobal,
+        roiPct: roiHoje,
+        tradesCount: countHoje
+      },
+      ontem: {
+        dataStr: new Date(ontemInicio).toLocaleDateString('pt-BR'),
+        pnlBruto: pnlBrutoOntem,
+        taxas: taxaOntem,
+        funding: fundingOntem,
+        pnlLiquido: pnlLiquidoOntem,
+        pnlBrl: pnlLiquidoOntem * brlGlobal,
+        roiPct: roiOntem,
+        tradesCount: countOntem
+      }
+    });
+  } catch (err) {
+    res.json({ success: false, error: fut.detalheErro(err) });
+  }
+});
+
 
 // Scanner de Voláteis com Filtro de Liquidez (ETAPA 2)
 app.get('/api/volateis', async (req, res) => {
@@ -1720,14 +2064,14 @@ app.post('/api/trade', async (req, res) => {
 
     if (fill > 0) {
       const dados = await analisarEstruturaEMercado(symbol);
-      let slDistMan = dados ? (dados.slPctReal / 100 * preco) : (preco * ((6.0 / alav) / 100));
+      let slDistMan = dados ? (dados.slPctReal / 100 * preco) : (preco * ((5.0 / alav) / 100));
       let slRoeMan = (slDistMan / preco) * alav * 100;
-      if (slRoeMan < 6.0) {
-        slRoeMan = 6.0;
-        slDistMan = preco * ((6.0 / alav) / 100);
-      } else if (slRoeMan > 12.0) {
-        slRoeMan = 12.0;
-        slDistMan = preco * ((12.0 / alav) / 100);
+      if (slRoeMan < 5.0) {
+        slRoeMan = 5.0;
+        slDistMan = preco * ((5.0 / alav) / 100);
+      } else if (slRoeMan > 7.5) {
+        slRoeMan = 7.5;
+        slDistMan = preco * ((7.5 / alav) / 100);
       }
       let slCalc = lado === 'BUY' ? (preco - slDistMan) : (preco + slDistMan);
 
@@ -1735,12 +2079,12 @@ app.post('/api/trade', async (req, res) => {
         ? Math.abs(preco - dados.tpPrice)
         : 2.0 * slDistMan;
       let tpRoeMan = (tpDistMan / preco) * alav * 100;
-      if (tpRoeMan > 10.0) {
-        tpDistMan = preco * (0.10 / alav);
+      if (tpRoeMan > 8.0) {
+        tpDistMan = preco * (0.08 / alav);
       }
       let tpCalc = lado === 'BUY' ? (preco + tpDistMan) : (preco - tpDistMan);
 
-      const beTriggerDist = preco * ((0.80 / alav) / 100);
+      const beTriggerDist = preco * ((3.20 / alav) / 100);
       const beTriggerPrice = lado === 'BUY' ? (preco + beTriggerDist) : (preco - beTriggerDist);
 
       localAlvos[symbol] = {
@@ -1753,10 +2097,11 @@ app.post('/api/trade', async (req, res) => {
         beArmed: false,
         beStage: 0,
         beStopPrice: null,
-        beLabel: '',
+        beLabel: '[🌱 RESPIRO LIVRE ATÉ +3.20% ROI (PICO ATUAL: +0.00%)]',
         lockedRoi: 0,
         leverage: alav,
-        maxRoiReached: 0
+        maxRoiReached: 0,
+        openTime: Date.now()
       };
       salvarAlvos();
       res.json({ success: true, result: st });
@@ -1779,6 +2124,7 @@ app.post('/api/close', async (req, res) => {
     const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
     const roi = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
     registrarDesfechoTrade(symbol, 'MANUAL_CLOSE', roi, pos.pnlNaoRealizado);
+    gatekeeperVetoedUntil[symbol] = Date.now() + 7200000;
 
     await rag.salvarSaidaRAG({
       symbol,
@@ -1791,6 +2137,7 @@ app.post('/api/close', async (req, res) => {
     delete localAlvos[symbol];
     delete maxPriceTracker[symbol];
     delete minPriceTracker[symbol];
+    delete beBreachedTicks[symbol];
     salvarAlvos();
     res.json({ success: true, result: r });
   } catch (err) {
@@ -1897,8 +2244,40 @@ app.post('/api/limpar-placar', (req, res) => {
 
 app.get('/api/historico-completo', async (req, res) => {
   try {
-    const trades = await fut.userTradesCompleto();
-    res.json({ success: true, count: trades.length, trades });
+    const inc = await fut.income({ limit: 1000 }).catch(() => []);
+    const dbTrades = await db.all("SELECT * FROM trades_rag WHERE exit_time IS NOT NULL ORDER BY exit_time DESC LIMIT 300");
+
+    const trades = (dbTrades || []).map(t => {
+      const symInc = inc.filter(r => r.symbol === t.symbol && r.time >= (t.entry_time - 15000) && r.time <= (t.exit_time + 15000));
+      let realPnl = 0, comm = 0;
+      symInc.forEach(r => {
+        if (r.incomeType === 'REALIZED_PNL') realPnl += parseFloat(r.income);
+        if (r.incomeType === 'COMMISSION') comm += Math.abs(parseFloat(r.income));
+      });
+
+      const finalPnl = (symInc.length > 0 && Math.abs(realPnl) > 0) ? realPnl : (parseFloat(t.pnl_usdt) || 0);
+      const finalFee = comm > 0 ? comm : 0.02;
+
+      return {
+        id: t.id,
+        orderId: t.id,
+        symbol: t.symbol,
+        side: t.side,
+        leverage: t.leverage || 1,
+        mode: t.mode || '',
+        entryPrice: t.entry_price,
+        exitPrice: t.exit_price,
+        entryTime: t.entry_time,
+        time: t.exit_time,
+        roi: parseFloat(t.roi_pct) || 0,
+        pnl: finalPnl,
+        fee: finalFee,
+        exitReason: t.exit_reason || '',
+        result: (t.result || (finalPnl >= 0 ? 'WIN' : 'LOSS')).toUpperCase()
+      };
+    });
+
+    res.json({ success: true, count: trades.length, trades, marcoZero });
   } catch (err) {
     res.json({ success: false, error: fut.detalheErro(err) });
   }
@@ -1928,6 +2307,22 @@ app.get('/api/historico', async (req, res) => {
 
       <!-- PREÇO ATUAL GRANDE E DESTACADO -->
       <div class="price-display" id="price-${col}">$ 0.0000</div>
+
+      <!-- POSIÇÃO ABERTA (MOVIDA PARA O TOPO: ALTO DESTAQUE VISUAL COM GLOW) -->
+      <div class="pos-card" id="pos-${col}">
+        <div class="pos-header">
+          <div id="pos-lado-${col}" class="pos-side-pill">--</div>
+          <span id="pos-qty-${col}" class="pos-qty">Qty: --</span>
+        </div>
+        <div id="pos-be-status-${col}" class="pos-be-banner" style="display:none;"></div>
+        <div class="pos-pnl" id="pos-pnl-${col}">$ 0.00 (0.00%)</div>
+        <div class="pos-pnl-brl" id="pos-pnl-brl-${col}">R$ 0,00</div>
+        <div class="pos-entry-row">Preço Entrada: <b id="pos-entry-${col}" style="color:#FFF;">--</b></div>
+        <div class="pos-actions-row">
+          <button class="btn-close" onclick="fecharPosicao(${col})">FECHAR MERCADO</button>
+          <button class="btn-reverse" onclick="reverterPosicao(${col})">REVERTER</button>
+        </div>
+      </div>
       
       <!-- TENDÊNCIA MULTI-TIMEFRAME (EMA 50) -->
       <div class="mtf-box">
@@ -1990,22 +2385,6 @@ app.get('/api/historico', async (req, res) => {
         </div>
       </div>
 
-      <!-- POSIÇÃO ABERTA (ALTO DESTAQUE VISUAL COM GLOW) -->
-      <div class="pos-card" id="pos-${col}">
-        <div class="pos-header">
-          <div id="pos-lado-${col}" class="pos-side-pill">--</div>
-          <span id="pos-qty-${col}" class="pos-qty">Qty: --</span>
-        </div>
-        <div id="pos-be-status-${col}" class="pos-be-banner" style="display:none;"></div>
-        <div class="pos-pnl" id="pos-pnl-${col}">$ 0.00 (0.00%)</div>
-        <div class="pos-pnl-brl" id="pos-pnl-brl-${col}">R$ 0,00</div>
-        <div class="pos-entry-row">Preço Entrada: <b id="pos-entry-${col}" style="color:#FFF;">--</b></div>
-        <div class="pos-actions-row">
-          <button class="btn-close" onclick="fecharPosicao(${col})">FECHAR MERCADO</button>
-          <button class="btn-reverse" onclick="reverterPosicao(${col})">REVERTER</button>
-        </div>
-      </div>
-
       <!-- RODAPÉ: BLOCO DE RISCO QUANTITATIVO BEM DIMENSIONADO -->
       <div class="risk-card">
         <div class="risk-meta-row">
@@ -2030,7 +2409,7 @@ app.get('/api/historico', async (req, res) => {
             <div class="target-val" id="proj-sl-${col}">--</div>
           </div>
           <div class="target-box target-be">
-            <div class="target-title">BREAKEVEN (+0.25%)</div>
+            <div class="target-title">BREAKEVEN (+0.55%)</div>
             <div class="target-val" id="proj-be-${col}">--</div>
           </div>
           <div class="target-box target-tp">
@@ -2155,7 +2534,9 @@ app.get('/', (req, res) => {
       gap: 14px;
       box-shadow: 0 4px 25px rgba(0,0,0,0.4);
     }
-    .card.active { border-color: rgba(212, 175, 55, 0.55); box-shadow: 0 0 25px rgba(212, 175, 55, 0.1); }
+    .card.active:not(.has-pos) { border-color: rgba(212, 175, 55, 0.55); box-shadow: 0 0 25px rgba(212, 175, 55, 0.1); }
+    .card.has-pos-win { border-color: rgba(16, 185, 129, 0.75) !important; box-shadow: 0 0 25px rgba(16, 185, 129, 0.3) !important; }
+    .card.has-pos-loss { border-color: rgba(239, 68, 68, 0.75) !important; box-shadow: 0 0 25px rgba(239, 68, 68, 0.3) !important; }
 
     /* CARD HEADER */
     .card-top-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
@@ -2323,6 +2704,34 @@ app.get('/', (req, res) => {
     </div>
   </div>
 
+  <!-- MODAL DE BASE CAPITAL (20 USDT) -->
+  <div class="modal-overlay" id="modal-base-capital">
+    <div class="modal" style="max-width: 480px; text-align: center;">
+      <div class="modal-head">
+        <div style="text-align: left;">
+          <h3 style="color: var(--gold); font-size: 1.25rem; margin-bottom: 2px;">Performance Base Capital</h3>
+          <span style="font-size: 0.78rem; color: var(--text-muted); font-weight: 600;">2 slots x 10 USDT = <b style="color:#FFF;">20 USDT Base</b></span>
+        </div>
+        <button onclick="fecharBaseCapital()" style="background:transparent; border:none; color:var(--text-muted); font-size:1.5rem; cursor:pointer;">&times;</button>
+      </div>
+
+      <!-- NAVEGADOR DE ABAS COM SETAS (ONTEM / HOJE) -->
+      <div style="display:flex; justify-content:space-between; align-items:center; margin: 15px 0 20px 0; background: rgba(0,0,0,0.35); border: 1px solid var(--border); border-radius: 12px; padding: 6px 10px;">
+        <button id="bc-nav-prev" onclick="navegarBaseCapital(-1)" style="padding: 6px 12px; font-size: 1.1rem; background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 8px; cursor: pointer; color: var(--text);">&larr;</button>
+        <div style="display:flex; gap: 8px;">
+          <button id="bc-tab-ontem" onclick="mudarAbaBaseCapital('ontem')" style="padding: 7px 18px; font-size: 0.82rem; font-weight: 700; border-radius: 8px; border: none; cursor: pointer; background: transparent; color: var(--text-muted);">ONTEM</button>
+          <button id="bc-tab-hoje" onclick="mudarAbaBaseCapital('hoje')" style="padding: 7px 18px; font-size: 0.82rem; font-weight: 800; border-radius: 8px; border: none; cursor: pointer; background: var(--gold); color: #000;">HOJE</button>
+        </div>
+        <button id="bc-nav-next" onclick="navegarBaseCapital(1)" style="padding: 6px 12px; font-size: 1.1rem; background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 8px; cursor: pointer; color: var(--text);">&rarr;</button>
+      </div>
+
+      <!-- CONTEÚDO DINÂMICO -->
+      <div id="bc-conteudo">
+        <div style="padding: 30px; color: var(--text-muted); font-weight: 600;">Carregando dados...</div>
+      </div>
+    </div>
+  </div>
+
   <!-- MODAL DE HISTÓRICO -->
   <div class="modal-overlay" id="modal-hist">
     <div class="modal">
@@ -2332,7 +2741,7 @@ app.get('/', (req, res) => {
       </div>
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:10px;">
         <div style="display:flex; gap:8px;">
-          <button id="btn-tab-periodo" onclick="mudarAbaHist('periodo')" style="padding:8px 16px; font-size:0.8rem; background:var(--gold); color:#000; border-radius:8px; font-weight:800; cursor:pointer;">Agrupado</button>
+          <button id="btn-tab-periodo" onclick="mudarAbaHist('periodo')" style="padding:8px 16px; font-size:0.8rem; background:var(--gold); color:#000; border-radius:8px; font-weight:800; cursor:pointer;">Ciclo Atual</button>
           <button id="btn-tab-hoje" onclick="mudarAbaHist('hoje')" style="padding:8px 16px; font-size:0.8rem; background:rgba(255,255,255,0.08); color:var(--text); border-radius:8px; cursor:pointer; font-weight:700;">Hoje</button>
           <button id="btn-tab-todas" onclick="mudarAbaHist('todas')" style="padding:8px 16px; font-size:0.8rem; background:rgba(255,255,255,0.08); color:var(--text); border-radius:8px; cursor:pointer; font-weight:700;">Todas</button>
         </div>
@@ -2373,6 +2782,7 @@ app.get('/', (req, res) => {
 
       <div class="header-btns">
         <button onclick="carregarSaldo()">Atualizar</button>
+        <button onclick="abrirBaseCapital()" style="background: rgba(212, 175, 55, 0.16); border: 1px solid var(--gold); color: var(--gold); font-weight: 800;">Base Capital</button>
         <button onclick="abrirHistorico()">Histórico</button>
         <button onclick="fazerLogout()">Sair</button>
       </div>
@@ -2415,8 +2825,15 @@ app.get('/', (req, res) => {
 
     function selecionarColuna(c) {
       colunaAtiva = c;
-      document.getElementById('card-1').classList.toggle('active', c === 1);
-      document.getElementById('card-2').classList.toggle('active', c === 2);
+      [1, 2].forEach(col => {
+        const el = document.getElementById('card-' + col);
+        if (!el) return;
+        el.classList.toggle('active', col === c);
+        if (!el.classList.contains('has-pos')) {
+          el.style.borderColor = (col === c ? 'rgba(212, 175, 55, 0.55)' : 'var(--card-border)');
+          el.style.boxShadow = (col === c ? '0 0 25px rgba(212, 175, 55, 0.1)' : '0 4px 20px rgba(0,0,0,0.35)');
+        }
+      });
     }
 
     function askConfirm(title, message, isAlert = false) {
@@ -2483,6 +2900,7 @@ app.get('/', (req, res) => {
         const r = await fetch('/api/volateis');
         const d = await r.json();
         if (d.success && d.data) {
+          window.listaVolateisCache = d.data;
           let html = '';
           d.data.forEach(item => {
             const pct = parseFloat(item.priceChangePercent);
@@ -2494,6 +2912,20 @@ app.get('/', (req, res) => {
             '</div>';
           });
           document.getElementById('vol-bar').innerHTML = html;
+
+          // Preenchimento inicial inteligente dos slots sem permitir duplicidade
+          let s1 = (document.getElementById('sym-1')?.value || '').trim().toUpperCase();
+          let s2 = (document.getElementById('sym-2')?.value || '').trim().toUpperCase();
+          if (!s1 && d.data.length > 0) {
+            s1 = d.data[0].symbol;
+            document.getElementById('sym-1').value = s1;
+            debouncedLoad(1);
+          }
+          if ((!s2 || s2 === s1) && d.data.length > 1) {
+            s2 = (d.data.find(item => item.symbol !== s1)?.symbol) || 'SOLUSDT';
+            document.getElementById('sym-2').value = s2;
+            debouncedLoad(2);
+          }
         }
       } catch(e) {}
     }
@@ -2509,6 +2941,12 @@ app.get('/', (req, res) => {
     }
 
     function aplicarMoeda(sym) {
+      const outroCol = (colunaAtiva === 1 ? 2 : 1);
+      const outroSym = (document.getElementById('sym-' + outroCol)?.value || '').trim().toUpperCase();
+      if (sym && sym === outroSym) {
+        askConfirm('Par em Uso', 'O par <b style="color:var(--gold);">' + sym + '</b> já está ativo no Slot ' + outroCol + '. Escolha outro par para evitar duplicidade.', true);
+        return;
+      }
       lastUserInteraction[colunaAtiva] = Date.now();
       document.getElementById('sym-' + colunaAtiva).value = sym;
       debouncedLoad(colunaAtiva);
@@ -2533,6 +2971,18 @@ app.get('/', (req, res) => {
       let sym = document.getElementById('sym-' + col).value.trim().toUpperCase();
       if (!sym) return;
       if (!sym.endsWith('USDT')) sym += 'USDT';
+
+      const outroCol = (col === 1 ? 2 : 1);
+      const outroSym = (document.getElementById('sym-' + outroCol)?.value || '').trim().toUpperCase();
+      if (sym === outroSym) {
+        const candAlt = (window.dTopCandidatos && window.dTopCandidatos.find(c => c.symbol !== sym)?.symbol) ||
+                        (window.listaVolateisCache && window.listaVolateisCache.find(c => c.symbol !== sym)?.symbol) ||
+                        'SOLUSDT';
+        console.warn('[ANTI-DUPLICIDADE loadData] Slot ' + col + ' e Slot ' + outroCol + ' com ' + sym + '. Trocando Slot ' + col + ' para ' + candAlt);
+        document.getElementById('sym-' + col).value = candAlt;
+        debouncedLoad(col);
+        return;
+      }
       localStorage.setItem('sym-' + col, sym);
 
       try {
@@ -2631,7 +3081,11 @@ app.get('/', (req, res) => {
         // ── POSIÇÃO ABERTA (ALTO DESTAQUE VISUAL COM GLOW) ──
         const posBox = document.getElementById('pos-' + col);
         const cardEl = document.getElementById('card-' + col);
-        if (data.pos && parseFloat(data.pos.quantidade) !== 0) {
+        const outroCol = (col === 1 ? 2 : 1);
+        const outroSlotSym = window.dAutoBotSlots ? window.dAutoBotSlots[outroCol]?.symbol : null;
+        const pertenceOutroSlot = outroSlotSym && outroSlotSym === sym;
+
+        if (data.pos && parseFloat(data.pos.quantidade) !== 0 && !pertenceOutroSlot) {
           cardHasPosition[col] = true;
           posBox.style.display = 'block';
           const p = data.pos;
@@ -2668,34 +3122,44 @@ app.get('/', (req, res) => {
             : 'linear-gradient(180deg, rgba(239,68,68,0.18) 0%, rgba(127,29,29,0.25) 100%)';
 
           if (cardEl) {
-            cardEl.style.borderColor = isProfit ? 'rgba(16, 185, 129, 0.7)' : 'rgba(239, 68, 68, 0.7)';
-            cardEl.style.boxShadow = '0 0 25px ' + (isProfit ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)');
+            cardEl.classList.add('has-pos');
+            cardEl.classList.toggle('has-pos-win', isProfit);
+            cardEl.classList.toggle('has-pos-loss', !isProfit);
+            cardEl.style.borderColor = isProfit ? 'rgba(16, 185, 129, 0.75)' : 'rgba(239, 68, 68, 0.75)';
+            cardEl.style.boxShadow = '0 0 25px ' + (isProfit ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)');
           }
 
           const prec = data.pricePrecision || 4;
           document.getElementById('pos-entry-' + col).innerText = '$ ' + Number(p.precoEntrada).toFixed(prec);
 
-          // Banner de Status da Posição (Breakeven)
+          // Banner de Status da Posição (Trava Curta -1.0% ROI / Respiro Livre até +2.20%)
           const beEl = document.getElementById('pos-be-status-' + col);
           if (beEl) {
-            const stopPriceTxt = data.beStopPrice ? Number(data.beStopPrice).toFixed(prec) : '--';
-            if (data.beArmed && data.beStopPrice) {
-              const maxR = (data.maxRoiReached || 0).toFixed(2);
-              const lockR = (data.lockedRoi || 0).toFixed(1);
-              beEl.style.display = 'block';
-              beEl.className = 'pos-be-banner';
+            beEl.style.display = 'block';
+            beEl.className = 'pos-be-banner';
+            const maxR = (data.maxRoiReached || 0).toFixed(2);
+            const lockR = (data.lockedRoi || 0).toFixed(2);
+            const stopP = data.beStopPrice ? ('$' + Number(data.beStopPrice).toFixed(prec)) : '';
+
+            if (data.maxRoiReached >= 3.20) {
               beEl.style.background = 'rgba(16, 185, 129, 0.22)';
               beEl.style.borderColor = 'var(--green)';
               beEl.style.color = 'var(--green)';
-              beEl.innerText = '🛡️ BREAKEVEN ATIVO: GARANTIDO +' + lockR + '% ROI ($' + stopPriceTxt + ') | PICO: +' + maxR + '% ROI';
+              beEl.innerText = data.beLabel || ('[🛡️ TRAVA ATIVA: GARANTIDO +' + lockR + '% ROI (' + stopP + ') | PICO +' + maxR + '%]');
             } else {
-              beEl.style.display = 'none';
+              beEl.style.background = 'rgba(255, 255, 255, 0.06)';
+              beEl.style.borderColor = 'rgba(255, 255, 255, 0.2)';
+              beEl.style.color = 'var(--gold)';
+              beEl.innerText = data.beLabel || ('[🌱 RESPIRO LIVRE ATÉ +3.20% ROI (PICO ATUAL: +' + maxR + '%)]');
             }
           }
         } else {
           cardHasPosition[col] = false;
           posBox.style.display = 'none';
+          const beEl = document.getElementById('pos-be-status-' + col);
+          if (beEl) beEl.style.display = 'none';
           if (cardEl) {
+            cardEl.classList.remove('has-pos', 'has-pos-win', 'has-pos-loss');
             cardEl.style.borderColor = (colunaAtiva === col ? 'rgba(212, 175, 55, 0.55)' : 'var(--card-border)');
             cardEl.style.boxShadow = (colunaAtiva === col ? '0 0 25px rgba(212, 175, 55, 0.1)' : '0 4px 20px rgba(0,0,0,0.35)');
           }
@@ -2920,6 +3384,8 @@ app.get('/', (req, res) => {
           const btn = document.getElementById('btn-auto-toggle');
           const statusTxt = document.getElementById('auto-status-text');
           const logEl = document.getElementById('auto-log-text');
+          window.dAutoBotSlots = d.slots;
+          window.dTopCandidatos = d.topCandidatos || [];
 
           if (d.enabled) {
             btn.innerText = 'DESLIGAR ROBÔ';
@@ -2958,6 +3424,20 @@ app.get('/', (req, res) => {
                 }
               }
             });
+
+            // Trava estrita de desduplicação frontal: ambos slots nunca podem ter o mesmo par
+            const s1 = (document.getElementById('sym-1')?.value || '').trim().toUpperCase();
+            const s2 = (document.getElementById('sym-2')?.value || '').trim().toUpperCase();
+            if (s1 && s2 && s1 === s2) {
+              const s1TemPos = !!(d.slots && d.slots[1] && d.slots[1].symbol === s1);
+              const colTrocar = s1TemPos ? 2 : 1;
+              const candAlternativo = (d.topCandidatos && d.topCandidatos.find(c => c.symbol !== s1)?.symbol) ||
+                                      (window.listaVolateisCache && window.listaVolateisCache.find(c => c.symbol !== s1)?.symbol) ||
+                                      'SOLUSDT';
+              console.warn('[DESDUPLICAÇÃO] Ambos slots estavam com ' + s1 + '. Trocando Slot ' + colTrocar + ' para ' + candAlternativo);
+              document.getElementById('sym-' + colTrocar).value = candAlternativo;
+              debouncedLoad(colTrocar);
+            }
           } else {
             btn.innerText = 'LIGAR ROBÔ IA';
             btn.style.background = 'rgba(16, 185, 129, 0.2)';
@@ -3066,6 +3546,157 @@ app.get('/', (req, res) => {
     let abaAtualHist = 'periodo';
     let todosTradesCache = [];
 
+
+    // ── MODAL BASE CAPITAL (20 USDT) ──
+    let baseCapitalCache = null;
+    let abaBaseCapital = 'hoje';
+
+    function abrirBaseCapital() {
+      document.getElementById('modal-base-capital').style.display = 'flex';
+      carregarBaseCapital();
+    }
+
+    function fecharBaseCapital() {
+      document.getElementById('modal-base-capital').style.display = 'none';
+    }
+
+    function mudarAbaBaseCapital(aba) {
+      abaBaseCapital = aba;
+      atualizarNavBaseCapital();
+      renderizarBaseCapital();
+    }
+
+    function navegarBaseCapital(dir) {
+      if (dir < 0) {
+        mudarAbaBaseCapital('ontem');
+      } else {
+        mudarAbaBaseCapital('hoje');
+      }
+    }
+
+    function atualizarNavBaseCapital() {
+      const btnOntem = document.getElementById('bc-tab-ontem');
+      const btnHoje = document.getElementById('bc-tab-hoje');
+      const arrowPrev = document.getElementById('bc-nav-prev');
+      const arrowNext = document.getElementById('bc-nav-next');
+      if (!btnOntem || !btnHoje || !arrowPrev || !arrowNext) return;
+
+      if (abaBaseCapital === 'ontem') {
+        btnOntem.style.background = 'var(--gold)';
+        btnOntem.style.color = '#000';
+        btnOntem.style.fontWeight = '800';
+        btnHoje.style.background = 'transparent';
+        btnHoje.style.color = 'var(--text-muted)';
+        btnHoje.style.fontWeight = '700';
+
+        arrowPrev.style.opacity = '0.35';
+        arrowPrev.style.cursor = 'not-allowed';
+        arrowNext.style.opacity = '1';
+        arrowNext.style.cursor = 'pointer';
+      } else {
+        btnHoje.style.background = 'var(--gold)';
+        btnHoje.style.color = '#000';
+        btnHoje.style.fontWeight = '800';
+        btnOntem.style.background = 'transparent';
+        btnOntem.style.color = 'var(--text-muted)';
+        btnOntem.style.fontWeight = '700';
+
+        arrowPrev.style.opacity = '1';
+        arrowPrev.style.cursor = 'pointer';
+        arrowNext.style.opacity = '0.35';
+        arrowNext.style.cursor = 'not-allowed';
+      }
+    }
+
+    async function carregarBaseCapital() {
+      const container = document.getElementById('bc-conteudo');
+      if (!container) return;
+      container.innerHTML = '<div style="padding:30px; color:var(--text-muted); font-weight:600;">Carregando dados da Binance...</div>';
+      atualizarNavBaseCapital();
+      try {
+        const res = await fetch('/api/base-capital-pnl');
+        const data = await res.json();
+        if (data.success) {
+          baseCapitalCache = data;
+          renderizarBaseCapital();
+        } else {
+          container.innerHTML = '<div style="padding:30px; color:var(--red); font-weight:700;">Erro: ' + (data.error || 'Falha ao carregar') + '</div>';
+        }
+      } catch(e) {
+        container.innerHTML = '<div style="padding:30px; color:var(--red); font-weight:700;">Falha de comunicação</div>';
+      }
+    }
+
+    function renderizarBaseCapital() {
+      if (!baseCapitalCache) return;
+      const container = document.getElementById('bc-conteudo');
+      if (!container) return;
+      const d = baseCapitalCache[abaBaseCapital];
+      if (!d) return;
+
+      const isProfit = d.pnlLiquido >= 0;
+      const cor = isProfit ? 'var(--green)' : 'var(--red)';
+      const glow = isProfit ? 'rgba(16, 185, 129, 0.35)' : 'rgba(239, 68, 68, 0.35)';
+      const bgCard = isProfit
+        ? 'linear-gradient(180deg, rgba(16,185,129,0.12) 0%, rgba(6,78,59,0.2) 100%)'
+        : 'linear-gradient(180deg, rgba(239,68,68,0.12) 0%, rgba(127,29,29,0.2) 100%)';
+      const sinal = isProfit ? '+' : '';
+      const sinalUsdt = d.pnlLiquido >= 0 ? '+$ ' : '-$ ';
+      const sinalBrl = d.pnlBrl >= 0 ? '+R$ ' : '-R$ ';
+
+      const brlRate = baseCapitalCache.brl || 5.20;
+      const baseBrl = (baseCapitalCache.baseCapital * brlRate).toFixed(2);
+
+      let html = '<div style="background:' + bgCard + '; border: 1.5px solid ' + cor + '; border-radius: 16px; padding: 20px; box-shadow: 0 0 25px ' + glow + '; margin-bottom: 20px;">' +
+          '<div style="font-size: 0.8rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;">' +
+            abaBaseCapital.toUpperCase() + ' (' + d.dataStr + ')' +
+          '</div>' +
+          '<div style="font-size: 2.8rem; font-weight: 900; color: ' + cor + '; text-shadow: 0 0 20px ' + glow + '; margin: 4px 0; font-family: monospace;">' +
+            sinal + d.roiPct.toFixed(2) + '%' +
+          '</div>' +
+          '<div style="font-size: 1.35rem; font-weight: 800; color: #FFF; margin-bottom: 4px;">' +
+            sinalUsdt + Math.abs(d.pnlLiquido).toFixed(2) + ' USDT' +
+          '</div>' +
+          '<div style="font-size: 1.05rem; font-weight: 700; color: ' + (isProfit ? '#34D399' : '#F87171') + '; margin-bottom: 12px;">' +
+            sinalBrl + Math.abs(d.pnlBrl).toFixed(2) + ' BRL' +
+          '</div>' +
+          '<div style="font-size: 0.78rem; color: var(--text-muted); border-top: 1px dashed rgba(255,255,255,0.12); padding-top: 10px;">' +
+            'Capital Base: <b style="color:var(--gold);">' + baseCapitalCache.baseCapital.toFixed(2) + ' USDT</b> (R$ ' + baseBrl + ')' +
+          '</div>' +
+        '</div>';
+
+      html += '<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">' +
+          '<div style="background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 10px; padding: 10px; text-align: center;">' +
+            '<div style="font-size: 0.7rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase;">PnL Operacional</div>' +
+            '<div style="font-size: 1rem; font-weight: 800; color: ' + (d.pnlBruto >= 0 ? 'var(--green)' : 'var(--red)') + '; font-family: monospace; margin-top: 2px;">' +
+              (d.pnlBruto >= 0 ? '+$ ' : '-$ ') + Math.abs(d.pnlBruto).toFixed(2) +
+            '</div>' +
+          '</div>' +
+          '<div style="background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 10px; padding: 10px; text-align: center;">' +
+            '<div style="font-size: 0.7rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase;">Taxas Corretagem</div>' +
+            '<div style="font-size: 1rem; font-weight: 800; color: var(--gold); font-family: monospace; margin-top: 2px;">' +
+              '-$ ' + Math.abs(d.taxas).toFixed(2) +
+            '</div>' +
+          '</div>' +
+          '<div style="background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 10px; padding: 10px; text-align: center;">' +
+            '<div style="font-size: 0.7rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase;">Funding Fee</div>' +
+            '<div style="font-size: 1rem; font-weight: 800; color: ' + (d.funding >= 0 ? 'var(--green)' : 'var(--gold)') + '; font-family: monospace; margin-top: 2px;">' +
+              (d.funding >= 0 ? '+$ ' : '-$ ') + Math.abs(d.funding).toFixed(4) +
+            '</div>' +
+          '</div>' +
+          '<div style="background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 10px; padding: 10px; text-align: center;">' +
+            '<div style="font-size: 0.7rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase;">Ordens no Dia</div>' +
+            '<div style="font-size: 1rem; font-weight: 800; color: var(--text); font-family: monospace; margin-top: 2px;">' +
+              d.tradesCount + ' trades' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+
+      container.innerHTML = html;
+    }
+
+    let historicoMarcoZero = 0;
+
     function abrirHistorico() {
       document.getElementById('modal-hist').style.display = 'flex';
       carregarHistoricoCompleto();
@@ -3078,6 +3709,7 @@ app.get('/', (req, res) => {
       abaAtualHist = aba;
       ['periodo', 'hoje', 'todas'].forEach(t => {
         const btn = document.getElementById('btn-tab-' + t);
+        if (!btn) return;
         if (t === aba) {
           btn.style.background = 'var(--gold)';
           btn.style.color = '#000';
@@ -3102,6 +3734,7 @@ app.get('/', (req, res) => {
           return;
         }
         todosTradesCache = data.trades;
+        historicoMarcoZero = data.marcoZero || 0;
         renderizarAbaHistorico();
       } catch(e) {
         container.innerHTML = '<div style="text-align:center; padding:30px; color:var(--red); font-weight:700;">Erro ao carregar histórico.</div>';
@@ -3115,43 +3748,19 @@ app.get('/', (req, res) => {
         return;
       }
 
-      const tradeGroups = {};
-      todosTradesCache.forEach(t => {
-        const orderId = t.orderId;
-        if (!tradeGroups[orderId]) {
-          tradeGroups[orderId] = {
-            orderId,
-            symbol: t.symbol,
-            side: t.side,
-            time: t.time,
-            pnl: 0,
-            fee: 0,
-            qty: 0,
-            hasPnl: false
-          };
-        }
-        const p = parseFloat(t.realizedPnl);
-        const f = parseFloat(t.commission);
-        const q = parseFloat(t.qty);
-        if (!isNaN(p)) {
-          tradeGroups[orderId].pnl += p;
-          if (Math.abs(p) > 0.000001) tradeGroups[orderId].hasPnl = true;
-        }
-        if (!isNaN(f)) tradeGroups[orderId].fee += f;
-        if (!isNaN(q)) tradeGroups[orderId].qty += q;
-      });
-
-      const groupedArray = Object.values(tradeGroups).sort((a,b) => b.time - a.time);
-
       if (abaAtualHist === 'hoje') {
         const inicioHoje = new Date();
         inicioHoje.setHours(0,0,0,0);
-        const hojeTrades = groupedArray.filter(g => g.time >= inicioHoje.getTime());
+        const hojeTrades = todosTradesCache.filter(g => g.time >= inicioHoje.getTime());
         container.innerHTML = renderAbaComResumo(hojeTrades, 'Hoje', 'Operações de Hoje');
       } else if (abaAtualHist === 'todas') {
-        container.innerHTML = renderAbaComResumo(groupedArray, 'Todas', 'Todas as Operações');
+        container.innerHTML = renderAbaComResumo(todosTradesCache, 'Todas', 'Todas as Operações');
       } else {
-        container.innerHTML = renderAbaComResumo(groupedArray, 'Geral', 'Últimas 40 Operações');
+        const cicloTrades = (historicoMarcoZero && historicoMarcoZero > 0)
+          ? todosTradesCache.filter(g => g.time >= historicoMarcoZero)
+          : todosTradesCache.slice(0, 35);
+        const listaPeriodo = cicloTrades.length > 0 ? cicloTrades : todosTradesCache.slice(0, 35);
+        container.innerHTML = renderAbaComResumo(listaPeriodo, 'Ciclo Atual', 'Operações do Ciclo Atual');
       }
     }
 
@@ -3162,12 +3771,10 @@ app.get('/', (req, res) => {
 
       let totWin = 0, totLoss = 0, totPnl = 0, totFee = 0;
       lista.forEach(g => {
-        if (g.hasPnl) {
-          if (g.pnl > 0.0001) totWin++;
-          else if (g.pnl < -0.0001) totLoss++;
-          totPnl += g.pnl;
-        }
-        totFee += g.fee;
+        if (g.pnl > 0.0001 || g.result === 'WIN') totWin++;
+        else totLoss++;
+        totPnl += g.pnl;
+        totFee += (g.fee || 0);
       });
 
       const winRate = (totWin + totLoss) > 0 ? Math.round((totWin / (totWin + totLoss)) * 100) : 0;
@@ -3178,7 +3785,7 @@ app.get('/', (req, res) => {
           '</div>' +
           '<div class="hist-stat-card">' +
             '<div class="hist-stat-title">PnL Líquido (' + titulo + ')</div>' +
-            '<div class="hist-stat-val" style="color:' + (totPnl >= 0 ? 'var(--green)' : 'var(--red)') + ';">' + (totPnl >= 0 ? '+' : '') + '$ ' + totPnl.toFixed(2) + '</div>' +
+            '<div class="hist-stat-val" style="color:' + (totPnl >= 0 ? 'var(--green)' : 'var(--red)') + ';">' + (totPnl >= 0 ? '+$ ' : '-$ ') + Math.abs(totPnl).toFixed(2) + '</div>' +
           '</div>' +
           '<div class="hist-stat-card">' +
             '<div class="hist-stat-title">Corretagem (' + titulo + ')</div>' +
@@ -3186,34 +3793,42 @@ app.get('/', (req, res) => {
           '</div>' +
         '</div>';
 
-      html += renderListaSimples(lista.slice(0, 50), subtitulo);
+      html += renderListaSimples(lista.slice(0, 80), subtitulo);
       return html;
     }
 
     function renderListaSimples(lista, titulo) {
       if (lista.length === 0) return '<div style="text-align:center; padding:30px; color:var(--text-muted); font-weight:600;">Nenhum trade encontrado em ' + titulo + '.</div>';
-      let html = '<div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:14px; font-weight:700;">Exibindo ' + lista.length + ' ordens (' + titulo + ')</div>';
+      let html = '<div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:14px; font-weight:700;">Exibindo ' + lista.length + ' operações (' + titulo + ')</div>';
       lista.forEach(g => {
-        const isWin = g.pnl > 0.0001;
-        const isLoss = g.pnl < -0.0001;
-        const cor = isWin ? '#10B981' : (isLoss ? '#EF4444' : '#94A3B8');
-        const borderCor = isWin ? 'var(--green)' : (isLoss ? 'var(--red)' : 'var(--border)');
-        const bgBadge = isWin ? 'rgba(16,185,129,0.18)' : (isLoss ? 'rgba(239,68,68,0.18)' : 'rgba(255,255,255,0.06)');
+        const isWin = g.pnl > 0.0001 || g.result === 'WIN';
+        const cor = isWin ? '#10B981' : '#EF4444';
+        const borderCor = isWin ? 'var(--green)' : 'var(--red)';
+        const bgBadge = isWin ? 'rgba(16,185,129,0.18)' : 'rgba(239,68,68,0.18)';
         const dataStr = new Date(g.time).toLocaleString('pt-BR');
-        const tag = isWin ? 'WIN' : (isLoss ? 'LOSS' : '0 a 0');
+        const tag = isWin ? 'WIN' : 'LOSS';
+        const motivoTxt = g.exitReason ? ('[' + g.exitReason + ']') : '';
+        const roiVal = parseFloat(g.roi || 0);
+        const roiTxt = (roiVal >= 0 ? '+' : '') + roiVal.toFixed(2) + '% ROI';
+        const isShort = String(g.side).toUpperCase() === 'SHORT';
+        const sideTxt = (g.side || 'TRADE') + (g.leverage ? (' ' + g.leverage + 'x') : '');
+
+        const pEntrada = g.entryPrice ? ('$' + Number(g.entryPrice).toFixed(4)) : '--';
+        const pSaida = g.exitPrice ? ('$' + Number(g.exitPrice).toFixed(4)) : '--';
 
         html += '<div class="trade-card-row" style="border-left: 4px solid ' + borderCor + ';">' +
             '<div class="trade-left">' +
               '<div class="trade-sym-row">' +
                 '<span class="trade-sym">' + g.symbol + '</span>' +
-                '<span class="trade-side-pill ' + (g.side === 'BUY' ? 'pill-buy' : 'pill-sell') + '">' + (g.side === 'BUY' ? 'COMPRA' : 'VENDA') + '</span>' +
+                '<span class="trade-side-pill ' + (isShort ? 'pill-sell' : 'pill-buy') + '">' + sideTxt + '</span>' +
                 '<span class="trade-tag-pill" style="color:' + cor + '; background:' + bgBadge + ';">' + tag + '</span>' +
+                '<span style="font-size:0.75rem; color:var(--text-muted); font-family:monospace; margin-left:4px;">' + motivoTxt + ' ' + roiTxt + '</span>' +
               '</div>' +
-              '<div class="trade-date">' + dataStr + '</div>' +
+              '<div class="trade-date">' + dataStr + ' • Entrada: ' + pEntrada + ' &rarr; Saída: ' + pSaida + '</div>' +
             '</div>' +
             '<div class="trade-right">' +
-              '<div class="trade-pnl" style="color:' + cor + ';">' + (g.pnl >= 0 ? '+' : '') + '$ ' + g.pnl.toFixed(2) + '</div>' +
-              '<div class="trade-fee">Taxa: $ ' + g.fee.toFixed(4) + '</div>' +
+              '<div class="trade-pnl" style="color:' + cor + ';">' + (g.pnl >= 0 ? '+$ ' : '-$ ') + Math.abs(g.pnl).toFixed(2) + '</div>' +
+              '<div class="trade-fee">Taxa: $ ' + Number(g.fee).toFixed(4) + '</div>' +
             '</div>' +
           '</div>';
       });
@@ -3228,13 +3843,20 @@ app.get('/', (req, res) => {
 
     // Inicialização
     window.addEventListener('DOMContentLoaded', () => {
-      [1, 2].forEach(col => {
-        const saved = localStorage.getItem('sym-' + col);
-        if (saved && saved !== 'undefined' && saved !== 'null') {
-          document.getElementById('sym-' + col).value = saved;
-          debouncedLoad(col);
-        }
-      });
+      let s1 = localStorage.getItem('sym-1');
+      let s2 = localStorage.getItem('sym-2');
+      if (s1 && s2 && s1 === s2) {
+        s2 = null;
+        localStorage.removeItem('sym-2');
+      }
+      if (s1 && s1 !== 'undefined' && s1 !== 'null') {
+        document.getElementById('sym-1').value = s1;
+        debouncedLoad(1);
+      }
+      if (s2 && s2 !== 'undefined' && s2 !== 'null') {
+        document.getElementById('sym-2').value = s2;
+        debouncedLoad(2);
+      }
       carregarSaldo();
       carregarVolateis();
       carregarPlacar();
@@ -3268,7 +3890,7 @@ app.get('/', (req, res) => {
             autoBotState.slots[sNum].targetSymbol = p.symbol;
             autoBotState.slots[sNum].side = p.lado;
             autoBotState.slots[sNum].leverage = p.alavancagem;
-            autoBotState.slots[sNum].openTime = p.atualizadoEm || Date.now();
+            autoBotState.slots[sNum].openTime = localAlvos[p.symbol]?.openTime || p.atualizadoEm || Date.now();
             autoBotState.slots[sNum].status = `[POSIÇÃO ATIVA] ${p.symbol} (${p.lado} ${p.alavancagem}x)`;
             console.log(`[BOOT] Slot ${sNum} sincronizado com posição existente: ${p.symbol} (${p.lado} ${p.alavancagem}x)`);
 
@@ -3281,21 +3903,22 @@ app.get('/', (req, res) => {
                 entryPrice: pEntrada,
                 slPrice: isLong ? pEntrada * (1 - (12.0 / alav) / 100) : pEntrada * (1 + (12.0 / alav) / 100),
                 tpPrice: isLong ? pEntrada * (1 + 0.10 / alav) : pEntrada * (1 - 0.10 / alav),
-                beTriggerPrice: isLong ? pEntrada * (1 + (0.80 / alav) / 100) : pEntrada * (1 - (0.80 / alav) / 100),
+                beTriggerPrice: isLong ? pEntrada * (1 + (3.20 / alav) / 100) : pEntrada * (1 - (3.20 / alav) / 100),
                 slDistPct: 0.12 / alav,
                 beArmed: false,
                 beStage: 0,
                 beStopPrice: null,
-                beLabel: '',
+                beLabel: '[🌱 RESPIRO LIVRE ATÉ +3.20% ROI (PICO ATUAL: +0.00%)]',
                 lockedRoi: 0,
                 leverage: p.alavancagem,
-                maxRoiReached: 0
+                maxRoiReached: 0,
+                openTime: Date.now()
               };
               salvarAlvos();
             } else {
               if (localAlvos[p.symbol].beStage === undefined) localAlvos[p.symbol].beStage = 0;
               if (localAlvos[p.symbol].beStopPrice === undefined) localAlvos[p.symbol].beStopPrice = null;
-              if (localAlvos[p.symbol].beLabel === undefined) localAlvos[p.symbol].beLabel = '';
+              if (!localAlvos[p.symbol].beLabel) localAlvos[p.symbol].beLabel = '[🌱 RESPIRO LIVRE ATÉ +3.20% ROI (PICO ATUAL: +0.00%)]';
               if (localAlvos[p.symbol].lockedRoi === undefined) localAlvos[p.symbol].lockedRoi = 0;
               if (localAlvos[p.symbol].maxRoiReached === undefined) localAlvos[p.symbol].maxRoiReached = 0;
               delete localAlvos[p.symbol].jaReverteu;
