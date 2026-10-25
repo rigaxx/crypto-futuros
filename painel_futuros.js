@@ -617,9 +617,9 @@ async function analisarEstruturaEMercado(symbol) {
       tpRoe = 8.0;
     }
 
-    const beTriggerDist = curPrice * ((1.50 / leverageSugerida) / 100);
+    const beTriggerDist = curPrice * ((2.20 / leverageSugerida) / 100);
     const beTriggerPctReal = (beTriggerDist / curPrice) * 100;
-    const beTriggerRoe = 1.50;
+    const beTriggerRoe = 2.20;
     const beTriggerPrice = ladoOp === 'LONG' ? (curPrice + beTriggerDist) : (curPrice - beTriggerDist);
 
     const last5mOpenTime = (k5m && k5m.length > 0) ? k5m[k5m.length - 1][0] : 0;
@@ -892,22 +892,21 @@ setInterval(async () => {
         else if (degrauPico >= 6.50) novoLockedRoi = 5.80;
         else if (degrauPico >= 6.00) novoLockedRoi = 5.30;
         else if (degrauPico >= 5.50) novoLockedRoi = 4.80;
-        else if (degrauPico >= 5.00) novoLockedRoi = 4.30; // Bateu +5.0% ROI -> Garante +4.30% ROI!
+        else if (degrauPico >= 5.00) novoLockedRoi = 4.30;
         else if (degrauPico >= 4.50) novoLockedRoi = 3.70;
         else if (degrauPico >= 4.00) novoLockedRoi = 3.20;
         else if (degrauPico >= 3.50) novoLockedRoi = 2.60;
-        else if (degrauPico >= 3.00) novoLockedRoi = 2.10; // Bateu +3.0% ROI -> Garante +2.10% ROI!
-        else if (degrauPico >= 2.50) novoLockedRoi = 1.50;
-        else if (degrauPico >= 2.00) novoLockedRoi = 1.00;
-        else if (degrauPico >= 1.50) novoLockedRoi = 0.50; // Bateu +1.5% ROI -> Proibido virar Loss!
+        else if (degrauPico >= 3.00) novoLockedRoi = 2.10;
+        else if (degrauPico >= 2.50) novoLockedRoi = 1.60;
+        else if (maxRoi >= 2.20) novoLockedRoi = 1.20; // 1º Degrau já garante +1.20% ROI!
 
-        // Abaixo de +1.50% de ROI: Trava DESLIGADA. Respiro livre total
+        // Abaixo de +2.20% de ROI: Trava DESLIGADA. Respiro livre total
         if (!novoLockedRoi) {
           alvo.beArmed = false;
           alvo.beStage = 0;
           alvo.lockedRoi = 0;
           alvo.beStopPrice = null;
-          alvo.beLabel = `[🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO ATUAL: +${maxRoi.toFixed(2)}%)]`;
+          alvo.beLabel = `[🌱 RESPIRO LIVRE ATÉ +2.20% ROI (PICO ATUAL: +${maxRoi.toFixed(2)}%)]`;
         } else {
           alvo.beArmed = true;
           // Regra Inegociável: a catraca NUNCA recua
@@ -1568,7 +1567,7 @@ setInterval(async () => {
           }
           tpPrecoDefinido = dec.action === 'LONG' ? (precoExec + tpDistExec) : (precoExec - tpDistExec);
 
-          const beTriggerDist = precoExec * ((1.50 / alav) / 100);
+          const beTriggerDist = precoExec * ((2.20 / alav) / 100);
           const beTriggerPrice = dec.action === 'LONG' ? (precoExec + beTriggerDist) : (precoExec - beTriggerDist);
 
           console.log(`[ORDEM-EXECUTADA] Slot ${slotNum} (${cand}) [${modoTxt}]: ${dec.action} ${alav}x a $${formatarPrecoAtivo(cand, precoExec)} | Qty: ${filledQty} | SL: $${formatarPrecoAtivo(cand, slPrecoDefinido)} (-${slRoeExec.toFixed(1)}% ROI) | TP: $${formatarPrecoAtivo(cand, tpPrecoDefinido)}`);
@@ -1584,7 +1583,7 @@ setInterval(async () => {
             beArmed: false,
             beStage: 0,
             beStopPrice: null,
-            beLabel: '[🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO ATUAL: +0.00%)]',
+            beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.20% ROI (PICO ATUAL: +0.00%)]',
             lockedRoi: 0,
             leverage: alav,
             maxRoiReached: 0,
@@ -1944,7 +1943,7 @@ app.post('/api/trade', async (req, res) => {
       }
       let tpCalc = lado === 'BUY' ? (preco + tpDistMan) : (preco - tpDistMan);
 
-      const beTriggerDist = preco * ((1.50 / alav) / 100);
+      const beTriggerDist = preco * ((2.20 / alav) / 100);
       const beTriggerPrice = lado === 'BUY' ? (preco + beTriggerDist) : (preco - beTriggerDist);
 
       localAlvos[symbol] = {
@@ -1957,7 +1956,7 @@ app.post('/api/trade', async (req, res) => {
         beArmed: false,
         beStage: 0,
         beStopPrice: null,
-        beLabel: '[🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO ATUAL: +0.00%)]',
+        beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.20% ROI (PICO ATUAL: +0.00%)]',
         lockedRoi: 0,
         leverage: alav,
         maxRoiReached: 0,
@@ -3001,7 +3000,7 @@ app.get('/', (req, res) => {
             const lockR = (data.lockedRoi || 0).toFixed(2);
             const stopP = data.beStopPrice ? ('$' + Number(data.beStopPrice).toFixed(prec)) : '';
 
-            if (data.maxRoiReached >= 1.50) {
+            if (data.maxRoiReached >= 2.20) {
               beEl.style.background = 'rgba(16, 185, 129, 0.22)';
               beEl.style.borderColor = 'var(--green)';
               beEl.style.color = 'var(--green)';
@@ -3010,7 +3009,7 @@ app.get('/', (req, res) => {
               beEl.style.background = 'rgba(255, 255, 255, 0.06)';
               beEl.style.borderColor = 'rgba(255, 255, 255, 0.2)';
               beEl.style.color = 'var(--gold)';
-              beEl.innerText = data.beLabel || ('[🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO ATUAL: +' + maxR + '%)]');
+              beEl.innerText = data.beLabel || ('[🌱 RESPIRO LIVRE ATÉ +2.20% ROI (PICO ATUAL: +' + maxR + '%)]');
             }
           }
         } else {
@@ -3763,12 +3762,12 @@ app.get('/', (req, res) => {
                 entryPrice: pEntrada,
                 slPrice: isLong ? pEntrada * (1 - (12.0 / alav) / 100) : pEntrada * (1 + (12.0 / alav) / 100),
                 tpPrice: isLong ? pEntrada * (1 + 0.10 / alav) : pEntrada * (1 - 0.10 / alav),
-                beTriggerPrice: isLong ? pEntrada * (1 + (1.50 / alav) / 100) : pEntrada * (1 - (1.50 / alav) / 100),
+                beTriggerPrice: isLong ? pEntrada * (1 + (2.20 / alav) / 100) : pEntrada * (1 - (2.20 / alav) / 100),
                 slDistPct: 0.12 / alav,
                 beArmed: false,
                 beStage: 0,
                 beStopPrice: null,
-                beLabel: '[🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO ATUAL: +0.00%)]',
+                beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.20% ROI (PICO ATUAL: +0.00%)]',
                 lockedRoi: 0,
                 leverage: p.alavancagem,
                 maxRoiReached: 0,
@@ -3778,7 +3777,7 @@ app.get('/', (req, res) => {
             } else {
               if (localAlvos[p.symbol].beStage === undefined) localAlvos[p.symbol].beStage = 0;
               if (localAlvos[p.symbol].beStopPrice === undefined) localAlvos[p.symbol].beStopPrice = null;
-              if (!localAlvos[p.symbol].beLabel) localAlvos[p.symbol].beLabel = '[🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO ATUAL: +0.00%)]';
+              if (!localAlvos[p.symbol].beLabel) localAlvos[p.symbol].beLabel = '[🌱 RESPIRO LIVRE ATÉ +2.20% ROI (PICO ATUAL: +0.00%)]';
               if (localAlvos[p.symbol].lockedRoi === undefined) localAlvos[p.symbol].lockedRoi = 0;
               if (localAlvos[p.symbol].maxRoiReached === undefined) localAlvos[p.symbol].maxRoiReached = 0;
               delete localAlvos[p.symbol].jaReverteu;
