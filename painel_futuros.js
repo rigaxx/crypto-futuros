@@ -73,7 +73,21 @@ function salvarPlacarStats() {
   } catch(e) {}
 }
 
+const closedTradeEvents = new Map(); // symbol -> timestamp para travar duplicidades atômicas
+
 function registrarDesfechoTrade(symbol, exitReason, roi, pnlUsdt) {
+  if (!symbol) return;
+  const agora = Date.now();
+  const ultimoReg = closedTradeEvents.get(symbol);
+  if (ultimoReg && (agora - ultimoReg) < 15000) {
+    console.log(`[PLACAR-IGNORADO] Desfecho duplicado bloqueado para ${symbol} (${exitReason}) - já registrado há ${agora - ultimoReg}ms.`);
+    return;
+  }
+  closedTradeEvents.set(symbol, agora);
+  for (const [s, t] of closedTradeEvents.entries()) {
+    if (agora - t > 60000) closedTradeEvents.delete(s);
+  }
+
   const pnlNum = parseFloat(pnlUsdt) || 0;
   const roiNum = parseFloat(roi) || 0;
   const isWin = (pnlNum > 0.0001 || roiNum > 0.01 || exitReason === 'TP' || (exitReason === 'BREAKEVEN' && roiNum >= 0));
@@ -322,13 +336,13 @@ async function analisarEstruturaEMercado(symbol) {
     // Status da Distância da EMA 21
     let distEmaText = '';
     let distEmaColor = 'var(--gold)';
-    if (distEma21Atr >= 0.25 && distEma21Atr <= 2.2) {
+    if (distEma21Atr >= 0.25 && distEma21Atr <= 2.00) {
       distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Zona de Pullback - OK]`;
       distEmaColor = 'var(--green)';
     } else if (distEma21Atr < 0.25) {
       distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Colado na EMA21]`;
       distEmaColor = 'var(--gold)';
-    } else if (distEma21Atr <= 3.2) {
+    } else if (distEma21Atr <= 2.40) {
       distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Zona Momentum]`;
       distEmaColor = 'var(--gold)';
     } else {
@@ -339,16 +353,16 @@ async function analisarEstruturaEMercado(symbol) {
     // Qualidade do Setup
     let qualidadeSetup = 'CONTRA-TENDÊNCIA (BLOQUEADO)';
     let qualidadeCor = 'var(--red)';
-    if (distEma21Atr > 3.2) {
+    if (distEma21Atr > 2.60) {
       qualidadeSetup = 'ESTICADO (AGUARDAR RECUO)';
       qualidadeCor = 'var(--red)';
-    } else if (aptoLong && distEma21Atr >= 0.25 && distEma21Atr <= 2.2) {
+    } else if (aptoLong && distEma21Atr >= 0.25 && distEma21Atr <= 2.00) {
       qualidadeSetup = 'PULLBACK A FAVOR DA TENDÊNCIA';
       qualidadeCor = 'var(--green)';
-    } else if (aptoShort && distEma21Atr >= 0.25 && distEma21Atr <= 2.2) {
+    } else if (aptoShort && distEma21Atr >= 0.25 && distEma21Atr <= 2.00) {
       qualidadeSetup = 'PULLBACK A FAVOR DA TENDÊNCIA';
       qualidadeCor = 'var(--green)';
-    } else if (rvol15m >= 1.4 && ((aptoLong && curPrice > ema9_15) || (aptoShort && curPrice < ema9_15))) {
+    } else if (rvol15m >= 1.30 && ((aptoLong && curPrice > ema9_15) || (aptoShort && curPrice < ema9_15))) {
       qualidadeSetup = 'ROMPIMENTO COM VOLUME';
       qualidadeCor = 'var(--blue)';
     }
@@ -411,52 +425,52 @@ async function analisarEstruturaEMercado(symbol) {
     let direcaoModo = null;
     let motivoModo = 'Aguardando confluência quantitativa';
 
-    // MODO A: PULLBACK DE TENDÊNCIA (Continuidade)
-    // Condição Limpa: APTO PARA OPERAR no MTF (1h e 15m alinhados e 5m verde para Long ou vermelho para Short) + EMAs Alinhadas + Distância EMA 21 entre 0.25x e 2.20x ATR + ADX >= 18
+    // MODO A: PULLBACK DE TENDÊNCIA (Continuidade — Campeão 76% WR)
+    // Condição Limpa: MTF (1h/15m/5m) + EMAs (9/21/50) alinhados + distEma21Atr entre 0.25x e 2.00x ATR + ADX >= 18 + ATR% 0.80% a 2.50% + RVOL >= 0.85x
     const mtfAptoPullbackLong = (dir1h === 'green' && dir15m === 'green' && (dir5m === 'green' || isGreen5m));
     const mtfAptoPullbackShort = (dir1h === 'red' && dir15m === 'red' && (dir5m === 'red' || isRed5m));
     const emasAlinhadasAlta = (ema9_15 > ema21_15 && ema21_15 > ema50_15) || (isBull1h && isBull15m);
     const emasAlinhadasBaixa = (ema9_15 < ema21_15 && ema21_15 < ema50_15) || (isBear1h && isBear15m);
 
-    if (mtfAptoPullbackLong && emasAlinhadasAlta && distEma21Atr >= 0.25 && distEma21Atr <= 2.20 && adx15m >= 18) {
+    if (mtfAptoPullbackLong && emasAlinhadasAlta && distEma21Atr >= 0.25 && distEma21Atr <= 2.00 && adx15m >= 18 && atrPct15m >= 0.80 && atrPct15m <= 2.50 && rvol15m >= 0.85) {
       modoDetectado = 'PULLBACK';
       modoLabel = 'PULLBACK LONG';
       direcaoModo = 'LONG';
-      motivoModo = 'Pullback na EMA 21 (15m) a favor da tendência de alta';
-    } else if (mtfAptoPullbackShort && emasAlinhadasBaixa && distEma21Atr >= 0.25 && distEma21Atr <= 2.20 && adx15m >= 18) {
+      motivoModo = `Pullback na EMA 21 (15m a ${distEma21Atr.toFixed(2)}x ATR) a favor da alta`;
+    } else if (mtfAptoPullbackShort && emasAlinhadasBaixa && distEma21Atr >= 0.25 && distEma21Atr <= 2.00 && adx15m >= 18 && atrPct15m >= 0.80 && atrPct15m <= 2.50 && rvol15m >= 0.85) {
       modoDetectado = 'PULLBACK';
       modoLabel = 'PULLBACK SHORT';
       direcaoModo = 'SHORT';
-      motivoModo = 'Pullback na EMA 21 (15m) a favor da tendência de baixa';
+      motivoModo = `Pullback na EMA 21 (15m a ${distEma21Atr.toFixed(2)}x ATR) a favor da baixa`;
     }
 
     // MODO B: IGNIÇÃO DE FLUXO / BREAKOUT (Momentum)
     if (!modoDetectado) {
-      if (breakUp && rvol15m >= 1.4 && deltaOI > 0.5 && takerRatioVal > 1.10 && distEma21Atr <= 3.2) {
+      if ((breakUp || (emasAlinhadasAlta && aptoLong)) && distEma21Atr <= 2.40 && rvol15m >= 1.30 && takerRatioVal >= 1.15) {
         modoDetectado = 'MOMENTUM';
         modoLabel = 'MOMENTUM LONG';
         direcaoModo = 'LONG';
-        motivoModo = 'Rompimento de alta com RVOL, Delta OI e agressão compradora';
-      } else if (breakDown && rvol15m >= 1.4 && deltaOI > 0.5 && takerRatioVal < 0.90 && distEma21Atr <= 3.2) {
+        motivoModo = 'Rompimento de alta com RVOL >= 1.30x e agressão compradora no Taker >= 1.15';
+      } else if ((breakDown || (emasAlinhadasBaixa && aptoShort)) && distEma21Atr <= 2.40 && rvol15m >= 1.30 && takerRatioVal <= 0.85) {
         modoDetectado = 'MOMENTUM';
         modoLabel = 'MOMENTUM SHORT';
         direcaoModo = 'SHORT';
-        motivoModo = 'Rompimento de baixa com RVOL, Delta OI e agressão vendedora';
+        motivoModo = 'Rompimento de baixa com RVOL >= 1.30x e agressão vendedora no Taker <= 0.85';
       }
     }
 
     // MODO C: EXAUSTÃO / RETORNO À MÉDIA (Caça-Reversão)
     if (!modoDetectado) {
-      if (distEma21Atr > 3.2 && rsi15m < 22 && takerRatioVal >= 0.95 && deltaOI <= 0.2 && hasLowerRejection) {
+      if (distEma21Atr >= 2.60 && rsi15m <= 26 && hasLowerRejection) {
         modoDetectado = 'EXAUSTAO_REVERSAO';
         modoLabel = 'EXAUSTÃO REVERSÃO LONG';
         direcaoModo = 'LONG';
-        motivoModo = 'Fundo esticado >3.2x ATR com RSI<22, pavio de rejeição e fluxo reagindo';
-      } else if (distEma21Atr > 3.2 && rsi15m > 78 && takerRatioVal <= 1.05 && deltaOI <= 0.2 && hasUpperRejection) {
+        motivoModo = 'Fundo esticado >= 2.60x ATR com RSI <= 26 e pavio de rejeição';
+      } else if (distEma21Atr >= 2.60 && rsi15m >= 74 && hasUpperRejection) {
         modoDetectado = 'EXAUSTAO_REVERSAO';
         modoLabel = 'EXAUSTÃO REVERSÃO SHORT';
         direcaoModo = 'SHORT';
-        motivoModo = 'Topo esticado >3.2x ATR com RSI>78, pavio de rejeição e agressão exausta';
+        motivoModo = 'Topo esticado >= 2.60x ATR com RSI >= 74 e pavio de rejeição';
       }
     }
 
@@ -487,12 +501,12 @@ async function analisarEstruturaEMercado(symbol) {
     }
     directionalScore += (mtfScore + emaScore);
 
-    // 2. ADX >= 20 + RSI favorável (52 a 72 para Long, 28 a 48 para Short): peso 20 pontos (+20 ou -20)
+    // 2. ADX >= 18 + RSI favorável (48 a 72 para Long, 28 a 52 para Short): peso 20 pontos (+20 ou -20)
     let adxRsiScore = 0;
-    if (adx15m >= 20) {
-      if (rsi15m >= 52 && rsi15m <= 72) {
+    if (adx15m >= 18) {
+      if (rsi15m >= 48 && rsi15m <= 72) {
         adxRsiScore = 20;
-      } else if (rsi15m >= 28 && rsi15m <= 48) {
+      } else if (rsi15m >= 28 && rsi15m <= 52) {
         adxRsiScore = -20;
       } else if (rsi15m > 72) {
         adxRsiScore = 10;
@@ -500,26 +514,24 @@ async function analisarEstruturaEMercado(symbol) {
         adxRsiScore = -10;
       }
     } else if (adx15m >= 15) {
-      if (rsi15m >= 52 && rsi15m <= 72) {
+      if (rsi15m >= 48 && rsi15m <= 72) {
         adxRsiScore = 10;
-      } else if (rsi15m >= 28 && rsi15m <= 48) {
+      } else if (rsi15m >= 28 && rsi15m <= 52) {
         adxRsiScore = -10;
       }
     }
     directionalScore += adxRsiScore;
 
-    // 3. Delta OI e RVOL >= 1.0x: peso 15 pontos
+    // 3. Delta OI e RVOL >= 0.85x: peso 15 pontos
     let flowScore = 0;
     const isTrendAlta = (directionalScore > 0) || (curPrice > ema21_15);
     if (isTrendAlta) {
-      if (deltaOI >= 0.2 && rvol15m >= 1.0) flowScore = 15;
-      else if (deltaOI > 0 || rvol15m >= 1.0) flowScore = 10;
-      else if (rvol15m >= 0.85) flowScore = 5;
+      if (deltaOI >= 0.2 && rvol15m >= 0.85) flowScore = 15;
+      else if (deltaOI > 0 || rvol15m >= 0.85) flowScore = 10;
       else if (deltaOI < -1.0) flowScore = -5;
     } else {
-      if (deltaOI >= 0.2 && rvol15m >= 1.0) flowScore = -15;
-      else if (deltaOI > 0 || rvol15m >= 1.0) flowScore = -10;
-      else if (rvol15m >= 0.85) flowScore = -5;
+      if (deltaOI >= 0.2 && rvol15m >= 0.85) flowScore = -15;
+      else if (deltaOI > 0 || rvol15m >= 0.85) flowScore = -10;
       else if (deltaOI < -1.0) flowScore = 5;
     }
     directionalScore += flowScore;
@@ -570,9 +582,9 @@ async function analisarEstruturaEMercado(symbol) {
     let slPctReal = (slDist / curPrice) * 100;
     let slRoe = slPctReal * leverageSugerida;
 
-    // Banda Saudável de Stop Loss em ROI: Piso Mínimo de 5.0% e Teto Máximo de 7.5%
-    const minSlRoi = 5.0;
-    const maxSlRoi = 7.5;
+    // Banda Rígida de Stop Loss em ROI: Piso Mínimo de 4.5% e Teto Máximo de 5.5% (-5.50% de ROI)
+    const minSlRoi = 4.5;
+    const maxSlRoi = 5.5;
 
     if (slRoe < minSlRoi) {
       slRoe = minSlRoi;
@@ -605,9 +617,9 @@ async function analisarEstruturaEMercado(symbol) {
       tpRoe = 8.0;
     }
 
-    const beTriggerDist = curPrice * ((3.20 / leverageSugerida) / 100);
+    const beTriggerDist = curPrice * ((1.50 / leverageSugerida) / 100);
     const beTriggerPctReal = (beTriggerDist / curPrice) * 100;
-    const beTriggerRoe = 3.20;
+    const beTriggerRoe = 1.50;
     const beTriggerPrice = ladoOp === 'LONG' ? (curPrice + beTriggerDist) : (curPrice - beTriggerDist);
 
     const last5mOpenTime = (k5m && k5m.length > 0) ? k5m[k5m.length - 1][0] : 0;
@@ -642,124 +654,8 @@ async function analisarEstruturaEMercado(symbol) {
   }
 }
 
-// ── IMPLANTAÇÃO /trader-timemachine (REPLAY HISTÓRICO LOCAL 15M - 0 TOKENS) ──
-function validarTimeMachineLocal(k15m, direcao, atrAtual) {
-  if (!k15m || k15m.length < 60) return { passou: true, winRateLocal: 100, toques: 0, sucessos: 0 };
-
-  const closes = k15m.map(v => parseFloat(v[4]));
-  const highs = k15m.map(v => parseFloat(v[2]));
-  const lows = k15m.map(v => parseFloat(v[3]));
-
-  const ema21 = ti.EMA.calculate({ period: 21, values: closes });
-  const ema50 = ti.EMA.calculate({ period: 50, values: closes });
-
-  const totalCandles = closes.length;
-  const startIdx = Math.max(50, totalCandles - 96);
-  const endIdx = totalCandles - 5; // deixa 4 a 5 velas subsequentes para validação
-
-  let toques = 0;
-  let sucessos = 0;
-  let inTouch = false;
-
-  for (let i = startIdx; i <= endIdx; i++) {
-    const e21 = ema21[i - 20];
-    const e50 = ema50[i - 49];
-    if (!e21 || !e50) continue;
-
-    const h = highs[i];
-    const l = lows[i];
-
-    if (direcao === 'LONG') {
-      const isTouching = (e21 > e50 && l <= e21 && h >= e21);
-      if (isTouching) {
-        if (!inTouch) {
-          inTouch = true;
-          toques++;
-          let maxFavor = 0;
-          for (let f = 1; f <= 5; f++) {
-            if (i + f < closes.length) {
-              const move = highs[i + f] - e21;
-              if (move > maxFavor) maxFavor = move;
-            }
-          }
-          if (maxFavor >= 0.7 * (atrAtual || (closes[i] * 0.01))) {
-            sucessos++;
-          }
-        }
-      } else {
-        inTouch = false;
-      }
-    } else if (direcao === 'SHORT') {
-      const isTouching = (e21 < e50 && h >= e21 && l <= e21);
-      if (isTouching) {
-        if (!inTouch) {
-          inTouch = true;
-          toques++;
-          let maxFavor = 0;
-          for (let f = 1; f <= 5; f++) {
-            if (i + f < closes.length) {
-              const move = e21 - lows[i + f];
-              if (move > maxFavor) maxFavor = move;
-            }
-          }
-          if (maxFavor >= 0.7 * (atrAtual || (closes[i] * 0.01))) {
-            sucessos++;
-          }
-        }
-      } else {
-        inTouch = false;
-      }
-    }
-  }
-
-  if (toques < 3) {
-    return { passou: true, winRateLocal: 100, toques, sucessos };
-  }
-
-  const winRateLocal = (sucessos / toques) * 100;
-  return {
-    passou: winRateLocal >= 50.0,
-    winRateLocal,
-    sucessos,
-    toques
-  };
-}
-
-// ── IMPLANTAÇÃO /trader-entry (CONFIRMAÇÃO VELA 5M NO GATILHO DE ENTRADA) ──
-function verificarConfirmacao5m(dados) {
-  const k5 = dados.rawKlines5m;
-  if (!k5 || k5.length < 2) {
-    return { confirmou: false, motivo: 'Velas de 5m insuficientes para confirmação' };
-  }
-  const lastClosed5m = k5[k5.length - 2];
-  const currentOpen5m = k5[k5.length - 1];
-
-  const c5_open = parseFloat(lastClosed5m[1]);
-  const c5_close = parseFloat(lastClosed5m[4]);
-  const curr5_open = parseFloat(currentOpen5m[1]);
-  const curr5_price = dados.curPrice;
-
-  if (dados.direcaoModo === 'LONG') {
-    if (c5_close <= c5_open) {
-      return { confirmou: false, motivo: `Última vela 5m fechou negativa ($${c5_close} <= $${c5_open})` };
-    }
-    if (curr5_price < curr5_open) {
-      return { confirmou: false, motivo: `Vela 5m atual derretendo vermelha ($${curr5_price} < $${curr5_open})` };
-    }
-  } else if (dados.direcaoModo === 'SHORT') {
-    if (c5_close >= c5_open) {
-      return { confirmou: false, motivo: `Última vela 5m fechou positiva ($${c5_close} >= $${c5_open})` };
-    }
-    if (curr5_price > curr5_open) {
-      return { confirmou: false, motivo: `Vela 5m atual subindo verde ($${curr5_price} > $${curr5_open})` };
-    }
-  }
-
-  return { confirmou: true };
-}
-
 // ── GATEKEEPER DINÂMICO 3 MODOS (ETAPA 5 - 0 TOKENS) ─────────────────
-function verificarGatekeeper(dados, isEntryCheck = false) {
+function verificarGatekeeper(dados) {
   if (!dados) return { passou: false, motivo: 'Dados indisponíveis' };
 
   if (dados.flatCandles5m > 2) {
@@ -815,26 +711,13 @@ function verificarGatekeeper(dados, isEntryCheck = false) {
     }
   }
 
-  // 5. Filtro Modo A (Pullback): Proteção de distância colada (< 0.25x ATR) e TimeMachine
+  // 5. Filtro Modo A (Pullback): Proteção de distância colada (< 0.25x ATR) e esticada (> 2.00x ATR)
   if (dados.modoDetectado === 'PULLBACK') {
     if (dados.distEma21Atr < 0.25) {
-      return { passou: false, motivo: `Gatekeeper: Preço colado na EMA 21 (${dados.distEma21Atr.toFixed(2)}x < 0.25x ATR)` };
+      return { passou: false, motivo: `Gatekeeper [PULLBACK]: Preço colado na EMA 21 (${dados.distEma21Atr.toFixed(2)}x < 0.25x ATR)` };
     }
-
-    // Replay Histórico TimeMachine apenas para PULLBACK
-    const tm = validarTimeMachineLocal(dados.rawKlines15m, dados.direcaoModo, dados.atr15m);
-    if (!tm.passou) {
-      gatekeeperVetoedUntil[dados.symbol] = Date.now() + 600000; // Veto de 10 minutos
-      console.log(`[VETO-TIMEMACHINE] ${dados.symbol} (${dados.direcaoModo}): WinRate 24h em toques EMA21 foi ${tm.winRateLocal.toFixed(1)}% < 50% (${tm.sucessos}/${tm.toques} toques). Veto de 10m ativado.`);
-      return { passou: false, motivo: `Gatekeeper [/trader-timemachine]: Histórico 24h com falhas de continuidade (${tm.winRateLocal.toFixed(1)}% < 50% em ${tm.toques} toques)` };
-    }
-  }
-
-  // 6. Confirmação /trader-entry na vela 5m (apenas durante tentativa de disparo do slot)
-  if (isEntryCheck) {
-    const conf5m = verificarConfirmacao5m(dados);
-    if (!conf5m.confirmou) {
-      return { passou: false, is5mAwaiting: true, motivo: `Gatekeeper [/trader-entry]: ${conf5m.motivo}` };
+    if (dados.distEma21Atr > 2.00) {
+      return { passou: false, motivo: `Gatekeeper [PULLBACK]: Preço esticado longe da EMA 21 (${dados.distEma21Atr.toFixed(2)}x > 2.00x ATR)` };
     }
   }
 
@@ -899,7 +782,7 @@ Responda APENAS JSON:
 }
 
 
-// ── REGRA DE GESTÃO TEMPORAL E SOFT STOP (15m, 30m, 90m - 0 TOKENS) ──
+// ── REGRA DE GESTÃO TEMPORAL E SOFT STOP (35m, 90m - 0 TOKENS) ──
 async function avaliarPerdao30mMatematico(symbol, pos, duracaoMinutos) {
   try {
     const alvo = localAlvos[symbol];
@@ -913,42 +796,29 @@ async function avaliarPerdao30mMatematico(symbol, pos, duracaoMinutos) {
       return {
         fechar: true,
         motivo: 'TIMEOUT_MAXIMO_90M',
-        desc: `Hard Timeout 90m (${roiAtual.toFixed(2)}% ROI | Duração ${duracaoMinutos}m >= 90m)`
+        desc: `Hard Timeout 90m (${roiAtual.toFixed(2)}% ROI | Duração ${Math.round(duracaoMinutos)}m >= 90m)`
       };
     }
 
-    // 1. Correção Posições Zumbis / Soft Stop aos 30 minutos:
-    // TODA posição com duracaoMin >= 30 e roiAtual <= -2.00% (cujo maxRoiReached < 2.50%) é encerrada incondicionalmente!
-    if (duracaoMinutos >= 30 && roiAtual <= -2.00 && maxRoi < 2.50) {
-      return {
-        fechar: true,
-        motivo: 'PERDAO_30M_SOFT_STOP',
-        desc: `Soft Stop aos 30m (${roiAtual.toFixed(2)}% ROI <= -2.0% | Pico: +${maxRoi.toFixed(2)}% < 2.5% | Duração ${duracaoMinutos}m)`
-      };
-    }
-
-    // 2. Corte Rápido de Falha de Ignição aos 15 minutos:
-    // Posição com duracaoMin >= 15, maxRoiReached < 0.50% e roiAtual <= -2.50% com vela de 15m contra posição
-    if (duracaoMinutos >= 15 && maxRoi < 0.50 && roiAtual <= -2.50) {
-      const k15 = await fut.klines(symbol, '15m', 2).catch(() => []);
-      if (k15 && k15.length > 0) {
-        const last15 = k15[k15.length - 1]; // vela atual de 15m
-        const o15 = parseFloat(last15[1]);
-        const c15 = parseFloat(last15[4]);
-        const contra15m = isLong ? (c15 < o15) : (c15 > o15);
-        if (contra15m) {
+    // 1. Perdão 30m Inteligente aos 35 minutos:
+    // Apenas se duracaoMinutos >= 35 E roiAtual <= -2.20% E maxRoiReached < 1.50% E preço contra EMA21 de 15m
+    if (duracaoMinutos >= 35 && roiAtual <= -2.20 && maxRoi < 1.50) {
+      const dados = await analisarEstruturaEMercado(symbol);
+      if (dados) {
+        const contraEma21 = isLong ? (dados.curPrice < dados.ema21_15) : (dados.curPrice > dados.ema21_15);
+        if (contraEma21) {
           return {
             fechar: true,
-            motivo: 'CORTE_FALHA_IGNICAO_15M',
-            desc: `Falha de Ignição 15m (${roiAtual.toFixed(2)}% ROI <= -2.50% | Pico: +${maxRoi.toFixed(2)}% < 0.50% | 15m contra posição)`
+            motivo: 'PERDAO_30M_SOFT_STOP',
+            desc: `Soft Stop aos 35m (${roiAtual.toFixed(2)}% ROI <= -2.20% | Pico: +${maxRoi.toFixed(2)}% < 1.50% | Contra EMA21 15m | Duração ${Math.round(duracaoMinutos)}m)`
           };
         }
       }
     }
 
-    // 3. Perdão Positivo (Deixar Vencedores Correrem): se >= +3.20% ROI e tendência a favor da EMA21 de 15m, NÃO fecha!
-    // Apenas mantém a proteção de retração ativa p/ buscar TP. Só encerra se perder EMA 9 (5m) ou EMA 21 (15m) contra a posição.
-    if (roiAtual >= 3.20 && duracaoMinutos >= 25) {
+    // 2. Perdão Positivo (Deixar Vencedores Correrem): se >= +1.80% ROI e tendência a favor da EMA21 de 15m, NÃO fecha!
+    // Só encerra se perder EMA 9 (5m) ou EMA 21 (15m) contra a posição após 35m
+    if (roiAtual >= 1.80 && duracaoMinutos >= 35) {
       const dados = await analisarEstruturaEMercado(symbol);
       if (dados) {
         const perdeuTendencia = isLong
@@ -958,7 +828,7 @@ async function avaliarPerdao30mMatematico(symbol, pos, duracaoMinutos) {
           return {
             fechar: true,
             motivo: 'PERDAO_30M_LUCRO',
-            desc: `Lucro aos 25m com Perda de Média (+${roiAtual.toFixed(2)}% ROI | Perdeu EMA9/21)`
+            desc: `Lucro aos 35m com Perda de Média (+${roiAtual.toFixed(2)}% ROI | Perdeu EMA9/21)`
           };
         }
       }
@@ -1009,46 +879,41 @@ setInterval(async () => {
         }
         const maxRoi = alvo.maxRoiReached || 0;
 
-        // ── NOVA RÉGUA DE RESPIRO NA SAÍDA (ETAPA 3 - DESTRAVA TAKE PROFITS) ──
+        // ── NOVA ADMINISTRAÇÃO POSITIVA: CATRACA DE 0.50% EM 0.50% DE ROI ──
         const prevArmed = alvo.beArmed || false;
         const prevLockedRoi = alvo.lockedRoi || 0;
 
-        // Abaixo de +3.20% de ROI: Trava DESLIGADA. Respiro livre total para desenvolvimento do pullback
-        if (maxRoi < 3.20) {
+        // Calcula o degrau atual de 0.50% em 0.50% a partir de alvo.maxRoiReached
+        const degrauPico = Math.floor(maxRoi * 2) / 2;
+        let novoLockedRoi = null;
+
+        if (degrauPico >= 7.50) novoLockedRoi = 6.90;
+        else if (degrauPico >= 7.00) novoLockedRoi = 6.40;
+        else if (degrauPico >= 6.50) novoLockedRoi = 5.80;
+        else if (degrauPico >= 6.00) novoLockedRoi = 5.30;
+        else if (degrauPico >= 5.50) novoLockedRoi = 4.80;
+        else if (degrauPico >= 5.00) novoLockedRoi = 4.30; // Bateu +5.0% ROI -> Garante +4.30% ROI!
+        else if (degrauPico >= 4.50) novoLockedRoi = 3.70;
+        else if (degrauPico >= 4.00) novoLockedRoi = 3.20;
+        else if (degrauPico >= 3.50) novoLockedRoi = 2.60;
+        else if (degrauPico >= 3.00) novoLockedRoi = 2.10; // Bateu +3.0% ROI -> Garante +2.10% ROI!
+        else if (degrauPico >= 2.50) novoLockedRoi = 1.50;
+        else if (degrauPico >= 2.00) novoLockedRoi = 1.00;
+        else if (degrauPico >= 1.50) novoLockedRoi = 0.50; // Bateu +1.5% ROI -> Proibido virar Loss!
+
+        // Abaixo de +1.50% de ROI: Trava DESLIGADA. Respiro livre total
+        if (!novoLockedRoi) {
           alvo.beArmed = false;
           alvo.beStage = 0;
           alvo.lockedRoi = 0;
           alvo.beStopPrice = null;
-          alvo.beLabel = `[🌱 RESPIRO LIVRE ATÉ +3.20% ROI (PICO ATUAL: +${maxRoi.toFixed(2)}%)]`;
+          alvo.beLabel = `[🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO ATUAL: +${maxRoi.toFixed(2)}%)]`;
         } else {
           alvo.beArmed = true;
-          let targetLocked = 1.50;
-          let stageNum = 1;
-          let stageLabel = 'ESTÁGIO 1 (+1.50%)';
+          // Regra Inegociável: a catraca NUNCA recua
+          alvo.lockedRoi = Math.max(alvo.lockedRoi || 0, novoLockedRoi);
 
-          if (maxRoi >= 6.40) {
-            // Estágio 3 (+6.40% ao TP): Sombra curta de 1.00% abaixo do pico (garante >= +5.40% ROI)
-            targetLocked = Number((maxRoi - 1.00).toFixed(2));
-            stageNum = 3;
-            stageLabel = 'ESTÁGIO 3 (-1.0% DO PICO)';
-          } else if (maxRoi >= 4.80) {
-            // Estágio 2 (+4.80% a +6.39% ROI): Trava fixa em +3.00% ROI
-            targetLocked = 3.00;
-            stageNum = 2;
-            stageLabel = 'ESTÁGIO 2 (+3.00%)';
-          } else {
-            // Estágio 1 (+3.20% a +4.79% ROI): Trava fixa em +1.50% ROI
-            targetLocked = 1.50;
-            stageNum = 1;
-            stageLabel = 'ESTÁGIO 1 (+1.50%)';
-          }
-
-          alvo.beStage = stageNum;
-          // Regra Inegociável: a trava NUNCA recua
-          const novoLockedRoi = Math.max(alvo.lockedRoi || 0, targetLocked);
-          alvo.lockedRoi = novoLockedRoi;
-
-          const calcStopPrice = entryPrice * (1 + (isLong ? 1 : -1) * ((novoLockedRoi / alav) / 100));
+          const calcStopPrice = entryPrice * (1 + (isLong ? 1 : -1) * ((alvo.lockedRoi / alav) / 100));
           if (alvo.beStopPrice === null || alvo.beStopPrice === undefined) {
             alvo.beStopPrice = calcStopPrice;
           } else {
@@ -1057,11 +922,11 @@ setInterval(async () => {
           }
 
           const stopFmt = formatarPrecoAtivo(sym, alvo.beStopPrice);
-          alvo.beLabel = `[🛡️ TRAVA ${stageLabel}: GARANTIDO +${alvo.lockedRoi.toFixed(2)}% ROI ($${stopFmt}) | PICO +${maxRoi.toFixed(2)}%]`;
+          alvo.beLabel = `[🛡️ CATRACA +${alvo.lockedRoi.toFixed(2)}%: GARANTIDO ($${stopFmt}) | PICO +${maxRoi.toFixed(2)}%]`;
 
           if (!prevArmed || Math.abs(alvo.lockedRoi - prevLockedRoi) >= 0.05) {
             salvarAlvos();
-            console.log(`[TRAVA-ESCADA-E${stageNum}] ${sym} (${pos.lado}): Pico +${maxRoi.toFixed(2)}% ROI -> Trava em +${alvo.lockedRoi.toFixed(2)}% ROI ($${stopFmt})`);
+            console.log(`[CATRACA-0.5%] ${sym} (${pos.lado}): Pico +${maxRoi.toFixed(2)}% ROI (Degrau +${degrauPico.toFixed(2)}%) -> Trava em +${alvo.lockedRoi.toFixed(2)}% ROI ($${stopFmt})`);
           }
         }
 
@@ -1082,9 +947,9 @@ setInterval(async () => {
             deveFechar = true;
             motivoFechamento = `[STOP LOSS ATR] Preço ${formatarPrecoAtivo(sym, curPrice)} <= SL ${formatarPrecoAtivo(sym, alvo.slPrice)} (${roi.toFixed(2)}% ROI)`;
           }
-          else if (!deveFechar && roi <= -7.50) {
+          else if (!deveFechar && roi <= -5.50) {
             deveFechar = true;
-            motivoFechamento = `[SAFETY SL -7.5%] ROI atingiu ${roi.toFixed(2)}% (Teto -7.5% ROI)`;
+            motivoFechamento = `[SAFETY SL -5.5%] ROI atingiu ${roi.toFixed(2)}% (Teto -5.5% ROI)`;
           }
           // 3. Breakeven / Retração (com Filtro Anti-Pavio: 3 ticks consecutivos ou furo direto >= 0.60% abaixo)
           else if (!deveFechar && alvo.beArmed && (roi <= alvo.lockedRoi || (alvo.beStopPrice && curPrice <= alvo.beStopPrice))) {
@@ -1112,9 +977,9 @@ setInterval(async () => {
             deveFechar = true;
             motivoFechamento = `[STOP LOSS ATR] Preço ${formatarPrecoAtivo(sym, curPrice)} >= SL ${formatarPrecoAtivo(sym, alvo.slPrice)} (${roi.toFixed(2)}% ROI)`;
           }
-          else if (!deveFechar && roi <= -7.50) {
+          else if (!deveFechar && roi <= -5.50) {
             deveFechar = true;
-            motivoFechamento = `[SAFETY SL -7.5%] ROI atingiu ${roi.toFixed(2)}% (Teto -7.5% ROI)`;
+            motivoFechamento = `[SAFETY SL -5.5%] ROI atingiu ${roi.toFixed(2)}% (Teto -5.5% ROI)`;
           }
           // 3. Breakeven / Retração (com Filtro Anti-Pavio: 3 ticks consecutivos ou furo direto >= 0.60% abaixo)
           else if (!deveFechar && alvo.beArmed && (roi <= alvo.lockedRoi || (alvo.beStopPrice && curPrice >= alvo.beStopPrice))) {
@@ -1129,33 +994,14 @@ setInterval(async () => {
           }
         }
 
-        // ── IMPLANTAÇÃO /trader-exit (CORTES TEMPORAIS E LIMPEZA DE ZUMBIS) ──
+        // ── GESTÃO TEMPORAL NO LOOP (0 TOKENS) ──
         const duracaoMs = Date.now() - (alvo.openTime || (pos.atualizadoEm || Date.now()));
         const duracaoMin = duracaoMs / 60000;
 
-        // 4. Hard Timeout Máximo de 90 minutos para qualquer trade negativo
+        // Hard Timeout Máximo de 90 minutos para qualquer trade negativo
         if (!deveFechar && duracaoMin >= 90 && roi < 0) {
           deveFechar = true;
           motivoFechamento = `[TIMEOUT_MAXIMO_90M] Posição negativa após 90m (${roi.toFixed(2)}% ROI | Duração ${Math.round(duracaoMin)}m)`;
-        }
-        // 5. Soft Stop aos 30 minutos (Limpeza incondicional de posições zumbis)
-        else if (!deveFechar && duracaoMin >= 30 && roi <= -2.00 && maxRoi < 2.50) {
-          deveFechar = true;
-          motivoFechamento = `[PERDAO_30M_SOFT_STOP] Estagnação aos 30m (${roi.toFixed(2)}% ROI <= -2.00% | Pico: +${maxRoi.toFixed(2)}% < 2.50% | Duração ${Math.round(duracaoMin)}m)`;
-        }
-        // 6. Corte Rápido de Falha de Ignição aos 15 minutos
-        else if (!deveFechar && duracaoMin >= 15 && maxRoi < 0.50 && roi <= -2.50) {
-          const k15 = await fut.klines(sym, '15m', 2).catch(() => []);
-          if (k15 && k15.length > 0) {
-            const last15 = k15[k15.length - 1];
-            const o15 = parseFloat(last15[1]);
-            const c15 = parseFloat(last15[4]);
-            const contra15m = isLong ? (c15 < o15) : (c15 > o15);
-            if (contra15m) {
-              deveFechar = true;
-              motivoFechamento = `[CORTE_FALHA_IGNICAO_15M] Falha de Ignição aos 15m (${roi.toFixed(2)}% ROI <= -2.50% | Pico: +${maxRoi.toFixed(2)}% < 0.50% | 15m contra)`;
-            }
-          }
         }
 
         // ── PROTEÇÃO CONTRA FUNDING TÓXICO EM POSIÇÃO ABERTA ──
@@ -1180,7 +1026,9 @@ setInterval(async () => {
         }
 
         if (deveFechar) {
+          if (closingInProgress.has(sym) || (localAlvos[sym] && localAlvos[sym].fechando)) continue;
           closingInProgress.add(sym);
+          if (localAlvos[sym]) localAlvos[sym].fechando = true;
           const alvoBackup = { ...localAlvos[sym] };
           delete localAlvos[sym];
           delete maxPriceTracker[sym];
@@ -1193,7 +1041,7 @@ setInterval(async () => {
             await fut.cancelarTodasOrdens(sym);
             await fut.fecharMercado(sym, pos.lado, pos.quantidade);
 
-            const exitTipo = (motivoFechamento.includes('TAKE PROFIT') || motivoFechamento.includes('TETO TP') || motivoFechamento.includes('SAIDA_PROTECAO_FUNDING') || motivoFechamento.includes('PERDAO_30M_LUCRO')) ? 'TP' : (motivoFechamento.includes('BREAKEVEN') ? 'BREAKEVEN' : (motivoFechamento.includes('CORTE_FALHA_IGNICAO_15M') ? 'CORTE_FALHA_IGNICAO_15M' : (motivoFechamento.includes('PERDAO_30M_SOFT_STOP') ? 'PERDAO_30M_SOFT_STOP' : (motivoFechamento.includes('TIMEOUT_MAXIMO_90M') ? 'TIMEOUT_MAXIMO_90M' : 'SL'))));
+            const exitTipo = (motivoFechamento.includes('TAKE PROFIT') || motivoFechamento.includes('TETO TP') || motivoFechamento.includes('SAIDA_PROTECAO_FUNDING') || motivoFechamento.includes('PERDAO_30M_LUCRO')) ? 'TP' : (motivoFechamento.includes('BREAKEVEN') ? 'BREAKEVEN' : (motivoFechamento.includes('PERDAO_30M_SOFT_STOP') ? 'PERDAO_30M_SOFT_STOP' : (motivoFechamento.includes('TIMEOUT_MAXIMO_90M') ? 'TIMEOUT_MAXIMO_90M' : 'SL')));
             await rag.salvarSaidaRAG({
               symbol: sym,
               exitPrice: curPrice,
@@ -1205,8 +1053,8 @@ setInterval(async () => {
             registrarDesfechoTrade(sym, exitTipo, roi, pos.pnlNaoRealizado);
 
             // Bloqueio rigoroso de repetição da mesma moeda por 2 horas (7200000ms) após qualquer fechamento (TP, SL, Trava ou Perdão)
-            gatekeeperVetoedUntil[sym] = Date.now() + 7200000;
-            console.log(`[COOLDOWN-POS-FECHAMENTO-2H] ${sym} fechou por ${exitTipo} (ROI: ${roi.toFixed(2)}%). Bloqueado por 2 horas para impedir reentradas viciosas.`);
+            gatekeeperVetoedUntil[sym] = Date.now() + 2700000;
+            console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${sym} fechou por ${exitTipo} (ROI: ${roi.toFixed(2)}%). Bloqueado por 45 minutos para impedir reentradas viciosas.`);
 
             // Libera slot com cooldown 45s
             [1, 2].forEach(s => {
@@ -1250,7 +1098,7 @@ async function atualizarTopSetups() {
     const vetados = await rag.consultarParesVetados(45).catch(() => []);
     const vetadosSet = new Set(vetados.map(v => v.symbol));
 
-    // Analisa até 60 moedas mais voláteis (descartando pumps/dumps extremos logo de início)
+    // Top 15 moedas mais voláteis do carrossel (24h)
     const candidatos = volData
       .filter(t => {
         const sym = t.symbol;
@@ -1263,7 +1111,7 @@ async function atualizarTopSetups() {
         return true;
       })
       .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)))
-      .slice(0, 60);
+      .slice(0, 15);
 
     const setups = [];
     for (const c of candidatos) {
@@ -1372,43 +1220,55 @@ setInterval(async () => {
           }
 
           const duracaoMs = now - (slot.openTime || now);
-          if (duracaoMs >= 15 * 60 * 1000) {
+          if (duracaoMs >= 35 * 60 * 1000) {
             if (now - (slot.last30mCheck || 0) >= 60 * 1000) {
               slot.last30mCheck = now;
               const duracaoMin = Math.round(duracaoMs / 60000);
+              if (closingInProgress.has(slot.symbol) || (localAlvos[slot.symbol] && localAlvos[slot.symbol].fechando)) {
+                continue;
+              }
               const decisao30m = await avaliarPerdao30mMatematico(slot.symbol, pos, duracaoMin);
               if (decisao30m.fechar) {
-                console.log(`[AUTOBOT-30M] Slot ${slotNum}: ${decisao30m.desc}! Fechando a mercado.`);
-                await fut.cancelarTodasOrdens(slot.symbol);
-                await fut.fecharMercado(slot.symbol, pos.lado, pos.quantidade);
+                if (closingInProgress.has(slot.symbol) || (localAlvos[slot.symbol] && localAlvos[slot.symbol].fechando)) {
+                  continue;
+                }
+                closingInProgress.add(slot.symbol);
+                if (localAlvos[slot.symbol]) localAlvos[slot.symbol].fechando = true;
+                try {
+                  console.log(`[AUTOBOT-30M] Slot ${slotNum}: ${decisao30m.desc}! Fechando a mercado.`);
+                  await fut.cancelarTodasOrdens(slot.symbol);
+                  await fut.fecharMercado(slot.symbol, pos.lado, pos.quantidade);
 
-                const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
-                const roiFinal = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
-                await rag.salvarSaidaRAG({
-                  symbol: slot.symbol,
-                  exitPrice: pos.precoMarca || pos.precoEntrada,
-                  exitReason: decisao30m.motivo,
-                  roiPct: roiFinal,
-                  pnlUsdt: pos.pnlNaoRealizado
-                }).catch(() => {});
+                  const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
+                  const roiFinal = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
+                  await rag.salvarSaidaRAG({
+                    symbol: slot.symbol,
+                    exitPrice: pos.precoMarca || pos.precoEntrada,
+                    exitReason: decisao30m.motivo,
+                    roiPct: roiFinal,
+                    pnlUsdt: pos.pnlNaoRealizado
+                  }).catch(() => {});
 
-                registrarDesfechoTrade(slot.symbol, decisao30m.motivo, roiFinal, pos.pnlNaoRealizado);
+                  registrarDesfechoTrade(slot.symbol, decisao30m.motivo, roiFinal, pos.pnlNaoRealizado);
 
-                delete localAlvos[slot.symbol];
-                delete maxPriceTracker[slot.symbol];
-                delete minPriceTracker[slot.symbol];
-                delete beBreachedTicks[slot.symbol];
-                salvarAlvos();
+                  delete localAlvos[slot.symbol];
+                  delete maxPriceTracker[slot.symbol];
+                  delete minPriceTracker[slot.symbol];
+                  delete beBreachedTicks[slot.symbol];
+                  salvarAlvos();
 
-                const symFechado = slot.symbol;
-                gatekeeperVetoedUntil[symFechado] = now + 7200000; // Bloqueio 2 horas (7200000ms)
-                console.log(`[COOLDOWN-POS-FECHAMENTO-2H] ${symFechado} fechado por estagnação 30m (${decisao30m.motivo}). Bloqueado por 2 horas.`);
-                slot.symbol = null;
-                slot.side = null;
-                slot.targetSymbol = null;
-                slot.searchCooldownUntil = now + 45000;
-                slot.status = 'PERDAO_COOLDOWN_45S';
-                autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 30m em ${symFechado}. Cooldown de 30m na moeda ativado.`;
+                  const symFechado = slot.symbol;
+                  gatekeeperVetoedUntil[symFechado] = now + 2700000; // Bloqueio 45 minutos (2700000ms)
+                  console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${symFechado} fechado por estagnação 35m (${decisao30m.motivo}). Bloqueado por 45 minutos.`);
+                  slot.symbol = null;
+                  slot.side = null;
+                  slot.targetSymbol = null;
+                  slot.searchCooldownUntil = now + 45000;
+                  slot.status = 'PERDAO_COOLDOWN_45S';
+                  autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 35m em ${symFechado}. Cooldown de 2h na moeda ativado.`;
+                } finally {
+                  closingInProgress.delete(slot.symbol);
+                }
               }
             }
           }
@@ -1437,44 +1297,56 @@ setInterval(async () => {
           slot.status = `[POSIÇÃO ATIVA] ${slot.symbol} (${slot.side || pos.lado} ${slot.leverage || pos.alavancagem}x)`;
 
           const duracaoMs = now - (slot.openTime || now);
-          if (duracaoMs >= 15 * 60 * 1000) {
+          if (duracaoMs >= 35 * 60 * 1000) {
             if (now - (slot.last30mCheck || 0) >= 60 * 1000) {
               slot.last30mCheck = now;
               const duracaoMin = Math.round(duracaoMs / 60000);
+              if (closingInProgress.has(slot.symbol) || (localAlvos[slot.symbol] && localAlvos[slot.symbol].fechando)) {
+                continue;
+              }
               const decisao30m = await avaliarPerdao30mMatematico(slot.symbol, pos, duracaoMin);
               if (decisao30m.fechar) {
-                console.log(`[AUTOBOT-30M] Slot ${slotNum}: ${decisao30m.desc}! Fechando a mercado.`);
-                await fut.cancelarTodasOrdens(slot.symbol);
-                await fut.fecharMercado(slot.symbol, pos.lado, pos.quantidade);
+                if (closingInProgress.has(slot.symbol) || (localAlvos[slot.symbol] && localAlvos[slot.symbol].fechando)) {
+                  continue;
+                }
+                closingInProgress.add(slot.symbol);
+                if (localAlvos[slot.symbol]) localAlvos[slot.symbol].fechando = true;
+                try {
+                  console.log(`[AUTOBOT-30M] Slot ${slotNum}: ${decisao30m.desc}! Fechando a mercado.`);
+                  await fut.cancelarTodasOrdens(slot.symbol);
+                  await fut.fecharMercado(slot.symbol, pos.lado, pos.quantidade);
 
-                const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
-                const roiFinal = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
-                await rag.salvarSaidaRAG({
-                  symbol: slot.symbol,
-                  exitPrice: pos.precoMarca || pos.precoEntrada,
-                  exitReason: decisao30m.motivo,
-                  roiPct: roiFinal,
-                  pnlUsdt: pos.pnlNaoRealizado
-                }).catch(() => {});
+                  const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
+                  const roiFinal = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
+                  await rag.salvarSaidaRAG({
+                    symbol: slot.symbol,
+                    exitPrice: pos.precoMarca || pos.precoEntrada,
+                    exitReason: decisao30m.motivo,
+                    roiPct: roiFinal,
+                    pnlUsdt: pos.pnlNaoRealizado
+                  }).catch(() => {});
 
-                registrarDesfechoTrade(slot.symbol, decisao30m.motivo, roiFinal, pos.pnlNaoRealizado);
+                  registrarDesfechoTrade(slot.symbol, decisao30m.motivo, roiFinal, pos.pnlNaoRealizado);
 
-                delete localAlvos[slot.symbol];
-                delete maxPriceTracker[slot.symbol];
-                delete minPriceTracker[slot.symbol];
-                delete beBreachedTicks[slot.symbol];
-                salvarAlvos();
+                  delete localAlvos[slot.symbol];
+                  delete maxPriceTracker[slot.symbol];
+                  delete minPriceTracker[slot.symbol];
+                  delete beBreachedTicks[slot.symbol];
+                  salvarAlvos();
 
-                const symFechado = slot.symbol;
-                gatekeeperVetoedUntil[symFechado] = now + 7200000; // Bloqueio 2 horas (7200000ms)
-                console.log(`[COOLDOWN-POS-FECHAMENTO-2H] ${symFechado} fechado por estagnação 30m (${decisao30m.motivo}). Bloqueado por 2 horas.`);
-                slot.symbol = null;
-                slot.side = null;
-                slot.targetSymbol = null;
-                slot.searchCooldownUntil = now + 45000;
-                slot.status = 'PERDAO_COOLDOWN_45S';
-                autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 30m em ${symFechado}. Cooldown de 30m na moeda ativado.`;
-                continue;
+                  const symFechado = slot.symbol;
+                  gatekeeperVetoedUntil[symFechado] = now + 2700000; // Bloqueio 45 minutos (2700000ms)
+                  console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${symFechado} fechado por estagnação 35m (${decisao30m.motivo}). Bloqueado por 45 minutos.`);
+                  slot.symbol = null;
+                  slot.side = null;
+                  slot.targetSymbol = null;
+                  slot.searchCooldownUntil = now + 45000;
+                  slot.status = 'PERDAO_COOLDOWN_45S';
+                  autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 35m em ${symFechado}. Cooldown de 2h na moeda ativado.`;
+                  continue;
+                } finally {
+                  closingInProgress.delete(slot.symbol);
+                }
               }
             }
           }
@@ -1553,20 +1425,8 @@ setInterval(async () => {
       const modoTxt = dados.modoLabel || 'SEM SETUP';
 
       // ── OTIMIZAÇÃO: GATEKEEPER HARDCODED (0 TOKENS) ──
-      const gk = verificarGatekeeper(dados, true);
+      const gk = verificarGatekeeper(dados);
       if (!gk.passou) {
-        if (gk.is5mAwaiting) {
-          const tempoAguardando = Math.round((now - (slot.targetAssignedTime || now)) / 1000);
-          if (tempoAguardando > 600) {
-            console.log(`[TIMEOUT-GATILHO-5M] Slot ${slotNum} (${cand}): Excedeu 10m sem confirmação 5m. Rotacionando.`);
-            gatekeeperVetoedUntil[cand] = now + 60000;
-            slot.targetSymbol = null;
-            continue;
-          }
-          slot.status = `[AGUARDANDO CONFIRMAÇÃO 5M] ${cand} (${gk.motivo.replace('Gatekeeper [/trader-entry]: ', '')}) [${tempoAguardando}s]`;
-          continue;
-        }
-
         console.log(`[GATEKEEPER-RECUSA] Slot ${slotNum} (${cand}) [${modoTxt} | Score: ${scoreTxt}]: ${gk.motivo}`);
         slot.status = `[RECUSADO: ${gk.motivo}]`;
         autoBotState.lastLog = `Slot ${slotNum} (${cand}): ${gk.motivo}`;
@@ -1708,7 +1568,7 @@ setInterval(async () => {
           }
           tpPrecoDefinido = dec.action === 'LONG' ? (precoExec + tpDistExec) : (precoExec - tpDistExec);
 
-          const beTriggerDist = precoExec * ((3.20 / alav) / 100);
+          const beTriggerDist = precoExec * ((1.50 / alav) / 100);
           const beTriggerPrice = dec.action === 'LONG' ? (precoExec + beTriggerDist) : (precoExec - beTriggerDist);
 
           console.log(`[ORDEM-EXECUTADA] Slot ${slotNum} (${cand}) [${modoTxt}]: ${dec.action} ${alav}x a $${formatarPrecoAtivo(cand, precoExec)} | Qty: ${filledQty} | SL: $${formatarPrecoAtivo(cand, slPrecoDefinido)} (-${slRoeExec.toFixed(1)}% ROI) | TP: $${formatarPrecoAtivo(cand, tpPrecoDefinido)}`);
@@ -1724,7 +1584,7 @@ setInterval(async () => {
             beArmed: false,
             beStage: 0,
             beStopPrice: null,
-            beLabel: '[🌱 RESPIRO LIVRE ATÉ +3.20% ROI (PICO ATUAL: +0.00%)]',
+            beLabel: '[🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO ATUAL: +0.00%)]',
             lockedRoi: 0,
             leverage: alav,
             maxRoiReached: 0,
@@ -2084,7 +1944,7 @@ app.post('/api/trade', async (req, res) => {
       }
       let tpCalc = lado === 'BUY' ? (preco + tpDistMan) : (preco - tpDistMan);
 
-      const beTriggerDist = preco * ((3.20 / alav) / 100);
+      const beTriggerDist = preco * ((1.50 / alav) / 100);
       const beTriggerPrice = lado === 'BUY' ? (preco + beTriggerDist) : (preco - beTriggerDist);
 
       localAlvos[symbol] = {
@@ -2097,7 +1957,7 @@ app.post('/api/trade', async (req, res) => {
         beArmed: false,
         beStage: 0,
         beStopPrice: null,
-        beLabel: '[🌱 RESPIRO LIVRE ATÉ +3.20% ROI (PICO ATUAL: +0.00%)]',
+        beLabel: '[🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO ATUAL: +0.00%)]',
         lockedRoi: 0,
         leverage: alav,
         maxRoiReached: 0,
@@ -2124,7 +1984,7 @@ app.post('/api/close', async (req, res) => {
     const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
     const roi = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
     registrarDesfechoTrade(symbol, 'MANUAL_CLOSE', roi, pos.pnlNaoRealizado);
-    gatekeeperVetoedUntil[symbol] = Date.now() + 7200000;
+    gatekeeperVetoedUntil[symbol] = Date.now() + 2700000;
 
     await rag.salvarSaidaRAG({
       symbol,
@@ -3141,7 +3001,7 @@ app.get('/', (req, res) => {
             const lockR = (data.lockedRoi || 0).toFixed(2);
             const stopP = data.beStopPrice ? ('$' + Number(data.beStopPrice).toFixed(prec)) : '';
 
-            if (data.maxRoiReached >= 3.20) {
+            if (data.maxRoiReached >= 1.50) {
               beEl.style.background = 'rgba(16, 185, 129, 0.22)';
               beEl.style.borderColor = 'var(--green)';
               beEl.style.color = 'var(--green)';
@@ -3150,7 +3010,7 @@ app.get('/', (req, res) => {
               beEl.style.background = 'rgba(255, 255, 255, 0.06)';
               beEl.style.borderColor = 'rgba(255, 255, 255, 0.2)';
               beEl.style.color = 'var(--gold)';
-              beEl.innerText = data.beLabel || ('[🌱 RESPIRO LIVRE ATÉ +3.20% ROI (PICO ATUAL: +' + maxR + '%)]');
+              beEl.innerText = data.beLabel || ('[🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO ATUAL: +' + maxR + '%)]');
             }
           }
         } else {
@@ -3903,12 +3763,12 @@ app.get('/', (req, res) => {
                 entryPrice: pEntrada,
                 slPrice: isLong ? pEntrada * (1 - (12.0 / alav) / 100) : pEntrada * (1 + (12.0 / alav) / 100),
                 tpPrice: isLong ? pEntrada * (1 + 0.10 / alav) : pEntrada * (1 - 0.10 / alav),
-                beTriggerPrice: isLong ? pEntrada * (1 + (3.20 / alav) / 100) : pEntrada * (1 - (3.20 / alav) / 100),
+                beTriggerPrice: isLong ? pEntrada * (1 + (1.50 / alav) / 100) : pEntrada * (1 - (1.50 / alav) / 100),
                 slDistPct: 0.12 / alav,
                 beArmed: false,
                 beStage: 0,
                 beStopPrice: null,
-                beLabel: '[🌱 RESPIRO LIVRE ATÉ +3.20% ROI (PICO ATUAL: +0.00%)]',
+                beLabel: '[🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO ATUAL: +0.00%)]',
                 lockedRoi: 0,
                 leverage: p.alavancagem,
                 maxRoiReached: 0,
@@ -3918,7 +3778,7 @@ app.get('/', (req, res) => {
             } else {
               if (localAlvos[p.symbol].beStage === undefined) localAlvos[p.symbol].beStage = 0;
               if (localAlvos[p.symbol].beStopPrice === undefined) localAlvos[p.symbol].beStopPrice = null;
-              if (!localAlvos[p.symbol].beLabel) localAlvos[p.symbol].beLabel = '[🌱 RESPIRO LIVRE ATÉ +3.20% ROI (PICO ATUAL: +0.00%)]';
+              if (!localAlvos[p.symbol].beLabel) localAlvos[p.symbol].beLabel = '[🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO ATUAL: +0.00%)]';
               if (localAlvos[p.symbol].lockedRoi === undefined) localAlvos[p.symbol].lockedRoi = 0;
               if (localAlvos[p.symbol].maxRoiReached === undefined) localAlvos[p.symbol].maxRoiReached = 0;
               delete localAlvos[p.symbol].jaReverteu;
