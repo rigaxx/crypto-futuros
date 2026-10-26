@@ -213,9 +213,47 @@ async function validarLiquidezMoeda(symbol) {
     const ask = parseFloat(book.asks[0][0]);
     if (!bid || !ask || bid <= 0) return { ok: false, motivo: 'PRECO_INVALIDO' };
 
+    // 1. Veto de Spread Largo (> 0.10%)
     const spreadPct = ((ask - bid) / bid) * 100;
-    if (spreadPct > 0.15) {
-      return { ok: false, motivo: `SPREAD_EXCESSIVO (${spreadPct.toFixed(3)}%)` };
+    if (spreadPct > 0.10) {
+      return { ok: false, motivo: `[VETO-SLIPPAGE: SPREAD LARGO] (${spreadPct.toFixed(3)}% > 0.10%)` };
+    }
+
+    // 2. Veto de "Moeda de 1 Tick Grosso" (> 0.08% do preço)
+    const f = fut.filtrosDe(symbol);
+    let tickSize = f ? parseFloat(f.tickSize) : 0;
+    if (!(tickSize > 0) && (book.bids.length >= 2 || book.asks.length >= 2)) {
+      const diffBid = book.bids.length >= 2 ? Math.abs(parseFloat(book.bids[0][0]) - parseFloat(book.bids[1][0])) : 0;
+      const diffAsk = book.asks.length >= 2 ? Math.abs(parseFloat(book.asks[1][0]) - parseFloat(book.asks[0][0])) : 0;
+      tickSize = Math.max(diffBid, diffAsk);
+    }
+    const tickPct = (tickSize / bid) * 100;
+    if (tickPct > 0.08) {
+      return { ok: false, motivo: `[VETO-TICK-GROSSO] (1 tick = ${tickPct.toFixed(3)}% > 0.08%)` };
+    }
+
+    // 3. Liquidez Mínima nos Top 5 Níveis do Book (>= $150 USDT em até 0.15%)
+    let volAsksTop5 = 0;
+    const maxAskPrice = ask * 1.0015;
+    for (const item of (book.asks || []).slice(0, 5)) {
+      const p = parseFloat(item[0]);
+      const q = parseFloat(item[1]);
+      if (p <= maxAskPrice) volAsksTop5 += (p * q);
+    }
+
+    let volBidsTop5 = 0;
+    const minBidPrice = bid * (1 - 0.0015);
+    for (const item of (book.bids || []).slice(0, 5)) {
+      const p = parseFloat(item[0]);
+      const q = parseFloat(item[1]);
+      if (p >= minBidPrice) volBidsTop5 += (p * q);
+    }
+
+    if (volAsksTop5 < 150 || volBidsTop5 < 150) {
+      return {
+        ok: false,
+        motivo: `[VETO-LIQUIDEZ-BOOK] Top 5 níveis com < $150 USDT em 0.15% (Asks: $${volAsksTop5.toFixed(0)}, Bids: $${volBidsTop5.toFixed(0)})`
+      };
     }
 
     let flatCandles = 0;
@@ -227,7 +265,7 @@ async function validarLiquidezMoeda(symbol) {
       return { ok: false, motivo: `ZUMBI (${flatCandles} velas 0%)` };
     }
 
-    return { ok: true, oiVal, spreadPct, flatCandles };
+    return { ok: true, oiVal, spreadPct, tickPct, volAsksTop5, volBidsTop5, flatCandles };
   } catch(e) {
     return { ok: false, motivo: e.message };
   }
@@ -386,12 +424,39 @@ async function analisarEstruturaEMercado(symbol) {
       if (o === c || h === l || vol === 0) flatCandles5m++;
     }
 
-    // Spread do Order Book
+    // Spread, Tick Ratio e Liquidez Top 5 do Order Book (CORREÇÃO 3)
     let spreadPct = 0;
+    let tickPct = 0;
+    let volAsksTop5 = 0;
+    let volBidsTop5 = 0;
     if (bookData && bookData.bids?.[0] && bookData.asks?.[0]) {
       const bid = parseFloat(bookData.bids[0][0]);
       const ask = parseFloat(bookData.asks[0][0]);
-      if (bid > 0) spreadPct = ((ask - bid) / bid) * 100;
+      if (bid > 0) {
+        spreadPct = ((ask - bid) / bid) * 100;
+        const f = fut.filtrosDe(symbol);
+        let tickSize = f ? parseFloat(f.tickSize) : 0;
+        if (!(tickSize > 0) && (bookData.bids.length >= 2 || bookData.asks.length >= 2)) {
+          const diffBid = bookData.bids.length >= 2 ? Math.abs(parseFloat(bookData.bids[0][0]) - parseFloat(bookData.bids[1][0])) : 0;
+          const diffAsk = bookData.asks.length >= 2 ? Math.abs(parseFloat(bookData.asks[1][0]) - parseFloat(bookData.asks[0][0])) : 0;
+          tickSize = Math.max(diffBid, diffAsk);
+        }
+        tickPct = (tickSize / bid) * 100;
+
+        const maxAskPrice = ask * 1.0015;
+        for (const item of (bookData.asks || []).slice(0, 5)) {
+          const p = parseFloat(item[0]);
+          const q = parseFloat(item[1]);
+          if (p <= maxAskPrice) volAsksTop5 += (p * q);
+        }
+
+        const minBidPrice = bid * (1 - 0.0015);
+        for (const item of (bookData.bids || []).slice(0, 5)) {
+          const p = parseFloat(item[0]);
+          const q = parseFloat(item[1]);
+          if (p >= minBidPrice) volBidsTop5 += (p * q);
+        }
+      }
     }
 
     // ── VELA 5M E IDENTIFICAÇÃO DE PAVIO / DIREÇÃO ──
@@ -582,9 +647,9 @@ async function analisarEstruturaEMercado(symbol) {
     let slPctReal = (slDist / curPrice) * 100;
     let slRoe = slPctReal * leverageSugerida;
 
-    // Banda Rígida de Stop Loss em ROI: Piso Mínimo de 4.5% e Teto Máximo de 5.5% (-5.50% de ROI)
-    const minSlRoi = 4.5;
-    const maxSlRoi = 5.5;
+    // Banda Rígida de Stop Loss em ROI: Piso Mínimo de 4.20% e Teto Máximo de 4.80% (-4.80% de ROI)
+    const minSlRoi = 4.20;
+    const maxSlRoi = 4.80;
 
     if (slRoe < minSlRoi) {
       slRoe = minSlRoi;
@@ -641,7 +706,7 @@ async function analisarEstruturaEMercado(symbol) {
       aptoLong, aptoShort, mtfStatus, mtfText,
       emaAlignStatus, qualidadeSetup, qualidadeCor,
       deltaOI, takerRatioVal, fundingRate, oiVal,
-      flatCandles5m, spreadPct,
+      flatCandles5m, spreadPct, tickPct, volAsksTop5, volBidsTop5,
       modoDetectado, modoLabel, direcaoModo, motivoModo, directionalScore,
       leverageSugerida,
       slDist, slPctReal, slRoe, slPrice,
@@ -661,8 +726,23 @@ function verificarGatekeeper(dados) {
   if (dados.flatCandles5m > 2) {
     return { passou: false, motivo: `Gatekeeper: Moeda zumbi (${dados.flatCandles5m} velas 0% no 5m)` };
   }
-  if (dados.spreadPct > 0.15) {
-    return { passou: false, motivo: `Gatekeeper: Spread excessivo (${dados.spreadPct.toFixed(3)}%)` };
+
+  // ── PRÉ-FILTROS ANTI-SLIPPAGE E ANTI-BOOK RASO (CORREÇÃO 3) ──
+  // 1. Veto de Spread Largo (> 0.10%)
+  if (dados.spreadPct > 0.10) {
+    return { passou: false, motivo: `Gatekeeper [VETO-SLIPPAGE: SPREAD LARGO]: Spread (${dados.spreadPct.toFixed(3)}% > 0.10%)` };
+  }
+
+  // 2. Veto de "Moeda de 1 Tick Grosso" (> 0.08% do preço)
+  if (dados.tickPct > 0.08) {
+    return { passou: false, motivo: `Gatekeeper [VETO-TICK-GROSSO]: 1 tick representa ${dados.tickPct.toFixed(3)}% > 0.08% do preço` };
+  }
+
+  // 3. Liquidez Mínima nos Top 5 Níveis do Book (>= $150 USDT no lado da execução em até 0.15%)
+  const ladoExecGk = dados.direcaoModo === 'SHORT' ? 'bids' : 'asks';
+  const volExecGk = ladoExecGk === 'bids' ? (dados.volBidsTop5 || 0) : (dados.volAsksTop5 || 0);
+  if (volExecGk < 150) {
+    return { passou: false, motivo: `Gatekeeper [VETO-LIQUIDEZ-BOOK]: Top 5 níveis (${ladoExecGk}) com apenas $${volExecGk.toFixed(0)} < $150 USDT em 0.15%` };
   }
 
   // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.80% a 2.50%)
@@ -800,9 +880,9 @@ async function avaliarPerdao30mMatematico(symbol, pos, duracaoMinutos) {
       };
     }
 
-    // 1. Perdão 30m Inteligente aos 35 minutos:
-    // Apenas se duracaoMinutos >= 35 E roiAtual <= -2.20% E maxRoiReached < 1.50% E preço contra EMA21 de 15m
-    if (duracaoMinutos >= 35 && roiAtual <= -2.20 && maxRoi < 1.50) {
+    // 1. Perdão 30m Inteligente antecipado para 25 minutos (CORREÇÃO 4):
+    // Apenas se duracaoMinutos >= 25 E roiAtual <= -2.00% E maxRoiReached < 1.60% E preço contra EMA21 de 15m
+    if (duracaoMinutos >= 25 && roiAtual <= -2.00 && maxRoi < 1.60) {
       const dados = await analisarEstruturaEMercado(symbol);
       if (dados) {
         const contraEma21 = isLong ? (dados.curPrice < dados.ema21_15) : (dados.curPrice > dados.ema21_15);
@@ -810,15 +890,15 @@ async function avaliarPerdao30mMatematico(symbol, pos, duracaoMinutos) {
           return {
             fechar: true,
             motivo: 'PERDAO_30M_SOFT_STOP',
-            desc: `Soft Stop aos 35m (${roiAtual.toFixed(2)}% ROI <= -2.20% | Pico: +${maxRoi.toFixed(2)}% < 1.50% | Contra EMA21 15m | Duração ${Math.round(duracaoMinutos)}m)`
+            desc: `Soft Stop aos 25m (${roiAtual.toFixed(2)}% ROI <= -2.00% | Pico: +${maxRoi.toFixed(2)}% < 1.60% | Contra EMA21 15m | Duração ${Math.round(duracaoMinutos)}m)`
           };
         }
       }
     }
 
     // 2. Perdão Positivo (Deixar Vencedores Correrem): se >= +1.80% ROI e tendência a favor da EMA21 de 15m, NÃO fecha!
-    // Só encerra se perder EMA 9 (5m) ou EMA 21 (15m) contra a posição após 35m
-    if (roiAtual >= 1.80 && duracaoMinutos >= 35) {
+    // Só encerra se perder EMA 9 (5m) ou EMA 21 (15m) contra a posição após 25m
+    if (roiAtual >= 1.80 && duracaoMinutos >= 25) {
       const dados = await analisarEstruturaEMercado(symbol);
       if (dados) {
         const perdeuTendencia = isLong
@@ -828,7 +908,7 @@ async function avaliarPerdao30mMatematico(symbol, pos, duracaoMinutos) {
           return {
             fechar: true,
             motivo: 'PERDAO_30M_LUCRO',
-            desc: `Lucro aos 35m com Perda de Média (+${roiAtual.toFixed(2)}% ROI | Perdeu EMA9/21)`
+            desc: `Lucro aos 25m com Perda de Média (+${roiAtual.toFixed(2)}% ROI | Perdeu EMA9/21)`
           };
         }
       }
@@ -873,10 +953,50 @@ setInterval(async () => {
         const roiPuro = varPrecoPct * alav;
         const roi = roiPuro;
 
-        // ── MONITORAMENTO DE ROI MÁXIMO (BASEADO 100% EM ROI) ──
+        // ── MONITORAMENTO DE ROI MÁXIMO COM FILTRO DE ARMAÇÃO ANTI-SPIKE / SPREAD OCO (CORREÇÃO 2) ──
+        const prevRoiPuro = alvo.lastRoiPuro !== undefined ? alvo.lastRoiPuro : (alvo.maxRoiReached || 0);
+        const saltoRoi = roiPuro - prevRoiPuro;
+        let picoAutorizado = false;
+
         if (alvo.maxRoiReached === undefined || roi > alvo.maxRoiReached) {
-          alvo.maxRoiReached = roi;
+          // Para subir alvo.maxRoiReached acima de +1.60%:
+          if (roi > 1.60 && saltoRoi > 1.80) {
+            // Salto absurdo (> +1.80% de ROI em 1 tick de 1.5s): valida contra Bid (LONG) / Ask (SHORT) do Order Book OU exige 2 leituras
+            let bookValido = false;
+            try {
+              const bookSnapshot = await fut.livroOfertas(sym, 5).catch(() => null);
+              if (bookSnapshot && bookSnapshot.bids?.[0] && bookSnapshot.asks?.[0]) {
+                const execPrice = isLong ? parseFloat(bookSnapshot.bids[0][0]) : parseFloat(bookSnapshot.asks[0][0]);
+                if (execPrice > 0) {
+                  const execVarPct = ((execPrice - entryPrice) / entryPrice) * 100 * (isLong ? 1 : -1);
+                  const execRoi = execVarPct * alav;
+                  if (execRoi >= 1.60) {
+                    bookValido = true;
+                  }
+                }
+              }
+            } catch (errBook) {}
+
+            alvo.spikeTicks = (alvo.spikeTicks || 0) + 1;
+            if (bookValido || alvo.spikeTicks >= 2) {
+              picoAutorizado = true;
+              alvo.spikeTicks = 0;
+            } else {
+              console.log(`[FILTRO-CATRACA-SPIKE] ${sym} (${pos.lado}): Salto absurdo de +${saltoRoi.toFixed(2)}% ROI em 1 tick rejeitado para armação da catraca (aguardando 2ª leitura ou validação de book)`);
+            }
+          } else {
+            picoAutorizado = true;
+            alvo.spikeTicks = 0;
+          }
+
+          if (picoAutorizado) {
+            alvo.maxRoiReached = roi;
+          }
+        } else {
+          alvo.spikeTicks = 0;
         }
+
+        alvo.lastRoiPuro = roiPuro;
         const maxRoi = alvo.maxRoiReached || 0;
 
         // ── NOVA ADMINISTRAÇÃO POSITIVA: CATRACA DE 0.50% EM 0.50% DE ROI ──
@@ -943,22 +1063,33 @@ setInterval(async () => {
             deveFechar = true;
             motivoFechamento = `[TAKE PROFIT] Preço ${formatarPrecoAtivo(sym, curPrice)} >= TP ${formatarPrecoAtivo(sym, alvo.tpPrice)} (+${roi.toFixed(2)}% ROI)`;
           }
-          // 2. Stop Loss (Preço ATR ou Teto Rígido -12.0% ROI)
+          // 2. Stop Loss (Preço ATR ou Teto Rígido -4.80% ROI)
           else if (!deveFechar && alvo.slPrice && curPrice <= alvo.slPrice) {
             deveFechar = true;
             motivoFechamento = `[STOP LOSS ATR] Preço ${formatarPrecoAtivo(sym, curPrice)} <= SL ${formatarPrecoAtivo(sym, alvo.slPrice)} (${roi.toFixed(2)}% ROI)`;
           }
-          else if (!deveFechar && roi <= -5.50) {
+          else if (!deveFechar && roi <= -4.80) {
             deveFechar = true;
-            motivoFechamento = `[SAFETY SL -5.5%] ROI atingiu ${roi.toFixed(2)}% (Teto -5.5% ROI)`;
+            motivoFechamento = `[SAFETY SL -4.80%] ROI atingiu ${roi.toFixed(2)}% (Teto -4.80% ROI)`;
           }
-          // 3. Breakeven / Retração (com Filtro Anti-Pavio: 3 ticks consecutivos ou furo direto >= 0.60% abaixo)
+          // 3. Catraca / Breakeven / Retração (Zero atraso >= 2.20% ROI, 2 ticks nos degraus 1 e 2 ou furo <= lockedRoi - 0.30%)
           else if (!deveFechar && alvo.beArmed && (roi <= alvo.lockedRoi || (alvo.beStopPrice && curPrice <= alvo.beStopPrice))) {
-            const furouForte = roi <= (alvo.lockedRoi - 0.60);
             beBreachedTicks[sym] = (beBreachedTicks[sym] || 0) + 1;
-            if (furouForte || beBreachedTicks[sym] >= 3) {
-              deveFechar = true;
-              motivoFechamento = `[BREAKEVEN] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(2)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}% | Ticks: ${beBreachedTicks[sym]}${furouForte ? ' [FURO RAPIDO]' : ''})`;
+            const furouRapido = roi <= (alvo.lockedRoi - 0.30);
+            const degrauAlto = (maxRoi >= 2.20) || (alvo.lockedRoi >= 1.30);
+
+            if (degrauAlto) {
+              // Acima de +2.20% ROI (ou lockedRoi >= 1.30%): dispara no 1º tick (beConfirmTicks >= 1)
+              if (beBreachedTicks[sym] >= 1) {
+                deveFechar = true;
+                motivoFechamento = `[CATRACA-IMEDIATA] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(2)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}% | 1º Tick)`;
+              }
+            } else {
+              // 2 Primeiros degraus (+1.60% / +1.90%): 2 ticks consecutivos (3.0s) OU 1 tick se furar <= lockedRoi - 0.30%
+              if (furouRapido || beBreachedTicks[sym] >= 2) {
+                deveFechar = true;
+                motivoFechamento = `[CATRACA] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(2)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}% | Ticks: ${beBreachedTicks[sym]}${furouRapido ? ' [FURO RAPIDO -0.30%]' : ''})`;
+              }
             }
           } else if (!deveFechar) {
             beBreachedTicks[sym] = 0;
@@ -973,22 +1104,33 @@ setInterval(async () => {
             deveFechar = true;
             motivoFechamento = `[TAKE PROFIT] Preço ${formatarPrecoAtivo(sym, curPrice)} <= TP ${formatarPrecoAtivo(sym, alvo.tpPrice)} (+${roi.toFixed(2)}% ROI)`;
           }
-          // 2. Stop Loss (Preço ATR ou Teto Rígido -12.0% ROI)
+          // 2. Stop Loss (Preço ATR ou Teto Rígido -4.80% ROI)
           else if (!deveFechar && alvo.slPrice && curPrice >= alvo.slPrice) {
             deveFechar = true;
             motivoFechamento = `[STOP LOSS ATR] Preço ${formatarPrecoAtivo(sym, curPrice)} >= SL ${formatarPrecoAtivo(sym, alvo.slPrice)} (${roi.toFixed(2)}% ROI)`;
           }
-          else if (!deveFechar && roi <= -5.50) {
+          else if (!deveFechar && roi <= -4.80) {
             deveFechar = true;
-            motivoFechamento = `[SAFETY SL -5.5%] ROI atingiu ${roi.toFixed(2)}% (Teto -5.5% ROI)`;
+            motivoFechamento = `[SAFETY SL -4.80%] ROI atingiu ${roi.toFixed(2)}% (Teto -4.80% ROI)`;
           }
-          // 3. Breakeven / Retração (com Filtro Anti-Pavio: 3 ticks consecutivos ou furo direto >= 0.60% abaixo)
+          // 3. Catraca / Breakeven / Retração (Zero atraso >= 2.20% ROI, 2 ticks nos degraus 1 e 2 ou furo <= lockedRoi - 0.30%)
           else if (!deveFechar && alvo.beArmed && (roi <= alvo.lockedRoi || (alvo.beStopPrice && curPrice >= alvo.beStopPrice))) {
-            const furouForte = roi <= (alvo.lockedRoi - 0.60);
             beBreachedTicks[sym] = (beBreachedTicks[sym] || 0) + 1;
-            if (furouForte || beBreachedTicks[sym] >= 3) {
-              deveFechar = true;
-              motivoFechamento = `[BREAKEVEN] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(2)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}% | Ticks: ${beBreachedTicks[sym]}${furouForte ? ' [FURO RAPIDO]' : ''})`;
+            const furouRapido = roi <= (alvo.lockedRoi - 0.30);
+            const degrauAlto = (maxRoi >= 2.20) || (alvo.lockedRoi >= 1.30);
+
+            if (degrauAlto) {
+              // Acima de +2.20% ROI (ou lockedRoi >= 1.30%): dispara no 1º tick (beConfirmTicks >= 1)
+              if (beBreachedTicks[sym] >= 1) {
+                deveFechar = true;
+                motivoFechamento = `[CATRACA-IMEDIATA] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(2)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}% | 1º Tick)`;
+              }
+            } else {
+              // 2 Primeiros degraus (+1.60% / +1.90%): 2 ticks consecutivos (3.0s) OU 1 tick se furar <= lockedRoi - 0.30%
+              if (furouRapido || beBreachedTicks[sym] >= 2) {
+                deveFechar = true;
+                motivoFechamento = `[CATRACA] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(2)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}% | Ticks: ${beBreachedTicks[sym]}${furouRapido ? ' [FURO RAPIDO -0.30%]' : ''})`;
+              }
             }
           } else if (!deveFechar) {
             beBreachedTicks[sym] = 0;
@@ -1042,7 +1184,7 @@ setInterval(async () => {
             await fut.cancelarTodasOrdens(sym);
             await fut.fecharMercado(sym, pos.lado, pos.quantidade);
 
-            const exitTipo = (motivoFechamento.includes('TAKE PROFIT') || motivoFechamento.includes('TETO TP') || motivoFechamento.includes('SAIDA_PROTECAO_FUNDING') || motivoFechamento.includes('PERDAO_30M_LUCRO')) ? 'TP' : (motivoFechamento.includes('BREAKEVEN') ? 'BREAKEVEN' : (motivoFechamento.includes('PERDAO_30M_SOFT_STOP') ? 'PERDAO_30M_SOFT_STOP' : (motivoFechamento.includes('TIMEOUT_MAXIMO_90M') ? 'TIMEOUT_MAXIMO_90M' : 'SL')));
+            const exitTipo = (motivoFechamento.includes('TAKE PROFIT') || motivoFechamento.includes('TETO TP') || motivoFechamento.includes('SAIDA_PROTECAO_FUNDING') || motivoFechamento.includes('PERDAO_30M_LUCRO')) ? 'TP' : ((motivoFechamento.includes('BREAKEVEN') || motivoFechamento.includes('CATRACA')) ? 'BREAKEVEN' : (motivoFechamento.includes('PERDAO_30M_SOFT_STOP') ? 'PERDAO_30M_SOFT_STOP' : (motivoFechamento.includes('TIMEOUT_MAXIMO_90M') ? 'TIMEOUT_MAXIMO_90M' : 'SL')));
             await rag.salvarSaidaRAG({
               symbol: sym,
               exitPrice: curPrice,
@@ -1221,7 +1363,7 @@ setInterval(async () => {
           }
 
           const duracaoMs = now - (slot.openTime || now);
-          if (duracaoMs >= 35 * 60 * 1000) {
+          if (duracaoMs >= 25 * 60 * 1000) {
             if (now - (slot.last30mCheck || 0) >= 60 * 1000) {
               slot.last30mCheck = now;
               const duracaoMin = Math.round(duracaoMs / 60000);
@@ -1260,13 +1402,13 @@ setInterval(async () => {
 
                   const symFechado = slot.symbol;
                   gatekeeperVetoedUntil[symFechado] = now + 2700000; // Bloqueio 45 minutos (2700000ms)
-                  console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${symFechado} fechado por estagnação 35m (${decisao30m.motivo}). Bloqueado por 45 minutos.`);
+                  console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${symFechado} fechado por estagnação 25m (${decisao30m.motivo}). Bloqueado por 45 minutos.`);
                   slot.symbol = null;
                   slot.side = null;
                   slot.targetSymbol = null;
                   slot.searchCooldownUntil = now + 45000;
                   slot.status = 'PERDAO_COOLDOWN_45S';
-                  autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 35m em ${symFechado}. Cooldown de 2h na moeda ativado.`;
+                  autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 25m em ${symFechado}. Cooldown de 45m na moeda ativado.`;
                 } finally {
                   closingInProgress.delete(slot.symbol);
                 }
@@ -1298,7 +1440,7 @@ setInterval(async () => {
           slot.status = `[POSIÇÃO ATIVA] ${slot.symbol} (${slot.side || pos.lado} ${slot.leverage || pos.alavancagem}x)`;
 
           const duracaoMs = now - (slot.openTime || now);
-          if (duracaoMs >= 35 * 60 * 1000) {
+          if (duracaoMs >= 25 * 60 * 1000) {
             if (now - (slot.last30mCheck || 0) >= 60 * 1000) {
               slot.last30mCheck = now;
               const duracaoMin = Math.round(duracaoMs / 60000);
@@ -1337,13 +1479,13 @@ setInterval(async () => {
 
                   const symFechado = slot.symbol;
                   gatekeeperVetoedUntil[symFechado] = now + 2700000; // Bloqueio 45 minutos (2700000ms)
-                  console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${symFechado} fechado por estagnação 35m (${decisao30m.motivo}). Bloqueado por 45 minutos.`);
+                  console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${symFechado} fechado por estagnação 25m (${decisao30m.motivo}). Bloqueado por 45 minutos.`);
                   slot.symbol = null;
                   slot.side = null;
                   slot.targetSymbol = null;
                   slot.searchCooldownUntil = now + 45000;
                   slot.status = 'PERDAO_COOLDOWN_45S';
-                  autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 35m em ${symFechado}. Cooldown de 2h na moeda ativado.`;
+                  autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 25m em ${symFechado}. Cooldown de 45m na moeda ativado.`;
                   continue;
                 } finally {
                   closingInProgress.delete(slot.symbol);
@@ -1498,10 +1640,49 @@ setInterval(async () => {
         const bestAsk = parseFloat((book?.asks?.[0] || [])[0]);
         if (!bestBid || !bestAsk) continue;
 
-        // Check rigoroso de Spread Instantâneo (> 0.30% aborta na hora)
+        // ── PRÉ-FILTROS ANTI-SLIPPAGE E ANTI-BOOK RASO NA EXECUÇÃO (CORREÇÃO 3) ──
+        // 1. Veto de Spread Largo (> 0.10%)
         const spreadPct = ((bestAsk - bestBid) / bestBid) * 100;
-        if (spreadPct > 0.30) {
-          console.log(`[AUTOBOT-SPREAD-VETO] Slot ${slotNum} (${cand}): Spread instantâneo de ${spreadPct.toFixed(3)}% > 0.30% max. Cancelando envio para proteger contra slippage.`);
+        if (spreadPct > 0.10) {
+          console.log(`[AUTOBOT-SPREAD-VETO] Slot ${slotNum} (${cand}): [VETO-SLIPPAGE: SPREAD LARGO] Spread instantâneo de ${spreadPct.toFixed(3)}% > 0.10% max. Cancelando envio para proteger contra slippage.`);
+          gatekeeperVetoedUntil[cand] = now + 60000;
+          slot.targetSymbol = null;
+          continue;
+        }
+
+        // 2. Veto de Moeda de 1 Tick Grosso (> 0.08% do preço)
+        const fCand = fut.filtrosDe(cand);
+        let tickSizeCand = fCand ? parseFloat(fCand.tickSize) : 0;
+        if (!(tickSizeCand > 0) && (book?.bids || []).length >= 2) {
+          tickSizeCand = Math.abs(parseFloat(book.bids[0][0]) - parseFloat(book.bids[1][0]));
+        }
+        const tickPctCand = (tickSizeCand / bestBid) * 100;
+        if (tickPctCand > 0.08) {
+          console.log(`[AUTOBOT-TICK-VETO] Slot ${slotNum} (${cand}): [VETO-TICK-GROSSO] 1 tick = ${tickPctCand.toFixed(3)}% > 0.08% do preço. Cancelando envio.`);
+          gatekeeperVetoedUntil[cand] = now + 60000;
+          slot.targetSymbol = null;
+          continue;
+        }
+
+        // 3. Liquidez Mínima Top 5 Níveis (>= $150 USDT em até 0.15% no lado de execução)
+        let volExecBook = 0;
+        if (ladoTrade === 'BUY') {
+          const maxAsk = bestAsk * 1.0015;
+          for (const item of (book?.asks || []).slice(0, 5)) {
+            const p = parseFloat(item[0]);
+            const q = parseFloat(item[1]);
+            if (p <= maxAsk) volExecBook += (p * q);
+          }
+        } else {
+          const minBid = bestBid * (1 - 0.0015);
+          for (const item of (book?.bids || []).slice(0, 5)) {
+            const p = parseFloat(item[0]);
+            const q = parseFloat(item[1]);
+            if (p >= minBid) volExecBook += (p * q);
+          }
+        }
+        if (volExecBook < 150) {
+          console.log(`[AUTOBOT-LIQUIDEZ-VETO] Slot ${slotNum} (${cand}): [VETO-LIQUIDEZ-BOOK] Top 5 níveis com apenas $${volExecBook.toFixed(0)} < $150 USDT em 0.15%. Cancelando envio.`);
           gatekeeperVetoedUntil[cand] = now + 60000;
           slot.targetSymbol = null;
           continue;
@@ -1549,13 +1730,13 @@ setInterval(async () => {
           slDistExec = precoExec * (dados.slPctReal / 100);
           slRoeExec = (slDistExec / precoExec) * alav * 100;
 
-          // Banda saudável de ROI no SL: piso -5.0% e teto -7.5%
-          if (slRoeExec < 5.0) {
-            slRoeExec = 5.0;
-            slDistExec = precoExec * ((5.0 / alav) / 100);
-          } else if (slRoeExec > 7.5) {
-            slRoeExec = 7.5;
-            slDistExec = precoExec * ((7.5 / alav) / 100);
+          // Banda Rígida de Stop Loss em ROI: piso -4.20% e teto -4.80% (CORREÇÃO 4)
+          if (slRoeExec < 4.20) {
+            slRoeExec = 4.20;
+            slDistExec = precoExec * ((4.20 / alav) / 100);
+          } else if (slRoeExec > 4.80) {
+            slRoeExec = 4.80;
+            slDistExec = precoExec * ((4.80 / alav) / 100);
           }
           slPrecoDefinido = dec.action === 'LONG' ? (precoExec - slDistExec) : (precoExec + slDistExec);
 
@@ -1925,14 +2106,14 @@ app.post('/api/trade', async (req, res) => {
 
     if (fill > 0) {
       const dados = await analisarEstruturaEMercado(symbol);
-      let slDistMan = dados ? (dados.slPctReal / 100 * preco) : (preco * ((5.0 / alav) / 100));
+      let slDistMan = dados ? (dados.slPctReal / 100 * preco) : (preco * ((4.50 / alav) / 100));
       let slRoeMan = (slDistMan / preco) * alav * 100;
-      if (slRoeMan < 5.0) {
-        slRoeMan = 5.0;
-        slDistMan = preco * ((5.0 / alav) / 100);
-      } else if (slRoeMan > 7.5) {
-        slRoeMan = 7.5;
-        slDistMan = preco * ((7.5 / alav) / 100);
+      if (slRoeMan < 4.20) {
+        slRoeMan = 4.20;
+        slDistMan = preco * ((4.20 / alav) / 100);
+      } else if (slRoeMan > 4.80) {
+        slRoeMan = 4.80;
+        slDistMan = preco * ((4.80 / alav) / 100);
       }
       let slCalc = lado === 'BUY' ? (preco - slDistMan) : (preco + slDistMan);
 
