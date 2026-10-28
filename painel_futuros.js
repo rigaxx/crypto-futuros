@@ -69,12 +69,13 @@ function getInicioHojeBrasil() {
   return new Date(spDateStr + 'T00:00:00-03:00').getTime();
 }
 
-// ── BLOCO 3.1: GRUPO FIXO DE MOEDAS DE ALTA LIQUIDEZ (WHITELIST VIP) ──
+// ── BLOCO 3.1: GRUPO FIXO DE MOEDAS DE ALTA LIQUIDEZ (WHITELIST VIP - 26 PARES) ──
 const WHITELIST_VIP = new Set([
-  'TAUSDT', 'ENAUSDT', 'QNTUSDT', 'ORDERUSDT', 'XNYUSDT', 'AVAUSDT', 'ARIAUSDT',
-  'SOLUSDT', 'SUIUSDT', 'ORDIUSDT', 'FETUSDT', 'RENDERUSDT', 'NEARUSDT', 'APTUSDT',
-  'WIFUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'AAVEUSDT', 'INJUSDT', 'TIAUSDT',
-  'SEIUSDT', 'PENDLEUSDT', 'ARKUSDT', 'PHAUSDT', 'LUMIAUSDT', 'JUPUSDT', 'ONDOUSDT'
+  'ENAUSDT', 'ORDERUSDT', 'XNYUSDT', 'INJUSDT', 'NEARUSDT',
+  'TAUSDT', 'SOLUSDT', 'SUIUSDT', 'FETUSDT', 'RENDERUSDT',
+  'PENDLEUSDT', 'SEIUSDT', 'TIAUSDT', 'LINKUSDT', 'AAVEUSDT',
+  'DOGEUSDT', 'WIFUSDT', 'ORDIUSDT', 'ARKUSDT', 'PHAUSDT',
+  'LUMIAUSDT', 'JUPUSDT', 'ONDOUSDT', 'AVAXUSDT', 'QNTUSDT', 'APTUSDT'
 ]);
 
 // ── BLOCO 3.2: CACHE DE ALINHAMENTO COM O BTCUSDT (0 TOKENS) ──
@@ -158,7 +159,7 @@ function salvarPlacarStats() {
 
 const closedTradeEvents = new Map(); // symbol -> timestamp para travar duplicidades atômicas
 
-function registrarDesfechoTrade(symbol, exitReason, roi, pnlUsdt) {
+function registrarDesfechoTrade(symbol, exitReason, roi, pnlUsdt, alvoContext = null) {
   if (!symbol) return;
   const agora = Date.now();
   const ultimoReg = closedTradeEvents.get(symbol);
@@ -173,11 +174,16 @@ function registrarDesfechoTrade(symbol, exitReason, roi, pnlUsdt) {
 
   const pnlNum = parseFloat(pnlUsdt) || 0;
   const roiNum = parseFloat(roi) || 0;
-  // BLOCO 2.3: Contabilidade Real de WIN vs LOSS:
-  // Um trade só incrementa wins se pnlLiquido > 0 (após descontar taxas taker estimadas de ~$0.04).
-  const taxaEstimada = 0.04;
-  const pnlLiquido = pnlNum - taxaEstimada;
-  const isWin = pnlLiquido > 0 && roiNum > 0.05;
+
+  // BLOCO 2.2: Contabilidade Real Unificada (50% Parcial + 50% Fechamento)
+  const pnlParcialLiq = alvoContext?.pnlParcialLiquido || 0;
+  const taxaParcial = alvoContext?.taxaParcial || 0;
+  const taxaEstimadaFinal = 0.04;
+  const pnlLiquidoFinal = pnlNum - taxaEstimadaFinal;
+  const pnlLiquidoTotal = pnlLiquidoFinal + pnlParcialLiq;
+  const pnlBrutoTotal = pnlNum + (alvoContext?.pnlParcialBruto || 0);
+
+  const isWin = pnlLiquidoTotal > 0 && (roiNum > 0.05 || pnlLiquidoTotal > 0.01);
   if (isWin) {
     placarStats.wins = (placarStats.wins || 0) + 1;
   } else {
@@ -185,7 +191,7 @@ function registrarDesfechoTrade(symbol, exitReason, roi, pnlUsdt) {
   }
   placarStats.total = (placarStats.wins || 0) + (placarStats.losses || 0);
   salvarPlacarStats();
-  console.log(`[PLACAR-ATUALIZADO] ${symbol} -> ${isWin ? 'WIN (Vencedor)' : 'LOSS (Perdedor)'} (${exitReason}) | PnL Bruto: $${pnlNum.toFixed(2)} | PnL Líq Est: $${pnlLiquido.toFixed(2)} | ROI: ${roiNum.toFixed(2)}% | Total: ${placarStats.wins}W / ${placarStats.losses}L`);
+  console.log(`[PLACAR-ATUALIZADO] ${symbol} -> ${isWin ? 'WIN (Vencedor)' : 'LOSS (Perdedor)'} (${exitReason}) | PnL Bruto Total: $${pnlBrutoTotal.toFixed(2)} | PnL Líq Total: $${pnlLiquidoTotal.toFixed(2)} (Parcial: +$${pnlParcialLiq.toFixed(2)}) | ROI: ${roiNum.toFixed(2)}% | Total: ${placarStats.wins}W / ${placarStats.losses}L`);
 }
 
 function formatarPrecoAtivo(sym, preco) {
@@ -1003,9 +1009,204 @@ async function avaliarPerdao30mMatematico(symbol, pos, duracaoMinutos) {
 // ── MONITORAMENTO DE RISCO EM CÓDIGO (1.5s - 0 Tokens, 0ms Delay) ─────
 let isMonitoringTick = false;
 const closingInProgress = new Set();
+const closingStartedAt = {};
 const beBreachedTicks = {};
 const slBreachedTicks = {};
 const partialTicks = {};
+
+// ── BLOCO 3: MOTOR GAMIFICADO DE SAÚDE DA ORDEM ABERTA (HP 0-100) ──
+function calcularHpOrdemAberta(alvo, analise) {
+  if (!alvo || !analise) return 70;
+  const isLong = (alvo.side || '').toUpperCase() === 'LONG';
+  let hp = 0;
+
+  // 1. Pilar 1 — Estrutura Maior (1h e EMA 50 de 15m): Até 40 HP
+  const tend1hFavor = isLong 
+    ? (analise.dir1h === 'ALTA' || analise.ema21_1h >= analise.ema50_1h || analise.curPrice >= analise.ema50_1h)
+    : (analise.dir1h === 'BAIXA' || analise.ema21_1h <= analise.ema50_1h || analise.curPrice <= analise.ema50_1h);
+  if (tend1hFavor) hp += 25;
+
+  const precoEma50_15 = isLong 
+    ? (analise.curPrice >= analise.ema50_15) 
+    : (analise.curPrice <= analise.ema50_15);
+  if (precoEma50_15) hp += 15;
+
+  // 2. Pilar 2 — Defesa da Zona de Valor (EMA 21 de 15m): Até 25 HP
+  const closes15 = analise.p15?.closes || [];
+  const lastClosed15m = closes15.length >= 2 ? closes15[closes15.length - 2] : (closes15[closes15.length - 1] || analise.curPrice);
+  const ema21 = analise.ema21_15 || analise.curPrice;
+  const atr15 = analise.atr15m || (analise.curPrice * 0.01);
+  const distContraEma21 = isLong ? (ema21 - lastClosed15m) : (lastClosed15m - ema21);
+
+  if (distContraEma21 <= 0) {
+    hp += 25; // Fechou a favor da EMA 21
+  } else if (distContraEma21 <= 0.5 * atr15) {
+    hp += 12; // Violou por < 0.5x ATR (apenas teste de pavio/respiro)
+  } else {
+    hp += 0;  // Rompimento contra por > 0.5x ATR
+  }
+
+  // 3. Pilar 3 — Fluxo e Agressão (Bússola Quant + Taker Ratio): Até 20 HP
+  const score = analise.directionalScore || 0;
+  if (isLong) {
+    if (score >= 30) hp += 12;
+    else if (score >= -20) hp += 6;
+  } else {
+    if (score <= -30) hp += 12;
+    else if (score <= 20) hp += 6;
+  }
+
+  const tr = analise.takerRatioVal || 1.0;
+  const semAgressaoContra = isLong ? (tr >= 0.85) : (tr <= 1.15);
+  if (semAgressaoContra) hp += 8;
+
+  // 4. Pilar 4 — Reação Recente do Preço (5m e RSI 15m): Até 15 HP
+  const rsi = analise.rsi15m || 50;
+  const mtf5mFavor = isLong 
+    ? (analise.dir5m === 'ALTA' || analise.curPrice >= analise.ema21_5) 
+    : (analise.dir5m === 'BAIXA' || analise.curPrice <= analise.ema21_5);
+  const rsiSaudavel = isLong 
+    ? (rsi >= 45 && rsi <= 72) 
+    : (rsi <= 55 && rsi >= 28);
+
+  if (mtf5mFavor || rsiSaudavel) {
+    hp += 15;
+  } else if ((isLong && rsi >= 38) || (!isLong && rsi <= 62)) {
+    hp += 8;
+  }
+
+  return Math.max(0, Math.min(100, hp));
+}
+
+// ── BLOCO 2: EXECUÇÃO E CONTABILIDADE DA PARCIAL DE 50% ──
+async function executarParcial50(sym, alvo, pos, curPrice, motivo = 'NORMAL_260') {
+  if (alvo.parcialExecutada) return false;
+  const f = fut.filtrosDe(sym);
+  const minQty = f ? parseFloat(f.minQty || 0.001) : 0.001;
+  const totalQty = Math.abs(parseFloat(pos.quantidade || alvo.quantidade || 0));
+  let metadeQty = totalQty / 2;
+  if (f && f.stepSize) metadeQty = fut.pisoNoStep(metadeQty, f.stepSize);
+
+  if (metadeQty >= minQty && (totalQty - metadeQty) >= minQty) {
+    try {
+      console.log(`[💰 PARCIAL 50% REALIZADA (${motivo})] ${sym} (${pos.lado}): Fechando ${metadeQty} de ${totalQty}`);
+      await fut.fecharMercado(sym, pos.lado, metadeQty);
+      alvo.parcialExecutada = true;
+
+      const isLong = pos.lado === 'LONG';
+      const entryPrice = parseFloat(pos.precoEntrada || alvo.entryPrice);
+      const pnlBrutoMetade1 = metadeQty * (isLong ? (curPrice - entryPrice) : (entryPrice - curPrice));
+      const taxaMetade1 = (metadeQty * curPrice) * 0.0005; // ~0.05% taker Binance
+      const pnlLiquidoMetade1 = pnlBrutoMetade1 - taxaMetade1;
+
+      alvo.pnlParcialBruto = (alvo.pnlParcialBruto || 0) + pnlBrutoMetade1;
+      alvo.pnlParcialLiquido = (alvo.pnlParcialLiquido || 0) + pnlLiquidoMetade1;
+      alvo.taxaParcial = (alvo.taxaParcial || 0) + taxaMetade1;
+
+      alvo.quantidade = totalQty - metadeQty;
+      pos.quantidade = totalQty - metadeQty;
+      salvarAlvos();
+      return true;
+    } catch(errParcial) {
+      console.error(`[PARCIAL 50%] Erro ao enviar ordem parcial para ${sym}:`, errParcial.message);
+      alvo.parcialExecutada = true;
+      salvarAlvos();
+      return false;
+    }
+  } else {
+    // Quantidade indivisível abaixo do minQty
+    alvo.parcialExecutada = true;
+    salvarAlvos();
+    return false;
+  }
+}
+
+// ── BLOCO 4: COMPARAÇÃO DE 2 VERIFICAÇÕES (T1 vs T2 A CADA 120s) E GESTÃO ASSIMÉTRICA ──
+async function avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracaoMin) {
+  const agora = Date.now();
+  if (duracaoMin < 4) return;
+  if (agora - (alvo.lastHpCheck || 0) < 120000) return; // Checagem a cada 2 minutos (120s)
+
+  const analise = await analisarEstruturaEMercado(sym).catch(() => null);
+  if (!analise) return;
+
+  const hpAtual = calcularHpOrdemAberta(alvo, analise);
+  const hpAnt = alvo.hpLeitura2 !== undefined ? alvo.hpLeitura2 : (alvo.hpLeitura1 || hpAtual);
+  alvo.hpLeitura1 = hpAnt;
+  alvo.hpLeitura2 = hpAtual;
+  alvo.lastHpCheck = agora;
+
+  const isLong = pos.lado === 'LONG';
+  const entryPrice = parseFloat(pos.precoEntrada);
+  const alav = pos.alavancagem || alvo.leverage || 1;
+
+  console.log(`[HP-AUDITORIA] ${sym} (${pos.lado} ${alav}x | Duração ${Math.round(duracaoMin)}m | ROI: ${roiPuro.toFixed(2)}%): Leitura HP T1:${hpAnt} ➔ T2:${hpAtual}/100`);
+
+  // ── CASO 1: Ordem no POSITIVO (roiPuro >= +1.50%) — Proteção Rápida do Lucro ──
+  if (roiPuro >= 1.50) {
+    // Se ainda não executou parcial de +2.60%, mas pico >= +1.60% e queda de saúde confirmada (T2 < T1 e T2 <= 55)
+    if (!alvo.parcialExecutada && (alvo.maxRoiReached >= 1.60) && (hpAtual < hpAnt && hpAtual <= 55)) {
+      alvo.beArmed = true;
+      alvo.lockedRoi = Math.max(alvo.lockedRoi || 0, 0.80);
+      const beDist = entryPrice * ((alvo.lockedRoi / alav) / 100);
+      const calcStopPrice = isLong ? (entryPrice + beDist) : (entryPrice - beDist);
+      alvo.beStopPrice = alvo.beStopPrice ? (isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice)) : calcStopPrice;
+      alvo.defesaLucroAtiva = true;
+      console.log(`[🛡️ DEFESA LUCRO ANTECIPADA] ${sym}: Catraca antecipada para +0.80% ROI devido à queda de HP (${hpAnt} ➔ ${hpAtual}) com pico de +${alvo.maxRoiReached.toFixed(2)}%`);
+
+      // Se roiPuro >= +1.85%, antecipa e executa Parcial de 50% imediatamente!
+      if (roiPuro >= 1.85) {
+        console.log(`[🛡️ PARCIAL 50% ANTECIPADA POR QUEDA DE HP (T1:${hpAnt} ➔ T2:${hpAtual})] ${sym}: ROI +${roiPuro.toFixed(2)}% >= +1.85%`);
+        await executarParcial50(sym, alvo, pos, curPrice, `ANTECIPADA_HP_${hpAnt}_${hpAtual}`);
+      }
+    }
+
+    // Se já em lucro alto (roiPuro >= +3.20%) e HP cair abaixo de 45 ou RSI 5m em exaustão extrema
+    const rsi5m = analise.p5?.closes ? ti.RSI.calculate({ period: 14, values: analise.p5.closes }).slice(-1)[0] || 50 : 50;
+    const rsiExausto = isLong ? (rsi5m >= 78) : (rsi5m <= 22);
+
+    if (roiPuro >= 3.20 && ((hpAtual < hpAnt && hpAtual <= 45) || rsiExausto)) {
+      const novoLocked = Number((roiPuro - 0.80).toFixed(2));
+      if (novoLocked > (alvo.lockedRoi || 0)) {
+        alvo.beArmed = true;
+        alvo.lockedRoi = novoLocked;
+        const beDist = entryPrice * ((alvo.lockedRoi / alav) / 100);
+        const calcStopPrice = isLong ? (entryPrice + beDist) : (entryPrice - beDist);
+        alvo.beStopPrice = alvo.beStopPrice ? (isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice)) : calcStopPrice;
+        console.log(`[CATRACA-APERTO-HP] ${sym}: Trava apertada para +${alvo.lockedRoi.toFixed(2)}% ROI por fadiga de HP/RSI (${hpAnt} ➔ ${hpAtual} | RSI 5m: ${rsi5m.toFixed(1)})`);
+      }
+    }
+  }
+
+  // ── CASO 2: Ordem no NEGATIVO (roiPuro < 0.00% e duracaoMin >= 12) — Cuidado Máximo (PROIBIDO Abortar no Fundo!) ──
+  if (roiPuro < 0.00 && duracaoMin >= 12) {
+    // Cenário 2A: Susto normal / Reação (T2 >= T1 OU T2 >= 45)
+    if (hpAtual >= hpAnt || hpAtual >= 45) {
+      if (alvo.modoResgateAtivo && hpAtual >= 60) {
+        console.log(`[RECUPERAÇÃO HP] ${sym}: Estrutura recuperou (HP ${hpAnt} ➔ ${hpAtual} >= 60). Desativando Modo Resgate.`);
+        alvo.modoResgateAtivo = false;
+        alvo.tpResgateRoi = null;
+        alvo.slResgateRoi = null;
+      }
+    } 
+    // Cenário 2B: Deterioração Grave Confirmada em 2 Leituras (T1 <= 42 E T2 < T1 E T2 <= 32)
+    else if (hpAnt <= 42 && hpAtual < hpAnt && hpAtual <= 32) {
+      if (!alvo.modoResgateAtivo) {
+        alvo.modoResgateAtivo = true;
+        alvo.tpResgateRoi = 0.35; // Alvo de saída no repique (+0.35% ROI para empate técnico com taxas)
+        
+        // Comprime o Stop Loss em 25% (ex: se era -5.60%, sobe para -4.20% ROI)
+        const funil = calcularFunilTempo(alvo, duracaoMin);
+        const slBase = Math.abs(funil?.slRoiDinamico || alvo.slRoiInicial || 5.60);
+        alvo.slResgateRoi = -Number((slBase * 0.75).toFixed(2));
+
+        console.log(`[🚑 MODO RESGATE ATIVADO] ${sym}: Confirmada deterioração grave em 2 leituras (T1:${hpAnt} ➔ T2:${hpAtual}). Alvo de saída no repique baixado para +0.35% ROI. Stop Loss comprimido em 25% para ${alvo.slResgateRoi.toFixed(2)}% ROI.`);
+      }
+    }
+  }
+
+  salvarAlvos();
+}
 
 setInterval(async () => {
   if (isMonitoringTick) return;
@@ -1020,6 +1221,15 @@ setInterval(async () => {
         console.warn(`[WATCHDOG-FECHANDO] Resetando trava de fechamento presa para ${sym} (>10s)`);
         alvo.fechando = false;
         closingInProgress.delete(sym);
+        delete closingStartedAt[sym];
+      }
+    }
+    for (const sym of Array.from(closingInProgress)) {
+      if (agoraWatchdog - (closingStartedAt[sym] || 0) > 12000) {
+        console.warn(`[WATCHDOG-CLOSING] Resetando closingInProgress preso para ${sym} (>12s)`);
+        closingInProgress.delete(sym);
+        delete closingStartedAt[sym];
+        if (localAlvos[sym]) localAlvos[sym].fechando = false;
       }
     }
 
@@ -1051,12 +1261,18 @@ setInterval(async () => {
         const roiPuro = varPrecoPct * alav;
         const roi = roiPuro;
 
-        // ── MONITORAMENTO DE ROI MÁXIMO ──
+        // ── MONITORAMENTO DE ROI MÁXIMO E DURAÇÃO ──
+        const duracaoMs = Date.now() - (alvo.openTime || (pos.atualizadoEm || Date.now()));
+        const duracaoMin = duracaoMs / 60000;
+
         if (alvo.maxRoiReached === undefined || roi > alvo.maxRoiReached) {
           alvo.maxRoiReached = roi;
         }
         alvo.lastRoiPuro = roiPuro;
         const maxRoi = alvo.maxRoiReached || 0;
+
+        // ── BLOCO 3 & 4: AVALIAÇÃO GAMIFICADA DE SAÚDE (HP 0-100 A CADA 120s) ──
+        await avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracaoMin).catch(e => console.error(`[HP-ERRO] ${sym}:`, e.message));
 
         // ── BLOCO 4.2: TIRO RÁPIDO AOS +2.60% ROI — PARCIAL DE 50% + TRAVA EM +1.20% ──
         if (roiPuro >= 2.60) {
@@ -1073,29 +1289,9 @@ setInterval(async () => {
               alvo.beStopPrice = isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice);
             }
 
-            // Realização Parcial de 50%
+            // Realização Parcial de 50% com contabilidade unificada
             if (!alvo.parcialExecutada) {
-              const f = fut.filtrosDe(sym);
-              const minQty = f ? parseFloat(f.minQty || 0.001) : 0.001;
-              const totalQty = Math.abs(parseFloat(pos.quantidade || alvo.quantidade || 0));
-              let metadeQty = totalQty / 2;
-              if (f && f.stepSize) metadeQty = fut.pisoNoStep(metadeQty, f.stepSize);
-
-              if (metadeQty >= minQty && (totalQty - metadeQty) >= minQty) {
-                try {
-                  console.log(`[💰 PARCIAL 50% REALIZADA EM +2.60% ROI] ${sym} (${pos.lado}): Fechando ${metadeQty} de ${totalQty}`);
-                  await fut.fecharMercado(sym, pos.lado, metadeQty);
-                  alvo.parcialExecutada = true;
-                  alvo.quantidade = totalQty - metadeQty;
-                  pos.quantidade = totalQty - metadeQty;
-                  salvarAlvos();
-                } catch(errParcial) {
-                  console.error(`[PARCIAL 50%] Erro ao enviar ordem parcial para ${sym}:`, errParcial.message);
-                  alvo.parcialExecutada = true;
-                }
-              } else {
-                alvo.parcialExecutada = true;
-              }
+              await executarParcial50(sym, alvo, pos, curPrice, 'TIRO_RAPIDO_260');
             }
           }
         } else {
@@ -1107,7 +1303,7 @@ setInterval(async () => {
         const prevLockedRoi = alvo.lockedRoi || 0;
 
         if (alvo.maxRoiReached < 2.60) {
-          // Abaixo de +2.60% de ROI: Catraca DESLIGADA. Respiro livre total
+          // Abaixo de +2.60% de ROI: se Catraca não foi armada por Defesa de Lucro HP, mantém respiro
           if (!alvo.beArmed) {
             alvo.lockedRoi = 0;
             alvo.beStopPrice = null;
@@ -1138,21 +1334,34 @@ setInterval(async () => {
         }
 
         // ── BLOCO 5: AFUNILAMENTO DINÂMICO DE TP E SL POR TEMPO ──
-        const duracaoMs = Date.now() - (alvo.openTime || (pos.atualizadoEm || Date.now()));
-        const duracaoMin = duracaoMs / 60000;
         const funil = calcularFunilTempo(alvo, duracaoMin);
 
-        // ── BLOCO 6: BADGE VISUAL DO FUNIL E DA PARCIAL NO CARD DO PAINEL ──
-        let statusBadge = '';
+        // ── BLOCO 5: BADGE VISUAL DE HP (T1 -> T2), FUNIL E PARCIAL NO CARD DO PAINEL ──
+        const hp1 = alvo.hpLeitura1 ?? 75;
+        const hp2 = alvo.hpLeitura2 ?? hp1;
+        let hpBadge = '';
+
+        if (alvo.modoResgateAtivo) {
+          hpBadge = `[🚑 MODO RESGATE ATIVO (HP ${hp1} ➔ ${hp2}/100) | SAÍDA PROGRAMADA NO REPIQUE (+0.35% ROI)]`;
+        } else if (alvo.defesaLucroAtiva || (roiPuro >= 1.50 && hp2 < hp1 && hp2 <= 55)) {
+          hpBadge = `[🛡️ HP EM QUEDA (${hp1} ➔ ${hp2}/100) | DEFESA DE LUCRO ANTECIPADA ATIVA]`;
+        } else if (hp2 >= 60) {
+          hpBadge = `[💚 HP DA ORDEM: ${hp2}/100 (T1:${hp1} ➔ T2:${hp2}) | ESTRUTURA FIRME]`;
+        } else {
+          hpBadge = `[⚠️ HP DA ORDEM: ${hp2}/100 (T1:${hp1} ➔ T2:${hp2}) | MONITORANDO]`;
+        }
+
+        let statusBadge = hpBadge;
         if (alvo.beArmed && alvo.lockedRoi > 0) {
           const stopFmt = formatarPrecoAtivo(sym, alvo.beStopPrice);
-          statusBadge = `[🛡️ CATRACA +${alvo.lockedRoi.toFixed(2)}%: GARANTIDO ($${stopFmt}) | PICO +${maxRoi.toFixed(2)}%]`;
+          statusBadge += ` [🛡️ CATRACA +${alvo.lockedRoi.toFixed(2)}%: GARANTIDO ($${stopFmt}) | PICO +${maxRoi.toFixed(2)}%]`;
         } else {
-          statusBadge = `[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO: +${maxRoi.toFixed(2)}%)]`;
+          statusBadge += ` [🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO: +${maxRoi.toFixed(2)}%)]`;
         }
         if (duracaoMin > 40) {
-          const stopStr = (alvo.beArmed && alvo.lockedRoi > 0) ? `+${alvo.lockedRoi.toFixed(2)}%` : `${funil.slRoiDinamico.toFixed(2)}%`;
-          statusBadge += ` [⏳ FUNIL ${Math.floor(duracaoMin)}m: ALVO +${funil.tpRoiDinamico.toFixed(2)}% | STOP ${stopStr}]`;
+          const stopStr = (alvo.beArmed && alvo.lockedRoi > 0) ? `+${alvo.lockedRoi.toFixed(2)}%` : ((alvo.modoResgateAtivo && alvo.slResgateRoi) ? `${alvo.slResgateRoi.toFixed(2)}%` : `${funil.slRoiDinamico.toFixed(2)}%`);
+          const alvoStr = alvo.modoResgateAtivo ? '+0.35%' : `+${funil.tpRoiDinamico.toFixed(2)}%`;
+          statusBadge += ` [⏳ FUNIL ${Math.floor(duracaoMin)}m: ALVO ${alvoStr} | STOP ${stopStr}]`;
         }
         if (alvo.parcialExecutada) {
           statusBadge += ' [💰 50% NO BOLSO]';
@@ -1163,21 +1372,28 @@ setInterval(async () => {
         let deveFechar = false;
         let motivoFechamento = '';
 
-        // 1. Take Profit pelo Funil (>= tpRoiDinamico) ou TP Cheio Fixo
-        if (!deveFechar && (roi >= funil.tpRoiDinamico || (alvo.tpPrice && (isLong ? curPrice >= alvo.tpPrice : curPrice <= alvo.tpPrice)))) {
-          deveFechar = true;
-          const tpTag = duracaoMin > 40 ? 'TP_FUNIL_TEMPO' : 'TAKE PROFIT';
-          motivoFechamento = `[${tpTag}] ROI atingiu +${roi.toFixed(2)}% >= Alvo +${funil.tpRoiDinamico.toFixed(2)}% (Preço: $${formatarPrecoAtivo(sym, curPrice)} | Duração: ${Math.round(duracaoMin)}m)`;
+        // 1. Take Profit pelo Modo Resgate (+0.35% ROI), Funil Dinâmico ou TP Cheio Fixo
+        if (!deveFechar) {
+          if (alvo.modoResgateAtivo && roi >= (alvo.tpResgateRoi || 0.35)) {
+            deveFechar = true;
+            motivoFechamento = `[SAIDA_RESGATE_REPIQUE_HP] Alvo de Resgate atingido no repique (+${roi.toFixed(2)}% ROI >= +${(alvo.tpResgateRoi || 0.35).toFixed(2)}% | Taxas cobertas | Duração: ${Math.round(duracaoMin)}m)`;
+          } else if (roi >= funil.tpRoiDinamico || (alvo.tpPrice && (isLong ? curPrice >= alvo.tpPrice : curPrice <= alvo.tpPrice))) {
+            deveFechar = true;
+            const tpTag = duracaoMin > 40 ? 'TP_FUNIL_TEMPO' : 'TAKE PROFIT';
+            motivoFechamento = `[${tpTag}] ROI atingiu +${roi.toFixed(2)}% >= Alvo +${funil.tpRoiDinamico.toFixed(2)}% (Preço: $${formatarPrecoAtivo(sym, curPrice)} | Duração: ${Math.round(duracaoMin)}m)`;
+          }
         }
 
-        // 2. Stop Loss pelo Funil (só se Catraca ainda não estiver protegendo no lucro!)
+        // 2. Stop Loss pelo Funil / Resgate (só se Catraca ainda não estiver protegendo no lucro!)
         if (!deveFechar && (!alvo.beArmed || !alvo.lockedRoi || alvo.lockedRoi <= 0)) {
-          if (roi <= funil.slRoiDinamico || (alvo.slPrice && (isLong ? curPrice <= alvo.slPrice : curPrice >= alvo.slPrice))) {
+          const slLimite = (alvo.modoResgateAtivo && alvo.slResgateRoi) ? alvo.slResgateRoi : funil.slRoiDinamico;
+          const slTag = alvo.modoResgateAtivo ? 'SL_MODO_RESGATE_25%' : (duracaoMin > 40 ? 'SL_FUNIL_TEMPO' : 'STOP LOSS ATR');
+
+          if (roi <= slLimite || (!alvo.modoResgateAtivo && alvo.slPrice && (isLong ? curPrice <= alvo.slPrice : curPrice >= alvo.slPrice))) {
             slBreachedTicks[sym] = (slBreachedTicks[sym] || 0) + 1;
             if (slBreachedTicks[sym] >= 2) {
               deveFechar = true;
-              const slTag = duracaoMin > 40 ? 'SL_FUNIL_TEMPO' : 'STOP LOSS ATR';
-              motivoFechamento = `[${slTag}] ROI atingiu ${roi.toFixed(2)}% <= Stop ${funil.slRoiDinamico.toFixed(2)}% (Preço: $${formatarPrecoAtivo(sym, curPrice)} | Duração: ${Math.round(duracaoMin)}m | Ticks: 2)`;
+              motivoFechamento = `[${slTag}] ROI atingiu ${roi.toFixed(2)}% <= Stop ${slLimite.toFixed(2)}% (Preço: $${formatarPrecoAtivo(sym, curPrice)} | Duração: ${Math.round(duracaoMin)}m | Ticks: 2)`;
             }
           } else {
             slBreachedTicks[sym] = 0;
@@ -1215,45 +1431,49 @@ setInterval(async () => {
 
         // ── BLOCO 1.1: EXECUÇÃO DO FECHAMENTO COM PROTEÇÃO BLINDADA ──
         if (deveFechar) {
-          if (closingInProgress.has(sym) || (localAlvos[sym] && localAlvos[sym].fechando)) continue;
-          closingInProgress.add(sym);
-          if (localAlvos[sym]) {
-            localAlvos[sym].fechando = true;
-            localAlvos[sym].fechandoDesde = Date.now();
+          const symFechado = sym;
+          if (closingInProgress.has(symFechado) || (localAlvos[symFechado] && localAlvos[symFechado].fechando)) continue;
+          closingInProgress.add(symFechado);
+          closingStartedAt[symFechado] = Date.now();
+          if (localAlvos[symFechado]) {
+            localAlvos[symFechado].fechando = true;
+            localAlvos[symFechado].fechandoDesde = Date.now();
           }
-          const alvoBackup = { ...localAlvos[sym] };
-          delete localAlvos[sym];
-          delete maxPriceTracker[sym];
-          delete minPriceTracker[sym];
-          delete beBreachedTicks[sym];
-          delete slBreachedTicks[sym];
-          delete partialTicks[sym];
+          const alvoBackup = { ...localAlvos[symFechado] };
+          delete localAlvos[symFechado];
+          delete maxPriceTracker[symFechado];
+          delete minPriceTracker[symFechado];
+          delete beBreachedTicks[symFechado];
+          delete slBreachedTicks[symFechado];
+          delete partialTicks[symFechado];
           salvarAlvos();
 
           try {
-            console.log(`[FECHAMENTO QUANT] ${sym}: ${motivoFechamento}`);
-            await fut.cancelarTodasOrdens(sym);
-            await fut.fecharMercado(sym, pos.lado, pos.quantidade);
+            console.log(`[FECHAMENTO QUANT] ${symFechado}: ${motivoFechamento}`);
+            await fut.cancelarTodasOrdens(symFechado);
+            await fut.fecharMercado(symFechado, pos.lado, pos.quantidade);
 
-            const exitTipo = (motivoFechamento.includes('TP') || motivoFechamento.includes('TAKE PROFIT')) ? 'TP' :
+            const exitTipo = (motivoFechamento.includes('TP') || motivoFechamento.includes('TAKE PROFIT') || motivoFechamento.includes('RESGATE_REPIQUE')) ? 'TP' :
               ((motivoFechamento.includes('CATRACA') || motivoFechamento.includes('BREAKEVEN')) ? 'BREAKEVEN' :
               (motivoFechamento.includes('SL') ? 'SL' : 'TIMEOUT'));
 
+            const pnlBrutoTotal = pos.pnlNaoRealizado + (alvoBackup.pnlParcialBruto || 0);
+
             await rag.salvarSaidaRAG({
-              symbol: sym,
+              symbol: symFechado,
               exitPrice: curPrice,
               exitReason: exitTipo,
               roiPct: roi,
-              pnlUsdt: pos.pnlNaoRealizado
+              pnlUsdt: pnlBrutoTotal
             }).catch(() => {});
 
-            registrarDesfechoTrade(sym, exitTipo, roi, pos.pnlNaoRealizado);
+            registrarDesfechoTrade(symFechado, exitTipo, roi, pos.pnlNaoRealizado, alvoBackup);
 
-            gatekeeperVetoedUntil[sym] = Date.now() + 2700000;
-            console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${sym} fechou por ${exitTipo} (ROI: ${roi.toFixed(2)}%). Bloqueado por 45 minutos.`);
+            gatekeeperVetoedUntil[symFechado] = Date.now() + 2700000;
+            console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${symFechado} fechou por ${exitTipo} (ROI: ${roi.toFixed(2)}%). Bloqueado por 45 minutos.`);
 
             [1, 2].forEach(s => {
-              if (autoBotState.slots[s].symbol === sym) {
+              if (autoBotState.slots[s].symbol === symFechado) {
                 autoBotState.slots[s].symbol = null;
                 autoBotState.slots[s].side = null;
                 autoBotState.slots[s].targetSymbol = null;
@@ -1262,20 +1482,22 @@ setInterval(async () => {
               }
             });
           } catch(err) {
-            console.error(`[FECHAMENTO QUANT] Erro ao fechar ${sym}:`, err.message);
-            const posRest = await fut.posicao(sym).catch(() => null);
+            console.error(`[FECHAMENTO QUANT] Erro ao fechar ${symFechado}:`, err.message);
+            const posRest = await fut.posicao(symFechado).catch(() => null);
             if (posRest && posRest.quantidade > 0) {
-              localAlvos[sym] = alvoBackup;
+              localAlvos[symFechado] = alvoBackup;
               salvarAlvos();
             }
           } finally {
-            if (localAlvos[sym]) localAlvos[sym].fechando = false;
-            closingInProgress.delete(sym);
+            if (localAlvos[symFechado]) localAlvos[symFechado].fechando = false;
+            closingInProgress.delete(symFechado);
+            delete closingStartedAt[symFechado];
           }
         }
       } catch(e) {
         if (localAlvos[sym]) localAlvos[sym].fechando = false;
         closingInProgress.delete(sym);
+        delete closingStartedAt[sym];
       }
     }
   } finally {
@@ -1428,35 +1650,41 @@ setInterval(async () => {
               }
               const decisao30m = await avaliarPerdao30mMatematico(slot.symbol, pos, duracaoMin);
               if (decisao30m.fechar) {
-                if (closingInProgress.has(slot.symbol) || (localAlvos[slot.symbol] && localAlvos[slot.symbol].fechando)) {
+                const symFechado = slot?.symbol;
+                if (!symFechado || closingInProgress.has(symFechado) || (localAlvos[symFechado] && localAlvos[symFechado].fechando)) {
                   continue;
                 }
-                closingInProgress.add(slot.symbol);
-                if (localAlvos[slot.symbol]) localAlvos[slot.symbol].fechando = true;
+                closingInProgress.add(symFechado);
+                closingStartedAt[symFechado] = now;
+                if (localAlvos[symFechado]) localAlvos[symFechado].fechando = true;
+                const alvoBackup = localAlvos[symFechado] ? { ...localAlvos[symFechado] } : null;
                 try {
                   console.log(`[AUTOBOT-30M] Slot ${slotNum}: ${decisao30m.desc}! Fechando a mercado.`);
-                  await fut.cancelarTodasOrdens(slot.symbol);
-                  await fut.fecharMercado(slot.symbol, pos.lado, pos.quantidade);
+                  await fut.cancelarTodasOrdens(symFechado);
+                  await fut.fecharMercado(symFechado, pos.lado, pos.quantidade);
 
                   const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
                   const roiFinal = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
+                  const pnlBrutoTotal = pos.pnlNaoRealizado + (alvoBackup?.pnlParcialBruto || 0);
+
                   await rag.salvarSaidaRAG({
-                    symbol: slot.symbol,
+                    symbol: symFechado,
                     exitPrice: pos.precoMarca || pos.precoEntrada,
                     exitReason: decisao30m.motivo,
                     roiPct: roiFinal,
-                    pnlUsdt: pos.pnlNaoRealizado
+                    pnlUsdt: pnlBrutoTotal
                   }).catch(() => {});
 
-                  registrarDesfechoTrade(slot.symbol, decisao30m.motivo, roiFinal, pos.pnlNaoRealizado);
+                  registrarDesfechoTrade(symFechado, decisao30m.motivo, roiFinal, pos.pnlNaoRealizado, alvoBackup);
 
-                  delete localAlvos[slot.symbol];
-                  delete maxPriceTracker[slot.symbol];
-                  delete minPriceTracker[slot.symbol];
-                  delete beBreachedTicks[slot.symbol];
+                  delete localAlvos[symFechado];
+                  delete maxPriceTracker[symFechado];
+                  delete minPriceTracker[symFechado];
+                  delete beBreachedTicks[symFechado];
+                  delete slBreachedTicks[symFechado];
+                  delete partialTicks[symFechado];
                   salvarAlvos();
 
-                  const symFechado = slot.symbol;
                   gatekeeperVetoedUntil[symFechado] = now + 2700000; // Bloqueio 45 minutos (2700000ms)
                   console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${symFechado} fechado por estagnação 25m (${decisao30m.motivo}). Bloqueado por 45 minutos.`);
                   slot.symbol = null;
@@ -1466,7 +1694,8 @@ setInterval(async () => {
                   slot.status = 'PERDAO_COOLDOWN_45S';
                   autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 25m em ${symFechado}. Cooldown de 45m na moeda ativado.`;
                 } finally {
-                  closingInProgress.delete(slot.symbol);
+                  if (symFechado) closingInProgress.delete(symFechado);
+                  delete closingStartedAt[symFechado];
                 }
               }
             }
@@ -1505,35 +1734,41 @@ setInterval(async () => {
               }
               const decisao30m = await avaliarPerdao30mMatematico(slot.symbol, pos, duracaoMin);
               if (decisao30m.fechar) {
-                if (closingInProgress.has(slot.symbol) || (localAlvos[slot.symbol] && localAlvos[slot.symbol].fechando)) {
+                const symFechado = slot?.symbol;
+                if (!symFechado || closingInProgress.has(symFechado) || (localAlvos[symFechado] && localAlvos[symFechado].fechando)) {
                   continue;
                 }
-                closingInProgress.add(slot.symbol);
-                if (localAlvos[slot.symbol]) localAlvos[slot.symbol].fechando = true;
+                closingInProgress.add(symFechado);
+                closingStartedAt[symFechado] = now;
+                if (localAlvos[symFechado]) localAlvos[symFechado].fechando = true;
+                const alvoBackup = localAlvos[symFechado] ? { ...localAlvos[symFechado] } : null;
                 try {
                   console.log(`[AUTOBOT-30M] Slot ${slotNum}: ${decisao30m.desc}! Fechando a mercado.`);
-                  await fut.cancelarTodasOrdens(slot.symbol);
-                  await fut.fecharMercado(slot.symbol, pos.lado, pos.quantidade);
+                  await fut.cancelarTodasOrdens(symFechado);
+                  await fut.fecharMercado(symFechado, pos.lado, pos.quantidade);
 
                   const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
                   const roiFinal = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
+                  const pnlBrutoTotal = pos.pnlNaoRealizado + (alvoBackup?.pnlParcialBruto || 0);
+
                   await rag.salvarSaidaRAG({
-                    symbol: slot.symbol,
+                    symbol: symFechado,
                     exitPrice: pos.precoMarca || pos.precoEntrada,
                     exitReason: decisao30m.motivo,
                     roiPct: roiFinal,
-                    pnlUsdt: pos.pnlNaoRealizado
+                    pnlUsdt: pnlBrutoTotal
                   }).catch(() => {});
 
-                  registrarDesfechoTrade(slot.symbol, decisao30m.motivo, roiFinal, pos.pnlNaoRealizado);
+                  registrarDesfechoTrade(symFechado, decisao30m.motivo, roiFinal, pos.pnlNaoRealizado, alvoBackup);
 
-                  delete localAlvos[slot.symbol];
-                  delete maxPriceTracker[slot.symbol];
-                  delete minPriceTracker[slot.symbol];
-                  delete beBreachedTicks[slot.symbol];
+                  delete localAlvos[symFechado];
+                  delete maxPriceTracker[symFechado];
+                  delete minPriceTracker[symFechado];
+                  delete beBreachedTicks[symFechado];
+                  delete slBreachedTicks[symFechado];
+                  delete partialTicks[symFechado];
                   salvarAlvos();
 
-                  const symFechado = slot.symbol;
                   gatekeeperVetoedUntil[symFechado] = now + 2700000; // Bloqueio 45 minutos (2700000ms)
                   console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${symFechado} fechado por estagnação 25m (${decisao30m.motivo}). Bloqueado por 45 minutos.`);
                   slot.symbol = null;
@@ -1544,7 +1779,8 @@ setInterval(async () => {
                   autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 25m em ${symFechado}. Cooldown de 45m na moeda ativado.`;
                   continue;
                 } finally {
-                  closingInProgress.delete(slot.symbol);
+                  if (symFechado) closingInProgress.delete(symFechado);
+                  delete closingStartedAt[symFechado];
                 }
               }
             }
@@ -1821,6 +2057,16 @@ setInterval(async () => {
             slDistPct: (slDistExec / precoExec),
             slRoiInicial: slRoeExec,
             parcialExecutada: false,
+            pnlParcialBruto: 0,
+            pnlParcialLiquido: 0,
+            taxaParcial: 0,
+            hpLeitura1: 75,
+            hpLeitura2: 75,
+            lastHpCheck: now,
+            modoResgateAtivo: false,
+            defesaLucroAtiva: false,
+            tpResgateRoi: null,
+            slResgateRoi: null,
             beArmed: false,
             beStage: 0,
             beStopPrice: null,
@@ -2066,6 +2312,10 @@ app.get('/api/moeda/:symbol', async (req, res) => {
       lockedRoi: localAlvos[symbol]?.lockedRoi || 0,
       maxRoiReached: localAlvos[symbol]?.maxRoiReached || 0,
       parcialExecutada: !!localAlvos[symbol]?.parcialExecutada,
+      hpLeitura1: localAlvos[symbol]?.hpLeitura1 ?? 75,
+      hpLeitura2: localAlvos[symbol]?.hpLeitura2 ?? 75,
+      modoResgateAtivo: !!localAlvos[symbol]?.modoResgateAtivo,
+      pnlParcialLiquido: localAlvos[symbol]?.pnlParcialLiquido || 0,
       pricePrecision: fut.filtrosDe(symbol)?.pricePrecision ?? 4,
       pos
     });
@@ -2199,6 +2449,16 @@ app.post('/api/trade', async (req, res) => {
         slDistPct: (slDistMan / preco),
         slRoiInicial: slRoeMan,
         parcialExecutada: false,
+        pnlParcialBruto: 0,
+        pnlParcialLiquido: 0,
+        taxaParcial: 0,
+        hpLeitura1: 75,
+        hpLeitura2: 75,
+        lastHpCheck: Date.now(),
+        modoResgateAtivo: false,
+        defesaLucroAtiva: false,
+        tpResgateRoi: null,
+        slResgateRoi: null,
         beArmed: false,
         beStage: 0,
         beStopPrice: null,
@@ -2231,7 +2491,10 @@ app.post('/api/close', async (req, res) => {
 
     const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
     const roi = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
-    registrarDesfechoTrade(symbol, 'MANUAL_CLOSE', roi, pos.pnlNaoRealizado);
+    const alvoBackup = localAlvos[symbol] ? { ...localAlvos[symbol] } : null;
+    const pnlBrutoTotal = pos.pnlNaoRealizado + (alvoBackup?.pnlParcialBruto || 0);
+
+    registrarDesfechoTrade(symbol, 'MANUAL_CLOSE', roi, pos.pnlNaoRealizado, alvoBackup);
     gatekeeperVetoedUntil[symbol] = Date.now() + 2700000;
 
     await rag.salvarSaidaRAG({
@@ -2239,7 +2502,7 @@ app.post('/api/close', async (req, res) => {
       exitPrice: pos.precoMarca || pos.precoEntrada,
       exitReason: 'MANUAL_CLOSE',
       roiPct: roi,
-      pnlUsdt: pos.pnlNaoRealizado
+      pnlUsdt: pnlBrutoTotal
     }).catch(() => {});
 
     delete localAlvos[symbol];
@@ -3993,18 +4256,36 @@ app.get('/', (req, res) => {
 
     // Sincroniza posições ativas da Binance nos slots autônomos e limpa órfãs
     try {
+      // BLOCO 1.1: Limpeza atômica de travas de fechamento em memória no boot
+      closingInProgress.clear();
+
       const posAtivas = await fut.todasPosicoes();
       const posComQtd = (Array.isArray(posAtivas) ? posAtivas : []).filter(p => parseFloat(p.positionAmt) !== 0);
 
-      // BLOCO 1.3: Limpeza imediata de posições antigas travadas (MUSDT, BEAMXUSDT ou fora da WHITELIST_VIP)
+      // BLOCO 1.3: Limpeza imediata de posições antigas travadas (MUSDT, BEAMXUSDT, fora da WHITELIST_VIP ou zumbi antigo de QNTUSDT)
       for (const p of posComQtd) {
-        if (p.symbol === 'MUSDT' || p.symbol === 'BEAMXUSDT' || !WHITELIST_VIP.has(p.symbol)) {
+        const alvoExistente = localAlvos[p.symbol];
+        const duracaoBootMs = Date.now() - (alvoExistente?.openTime || p.atualizadoEm || Date.now());
+        const isZombieQNT = (p.symbol === 'QNTUSDT' && duracaoBootMs > 2 * 3600 * 1000);
+
+        if (p.symbol === 'MUSDT' || p.symbol === 'BEAMXUSDT' || !WHITELIST_VIP.has(p.symbol) || isZombieQNT) {
           console.warn(`[BOOT-LIMPEZA-ZUMBI] Encerrando posição travada/fora da whitelist no boot: ${p.symbol} (${p.lado} ${p.quantidade})`);
           await fut.cancelarTodasOrdens(p.symbol).catch(() => {});
           await fut.fecharMercado(p.symbol, p.lado, p.quantidade).catch(e => {
             console.error(`[BOOT] Erro ao fechar ${p.symbol}:`, e.message);
           });
+          const margem = p.margem || ((p.quantidade * p.precoEntrada) / (p.alavancagem || 1));
+          const roiFinal = margem > 0 ? (p.pnlNaoRealizado / margem) * 100 : 0;
+          await rag.salvarSaidaRAG({
+            symbol: p.symbol,
+            exitPrice: p.precoMarca || p.precoEntrada,
+            exitReason: isZombieQNT ? 'SL_FUNIL_TEMPO' : 'BOOT_CLEANUP',
+            roiPct: roiFinal,
+            pnlUsdt: p.pnlNaoRealizado + (alvoExistente?.pnlParcialBruto || 0)
+          }).catch(() => {});
+          registrarDesfechoTrade(p.symbol, isZombieQNT ? 'SL_FUNIL_TEMPO' : 'BOOT_CLEANUP', roiFinal, p.pnlNaoRealizado, alvoExistente);
           delete localAlvos[p.symbol];
+          gatekeeperVetoedUntil[p.symbol] = Date.now() + 2700000;
         }
       }
       salvarAlvos();
@@ -4038,6 +4319,16 @@ app.get('/', (req, res) => {
               slDistPct: 0.056 / alav,
               slRoiInicial: 5.60,
               parcialExecutada: false,
+              pnlParcialBruto: 0,
+              pnlParcialLiquido: 0,
+              taxaParcial: 0,
+              hpLeitura1: 75,
+              hpLeitura2: 75,
+              lastHpCheck: Date.now(),
+              modoResgateAtivo: false,
+              defesaLucroAtiva: false,
+              tpResgateRoi: null,
+              slResgateRoi: null,
               beArmed: false,
               beStage: 0,
               beStopPrice: null,
