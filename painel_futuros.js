@@ -168,6 +168,21 @@ function salvarPlacarStats() {
 
 const closedTradeEvents = new Map(); // symbol -> timestamp para travar duplicidades atômicas
 
+// BLOCO 1: Quarentena Anti-Revanche Pós-Loss de 3 Horas (180m)
+const LOSS_COOLDOWN_FILE = '/var/www/crypto/.symbol_loss_cooldown.json';
+let symbolLossCooldown = {};
+try {
+  if (fs.existsSync(LOSS_COOLDOWN_FILE)) {
+    symbolLossCooldown = JSON.parse(fs.readFileSync(LOSS_COOLDOWN_FILE, 'utf8'));
+  }
+} catch (e) {}
+
+function salvarLossCooldown() {
+  try {
+    fs.writeFileSync(LOSS_COOLDOWN_FILE, JSON.stringify(symbolLossCooldown, null, 2));
+  } catch(e) {}
+}
+
 function registrarDesfechoTrade(symbol, exitReason, roi, pnlUsdt, alvoContext = null) {
   if (!symbol) return;
   const agora = Date.now();
@@ -197,6 +212,9 @@ function registrarDesfechoTrade(symbol, exitReason, roi, pnlUsdt, alvoContext = 
     placarStats.wins = (placarStats.wins || 0) + 1;
   } else {
     placarStats.losses = (placarStats.losses || 0) + 1;
+    symbolLossCooldown[symbol] = Date.now() + 3 * 60 * 60 * 1000; // 180m (3 horas) de quarentena anti-revanche
+    salvarLossCooldown();
+    console.log(`[COOLDOWN-POS-LOSS-3H] ${symbol} registrou LOSS (${exitReason} | ROI ${roiNum.toFixed(2)}%). Quarentena anti-revanche ativada por 180 minutos (3h).`);
   }
   placarStats.total = (placarStats.wins || 0) + (placarStats.losses || 0);
   salvarPlacarStats();
@@ -285,6 +303,7 @@ function isSimboloValido(symbol) {
   if (!symbol.match(/^[A-Z0-9]+USDT$/)) return false;
   if (!WHITELIST_VIP.has(symbol)) return false;
   if (BLOQUEADOS_SYNTHETIC.some(b => symbol.startsWith(b))) return false;
+  if (symbolLossCooldown && symbolLossCooldown[symbol] && Date.now() < symbolLossCooldown[symbol]) return false;
   const f = fut.filtrosDe(symbol);
   if (!f) return false;
   if (!f.stepSize || !(f.minQty >= 0)) return false;
@@ -445,6 +464,21 @@ async function analisarEstruturaEMercado(symbol) {
 
     // Distância da EMA 21 (15m) em ATR
     const distEma21Atr = Math.abs(curPrice - ema21_15) / (atr15m || 1);
+
+    // Range das últimas 8 velas de 15m e posição percentual do preço (0% = fundo extremo, 100% = topo extremo)
+    const ult8Highs = p15.highs.slice(-8);
+    const ult8Lows = p15.lows.slice(-8);
+    const max8_15m = Math.max(...ult8Highs);
+    const min8_15m = Math.min(...ult8Lows);
+    const range8_15m = max8_15m - min8_15m;
+    const posRange8Pct = range8_15m > 0 ? ((curPrice - min8_15m) / range8_15m) * 100 : 50;
+
+    // Variação percentual das últimas 3 velas de 15m
+    const ult3Closes = p15.closes.slice(-3);
+    const ult3Opens = p15.opens.slice(-3);
+    const var3Velas15m = (ult3Opens.length >= 3 && ult3Opens[0] > 0)
+      ? (((ult3Closes[ult3Closes.length - 1] - ult3Opens[0]) / ult3Opens[0]) * 100).toFixed(2)
+      : '0.00';
 
     // ADX 14 (15m)
     const adxArr = ti.ADX.calculate({ period: 14, high: p15.highs, low: p15.lows, close: p15.closes });
@@ -612,18 +646,18 @@ async function analisarEstruturaEMercado(symbol) {
       motivoModo = `Pullback na EMA 21 (15m a ${distEma21Atr.toFixed(2)}x ATR) a favor da baixa`;
     }
 
-    // MODO B: IGNIÇÃO DE FLUXO / BREAKOUT (Momentum)
+    // MODO B: IGNIÇÃO DE FLUXO / BREAKOUT (Momentum) - Anti-Exaustão (dist EMA21 <= 1.15x ATR)
     if (!modoDetectado) {
-      if ((breakUp || (emasAlinhadasAlta && aptoLong)) && distEma21Atr <= 2.40 && rvol15m >= 1.30 && takerRatioVal >= 1.15) {
+      if ((breakUp || (emasAlinhadasAlta && aptoLong)) && distEma21Atr <= 1.15 && rvol15m >= 1.30 && takerRatioVal >= 1.15) {
         modoDetectado = 'MOMENTUM';
         modoLabel = 'MOMENTUM LONG';
         direcaoModo = 'LONG';
-        motivoModo = 'Rompimento de alta com RVOL >= 1.30x e agressão compradora no Taker >= 1.15';
-      } else if ((breakDown || (emasAlinhadasBaixa && aptoShort)) && distEma21Atr <= 2.40 && rvol15m >= 1.30 && takerRatioVal <= 0.85) {
+        motivoModo = 'Rompimento de alta com RVOL >= 1.30x e agressão compradora no Taker >= 1.15 (dist EMA21 <= 1.15x ATR)';
+      } else if ((breakDown || (emasAlinhadasBaixa && aptoShort)) && distEma21Atr <= 1.15 && rvol15m >= 1.30 && takerRatioVal <= 0.85) {
         modoDetectado = 'MOMENTUM';
         modoLabel = 'MOMENTUM SHORT';
         direcaoModo = 'SHORT';
-        motivoModo = 'Rompimento de baixa com RVOL >= 1.30x e agressão vendedora no Taker <= 0.85';
+        motivoModo = 'Rompimento de baixa com RVOL >= 1.30x e agressão vendedora no Taker <= 0.85 (dist EMA21 <= 1.15x ATR)';
       }
     }
 
@@ -785,9 +819,9 @@ async function analisarEstruturaEMercado(symbol) {
       tpRoe = 8.0;
     }
 
-    const beTriggerDist = curPrice * ((2.30 / leverageSugerida) / 100);
+    const beTriggerDist = curPrice * ((1.60 / leverageSugerida) / 100);
     const beTriggerPctReal = (beTriggerDist / curPrice) * 100;
-    const beTriggerRoe = 2.30;
+    const beTriggerRoe = 1.60;
     const beTriggerPrice = ladoOp === 'LONG' ? (curPrice + beTriggerDist) : (curPrice - beTriggerDist);
 
     const last5mOpenTime = (k5m && k5m.length > 0) ? k5m[k5m.length - 1][0] : 0;
@@ -804,6 +838,7 @@ async function analisarEstruturaEMercado(symbol) {
       ema9_1h, ema21_1h, ema50_1h, ema50_4h,
       atr15m, atrPct15m, atr5m, atrPct5m,
       distEma21Atr, distEmaText, distEmaColor,
+      posRange8Pct, max8_15m, min8_15m, var3Velas15m,
       adx15m, rvol15m, rsi15m,
       dir4h, dir1h, dir15m, dir5m,
       aptoLong, aptoShort, mtfStatus, mtfText,
@@ -829,6 +864,38 @@ async function verificarGatekeeper(dados, exigirConfirmacao5m = true) {
   // BLOCO 3.1: Whitelist VIP estrita
   if (!WHITELIST_VIP.has(dados.symbol)) {
     return { passou: false, motivo: `Gatekeeper: Moeda ${dados.symbol} fora da WHITELIST_VIP` };
+  }
+
+  // BLOCO 1: Quarentena Anti-Revanche Pós-Loss de 3 Horas (180m)
+  if (symbolLossCooldown && symbolLossCooldown[dados.symbol] && Date.now() < symbolLossCooldown[dados.symbol]) {
+    const restMin = Math.round((symbolLossCooldown[dados.symbol] - Date.now()) / 60000);
+    return { passou: false, motivo: `Gatekeeper [QUARENTENA PÓS-LOSS 3H]: Moeda ${dados.symbol} em quarentena pós-loss por mais ${restMin}m` };
+  }
+
+  // BLOCO 1: Exigência de Zona de Valor Real (distEma21Atr <= 1.20x ATR)
+  if (dados.distEma21Atr > 1.20) {
+    return { passou: false, motivo: `Gatekeeper [ZONA DE VALOR]: Preço esticado longe da EMA 21 (${dados.distEma21Atr.toFixed(2)}x > 1.20x ATR)` };
+  }
+
+  // BLOCO 1: Desativação Estrita de MOMENTUM Esticado (> 1.15x ATR)
+  if (dados.modoDetectado === 'MOMENTUM' && dados.distEma21Atr > 1.15) {
+    return { passou: false, motivo: `Gatekeeper [MOMENTUM ESTICADO]: Distância da EMA 21 (${dados.distEma21Atr.toFixed(2)}x > 1.15x ATR) veta entrada` };
+  }
+
+  // BLOCO 1: Filtro de RSI 15m (Proíbe LONG se rsi > 63, SHORT se rsi < 37)
+  if (dados.direcaoModo === 'LONG' && dados.rsi15m > 63) {
+    return { passou: false, motivo: `Gatekeeper [RSI EXAUSTO]: RSI 15m para LONG muito alto (${dados.rsi15m.toFixed(1)} > 63)` };
+  }
+  if (dados.direcaoModo === 'SHORT' && dados.rsi15m < 37) {
+    return { passou: false, motivo: `Gatekeeper [RSI EXAUSTO]: RSI 15m para SHORT muito baixo (${dados.rsi15m.toFixed(1)} < 37)` };
+  }
+
+  // BLOCO 1: Filtro Anti-Topo / Anti-Fundo (Range 8 Velas 15m)
+  if (dados.direcaoModo === 'LONG' && dados.posRange8Pct !== undefined && dados.posRange8Pct >= 85) {
+    return { passou: false, motivo: `Gatekeeper [TOPO 8 VELAS]: Preço nos 15% superiores do range das últimas 8 velas 15m (${dados.posRange8Pct.toFixed(1)}% >= 85%) sem pullback` };
+  }
+  if (dados.direcaoModo === 'SHORT' && dados.posRange8Pct !== undefined && dados.posRange8Pct <= 15) {
+    return { passou: false, motivo: `Gatekeeper [FUNDO 8 VELAS]: Preço nos 15% inferiores do range das últimas 8 velas 15m (${dados.posRange8Pct.toFixed(1)}% <= 15%) sem pullback` };
   }
 
   if (dados.flatCandles5m > 2) {
@@ -930,22 +997,53 @@ async function verificarGatekeeper(dados, exigirConfirmacao5m = true) {
   };
 }
 
-// ── DECISÃO QUANTITATIVA VIA GEMINI FLASH (ETAPA 6) ───────────────────
+// ── DECISÃO QUANTITATIVA VIA GEMINI FLASH (ETAPA 6 / JEV-AI ENTRADA) ──
 async function consultarGeminiQuant(symbol, dados) {
   if (!ROUTER_API_KEY) {
     console.error('[GEMINI-QUANT] Sem ROUTER_API_KEY');
-    return { action: 'WAIT', confidence: 0, reason_short: 'Sem chave 9Router' };
+    return { action: 'WAIT', aprovado: false, confidence: 0, reason_short: 'Sem chave 9Router' };
   }
 
-  const prompt = `Gestor Quant Futuros. Avalie setup em ${symbol}:
-Modo: ${dados.modoLabel || dados.modoDetectado} | Dir: ${dados.direcaoModo} | Score: ${dados.directionalScore}
-Preco: ${dados.curPrice} | MTF: 1h=${dados.dir1h === 'green' ? 'ALTA' : 'BAIXA'}, 15m=${dados.dir15m === 'green' ? 'ALTA' : 'BAIXA'}
-DistEMA21: ${dados.distEma21Atr.toFixed(2)}x ATR | ATR%: ${dados.atrPct15m.toFixed(2)}% | RSI15m: ${dados.rsi15m}
-ADX: ${dados.adx15m.toFixed(1)} | RVOL: ${dados.rvol15m.toFixed(2)}x | TakerRatio: ${dados.takerRatioVal.toFixed(2)} | DeltaOI: ${dados.deltaOI.toFixed(2)}%
-Alavancagem: ${dados.leverageSugerida}x | SL: ${dados.slPrice.toFixed(4)} | TP: ${dados.tpPrice.toFixed(4)}
-Diretriz: Se MTF e Score forem solidos e alinhados ao modo (${dados.modoLabel}), aprove (${dados.direcaoModo}) com confianca >= 65. Em PULLBACK taker moderado e normal na retracao; em MOMENTUM expansao e esperada no rompimento.
-Responda APENAS JSON:
-{"action":"LONG"|"SHORT"|"WAIT","confidence":0-100,"reason_short":"motivo max 10 palavras"}`;
+  // Histórico recente RAG da moeda específica
+  let ragHistTxt = 'Sem histórico recente';
+  try {
+    const parRows = await db.all(
+      `SELECT result, roi_pct, exit_reason FROM trades_rag 
+       WHERE symbol = ? AND result IS NOT NULL 
+       ORDER BY entry_time DESC LIMIT 4`,
+      [symbol]
+    );
+    if (parRows && parRows.length > 0) {
+      ragHistTxt = parRows.map(r => `${r.result} (${r.roi_pct > 0 ? '+' : ''}${Number(r.roi_pct).toFixed(1)}% via ${r.exit_reason})`).join(', ');
+    }
+  } catch(e) {}
+
+  const posRange8 = dados.posRange8Pct !== undefined ? `${dados.posRange8Pct.toFixed(1)}% (0%=fundo extremo, 100%=topo extremo)` : '50%';
+  const var3 = dados.var3Velas15m !== undefined ? `${dados.var3Velas15m}%` : '0.00%';
+
+  const prompt = `Você é o Gestor Quant Futuros Binance - JEV-AI Entrada Anti-Exaustão.
+Avalie este setup de entrada em ${symbol}:
+Modo: ${dados.modoLabel || dados.modoDetectado} | Dir: ${dados.direcaoModo} | Score Direcional: ${dados.directionalScore}
+Preço Atual: ${dados.curPrice} | MTF: 1h=${dados.dir1h === 'green' ? 'ALTA' : 'BAIXA'}, 15m=${dados.dir15m === 'green' ? 'ALTA' : 'BAIXA'}
+Distância EMA 21 (15m): ${dados.distEma21Atr.toFixed(2)}x ATR | ATR% 15m: ${dados.atrPct15m.toFixed(2)}% | RSI 15m: ${dados.rsi15m}
+Posição no Range das Últimas 8 Velas 15m: ${posRange8}
+Variação das Últimas 3 Velas 15m: ${var3}
+ADX 15m: ${dados.adx15m.toFixed(1)} | RVOL 15m: ${dados.rvol15m.toFixed(2)}x | TakerRatio: ${dados.takerRatioVal.toFixed(2)} | DeltaOI: ${dados.deltaOI.toFixed(2)}%
+Alavancagem Sugerida: ${dados.leverageSugerida}x | SL Inicial: ${dados.slPrice.toFixed(4)} | TP Inicial: ${dados.tpPrice.toFixed(4)}
+Histórico RAG recente de ${symbol}: ${ragHistTxt}
+
+DIRETRIZES EXECUTIVAS ANTI-EXAUSTÃO:
+1. VETE IMEDIATAMENTE ("aprovado": false, "action": "WAIT") qualquer compra de topo esticado (preço alto no range recente > 80% ou sem pullback prévio saudável na EMA 21).
+2. VETE IMEDIATAMENTE ("aprovado": false, "action": "WAIT") qualquer venda de fundo exausto (preço baixo no range recente < 20% ou após sequência de velas de despejo).
+3. Toda aprovação exige confluência técnica limpa, distância EMA 21 controlada e confiança >= 75. Em caso de dúvida ou esticada, vete.
+
+Responda APENAS JSON no formato exato:
+{
+  "action": "LONG" | "SHORT" | "WAIT",
+  "aprovado": true | false,
+  "confidence": 0-100,
+  "reason_short": "motivo direto em até 10 palavras"
+}`;
 
   try {
     const payload = {
@@ -976,7 +1074,7 @@ Responda APENAS JSON:
     return parsed;
   } catch(e) {
     console.error(`[GEMINI-QUANT] Erro ao consultar IA para ${symbol}:`, e.message);
-    return { action: 'WAIT', confidence: 0, reason_short: 'Falha na IA' };
+    return { action: 'WAIT', aprovado: false, confidence: 0, reason_short: 'Falha na IA' };
   }
 }
 
@@ -1024,7 +1122,7 @@ const slBreachedTicks = {};
 const partialTicks = {};
 
 // ── BLOCO 3: MOTOR GAMIFICADO DE SAÚDE DA ORDEM ABERTA (HP 0-100) ──
-function calcularHpOrdemAberta(alvo, analise) {
+function calcularHpOrdemAberta(alvo, analise, roiAtual = 0, duracaoMin = 0) {
   if (!alvo || !analise) return 70;
   const isLong = (alvo.side || '').toUpperCase() === 'LONG';
   let hp = 0;
@@ -1041,18 +1139,25 @@ function calcularHpOrdemAberta(alvo, analise) {
   if (precoEma50_15) hp += 15;
 
   // 2. Pilar 2 — Defesa da Zona de Valor (EMA 21 de 15m): Até 25 HP
-  const closes15 = analise.p15?.closes || [];
-  const lastClosed15m = closes15.length >= 2 ? closes15[closes15.length - 2] : (closes15[closes15.length - 1] || analise.curPrice);
+  // Penalidade 3: Se o preço ao vivo (curPrice/markPrice) estiver abaixo da EMA 21 (15m) no LONG (ou acima no SHORT), o Pilar 2 vale 0 HP imediatamente (sem lag de 30m)
   const ema21 = analise.ema21_15 || analise.curPrice;
-  const atr15 = analise.atr15m || (analise.curPrice * 0.01);
-  const distContraEma21 = isLong ? (ema21 - lastClosed15m) : (lastClosed15m - ema21);
+  const aoVivoContraEma21 = isLong ? (analise.curPrice < ema21) : (analise.curPrice > ema21);
 
-  if (distContraEma21 <= 0) {
-    hp += 25; // Fechou a favor da EMA 21
-  } else if (distContraEma21 <= 0.5 * atr15) {
-    hp += 12; // Violou por < 0.5x ATR (apenas teste de pavio/respiro)
+  if (aoVivoContraEma21) {
+    hp += 0; // Preço ao vivo rompeu contra a EMA 21: zero pontos sem esperar fechar vela!
   } else {
-    hp += 0;  // Rompimento contra por > 0.5x ATR
+    const closes15 = analise.p15?.closes || [];
+    const lastClosed15m = closes15.length >= 2 ? closes15[closes15.length - 2] : (closes15[closes15.length - 1] || analise.curPrice);
+    const atr15 = analise.atr15m || (analise.curPrice * 0.01);
+    const distContraEma21 = isLong ? (ema21 - lastClosed15m) : (lastClosed15m - ema21);
+
+    if (distContraEma21 <= 0) {
+      hp += 25; // Fechou a favor da EMA 21
+    } else if (distContraEma21 <= 0.5 * atr15) {
+      hp += 12; // Violou por < 0.5x ATR (apenas teste de pavio/respiro)
+    } else {
+      hp += 0;  // Rompimento contra por > 0.5x ATR
+    }
   }
 
   // 3. Pilar 3 — Fluxo e Agressão (Bússola Quant + Taker Ratio): Até 20 HP
@@ -1084,7 +1189,155 @@ function calcularHpOrdemAberta(alvo, analise) {
     hp += 8;
   }
 
+  // ── PENALIDADES REAIS DE DESEMPENHO DA ORDEM ABERTA ──
+  // 1. Penalidade de Drawdown Atual: Se roiAtual < 0, subtrai Math.round(Math.abs(roiAtual) * 9)
+  if (roiAtual < 0) {
+    const penDrawdown = Math.round(Math.abs(roiAtual) * 9);
+    hp -= penDrawdown;
+  }
+
+  // 2. Penalidade de "Entrada no Topo/Fundo Sem Tração" (MFE Nulo):
+  // Se duracaoMin >= 15 e alvo.maxRoiReached < 0.35%, subtrai 25 HP
+  const maxRoi = alvo.maxRoiReached || 0;
+  if (duracaoMin >= 15 && maxRoi < 0.35) {
+    hp -= 25;
+  }
+
   return Math.max(0, Math.min(100, hp));
+}
+
+// ── BLOCO 4: MOTOR JEV-AI GESTOR DE ORDEM ABERTA (VIA 9ROUTER LOCAL) ──
+async function consultarJevOrdemAberta(sym, alvo, pos, analise, curPrice, roiAtual, duracaoMin, hpAnt, hpAtual) {
+  if (!ROUTER_API_KEY) return null;
+  const isLong = pos.lado === 'LONG';
+  const entryPrice = parseFloat(pos.precoEntrada || alvo.entryPrice);
+  const alav = pos.alavancagem || alvo.leverage || 1;
+
+  try {
+    const k5Closes = analise.p5?.closes || [];
+    const k5Opens = analise.p5?.opens || [];
+    const k5Highs = analise.p5?.highs || [];
+    const k5Lows = analise.p5?.lows || [];
+    const ult5Velas = [];
+    const startIdx = Math.max(0, k5Closes.length - 5);
+    for (let i = startIdx; i < k5Closes.length; i++) {
+      ult5Velas.push({
+        o: k5Opens[i],
+        h: k5Highs[i],
+        l: k5Lows[i],
+        c: k5Closes[i]
+      });
+    }
+
+    const payloadOrdem = {
+      moeda: sym,
+      lado: pos.lado,
+      alavancagem: alav,
+      duracaoMin: Math.round(duracaoMin),
+      roiAtual: Number(roiAtual.toFixed(2)),
+      maxRoiReached: Number((alvo.maxRoiReached || 0).toFixed(2)),
+      minRoiReached: Number((alvo.minRoiReached || 0).toFixed(2)),
+      hp: `${hpAnt} -> ${hpAtual}/100`,
+      ultimas5Velas5m: ult5Velas,
+      distEma21_15m: Number((analise.distEma21Atr || 0).toFixed(2)),
+      takerRatio: Number((analise.takerRatioVal || 1.0).toFixed(2)),
+      bussolaScore: analise.directionalScore || 0
+    };
+
+    const prompt = `Você é o Motor JEV-AI Gestor de Ordem Aberta de Futuros Binance.
+Avalie esta posição aberta e tome a decisão executiva de gestão de risco:
+${JSON.stringify(payloadOrdem)}
+
+DIRETRIZES EXECUTIVAS:
+1. "MANTER": Posição com estrutura saudável (HP >= 60) ou respirando normalmente na direção do setup.
+2. "TRAVAR_LUCRO": Posição com lucro acumulado (ROI >= +1.30%), mas enfrentando resistência ou sinais de exaustão de microestrutura.
+3. "MODO_RESGATE": Posição em drawdown (ROI < 0) com momentum fraco ou estagnada sem tração, mas que ainda pode dar repique técnico para saída no zero a zero (+0.25% ROI). Encurta o Stop Loss dinâmico (sugira em novo_sl_roi entre -2.50% e -4.80%).
+4. "FECHAR_AGORA": Quebra estrutural irreversível (duração >= 15m, MFE < +0.20%, fluxo institucional despejando forte contra e ROI <= -2.50%). Cortar a mercado imediatamente como stop preventivo para economizar metade do Stop Loss.
+
+Responda APENAS um JSON no formato exato:
+{
+  "acao": "MANTER" | "TRAVAR_LUCRO" | "MODO_RESGATE" | "FECHAR_AGORA",
+  "novo_tp_roi": null,
+  "novo_sl_roi": null,
+  "motivo_curto": "motivo direto em até 10 palavras"
+}`;
+
+    const resp = await axios.post('http://127.0.0.1:20128/v1/chat/completions', {
+      model: 'ag/gemini-3.8-flash-low',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.1,
+      max_tokens: 250
+    }, {
+      headers: {
+        'Authorization': `Bearer ${ROUTER_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 25000
+    });
+
+    if (resp.data?.usage) {
+      registrarUsoTokens(resp.data.usage);
+    }
+
+    const raw = resp.data?.choices?.[0]?.message?.content?.trim() || '';
+    let jsonStr = raw;
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (jsonMatch) jsonStr = jsonMatch[0];
+    else jsonStr = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
+    const dec = JSON.parse(jsonStr);
+
+    if (dec && dec.acao) {
+      alvo.jevDecisao = {
+        acao: dec.acao,
+        motivo_curto: dec.motivo_curto || '',
+        hora: Date.now()
+      };
+
+      console.log(`[🤖 JEV-AI GESTOR] ${sym} (${pos.lado} | ROI: ${roiAtual.toFixed(2)}% | HP: ${hpAtual}/100): Decisão: ${dec.acao} - "${dec.motivo_curto}"`);
+
+      // ── Execução Automática da Decisão do JEV-AI ──
+      if (dec.acao === 'TRAVAR_LUCRO') {
+        if (roiAtual >= 1.30) {
+          if (!alvo.parcialExecutada) {
+            console.log(`[JEV-AI] TRAVAR_LUCRO: Executando Parcial 50% em ${sym} (ROI: +${roiAtual.toFixed(2)}%)`);
+            await executarParcial50(sym, alvo, pos, curPrice, 'JEV_AI_TRAVA_LUCRO');
+          }
+          alvo.beArmed = true;
+          const novoLocked = Math.max(alvo.lockedRoi || 0.50, Number((roiAtual - 0.50).toFixed(2)));
+          alvo.lockedRoi = novoLocked;
+          const beDist = entryPrice * ((alvo.lockedRoi / alav) / 100);
+          const calcStopPrice = isLong ? (entryPrice + beDist) : (entryPrice - beDist);
+          alvo.beStopPrice = alvo.beStopPrice ? (isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice)) : calcStopPrice;
+          salvarAlvos();
+        }
+      } else if (dec.acao === 'MODO_RESGATE') {
+        alvo.modoResgateAtivo = true;
+        alvo.tpResgateRoi = 0.25; // Alvo de saída no repique em +0.25% ROI
+        let slDefinido = -3.60;
+        if (dec.novo_sl_roi !== null && dec.novo_sl_roi !== undefined) {
+          const val = Number(dec.novo_sl_roi);
+          if (!isNaN(val)) {
+            const negVal = val < 0 ? val : -val;
+            slDefinido = Math.max(-4.80, Math.min(-2.50, negVal));
+          }
+        }
+        alvo.slResgateRoi = slDefinido;
+        salvarAlvos();
+        console.log(`[JEV-AI] MODO_RESGATE ${sym}: Saída no repique em +0.25% ROI | Stop encurtado para ${slDefinido.toFixed(2)}% ROI`);
+      } else if (dec.acao === 'FECHAR_AGORA') {
+        if (duracaoMin >= 15 && (alvo.maxRoiReached || 0) < 0.20 && roiAtual <= -2.50) {
+          alvo.fecharImediatoJev = true;
+          alvo.motivoFechamentoJev = `[JEV_AI_STOP_PREVENTIVO] ${dec.motivo_curto || 'Quebra estrutural irreversível'} (ROI: ${roiAtual.toFixed(2)}% | Duração: ${Math.round(duracaoMin)}m)`;
+          salvarAlvos();
+          console.log(`[JEV-AI] FECHAR_AGORA ativado para ${sym}: ${alvo.motivoFechamentoJev}`);
+        }
+      }
+      return dec;
+    }
+  } catch(errJev) {
+    console.error(`[JEV-AI GESTOR] Erro ao consultar IA para ${sym}:`, errJev.message);
+  }
+  return null;
 }
 
 // ── BLOCO 2: EXECUÇÃO E CONTABILIDADE DA PARCIAL DE 50% ──
@@ -1139,7 +1392,7 @@ async function avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracao
   const analise = await analisarEstruturaEMercado(sym).catch(() => null);
   if (!analise) return;
 
-  const hpAtual = calcularHpOrdemAberta(alvo, analise);
+  const hpAtual = calcularHpOrdemAberta(alvo, analise, roiPuro, duracaoMin);
   const hpAnt = alvo.hpLeitura2 !== undefined ? alvo.hpLeitura2 : (alvo.hpLeitura1 || hpAtual);
   alvo.hpLeitura1 = hpAnt;
   alvo.hpLeitura2 = hpAtual;
@@ -1151,10 +1404,23 @@ async function avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracao
 
   console.log(`[HP-AUDITORIA] ${sym} (${pos.lado} ${alav}x | Duração ${Math.round(duracaoMin)}m | ROI: ${roiPuro.toFixed(2)}%): Leitura HP T1:${hpAnt} ➔ T2:${hpAtual}/100`);
 
+  // ── MOTOR JEV-AI GESTOR DE ORDEM ABERTA (A CADA 3M OU QUEDA URGENTE) ──
+  if (duracaoMin >= 5) {
+    const tempoDesdeUltimoJev = agora - (alvo.lastJevAiCheck || 0);
+    const hpQuedaUrgente = hpAtual < 55;
+    const recuoDeLucro = (alvo.maxRoiReached >= 1.40) && (roiPuro <= (alvo.maxRoiReached - 0.50));
+    const precisaChamarJev = (tempoDesdeUltimoJev >= 180000) || ((hpQuedaUrgente || recuoDeLucro) && tempoDesdeUltimoJev >= 60000);
+
+    if (precisaChamarJev) {
+      alvo.lastJevAiCheck = agora;
+      await consultarJevOrdemAberta(sym, alvo, pos, analise, curPrice, roiPuro, duracaoMin, hpAnt, hpAtual);
+    }
+  }
+
   // ── CASO 1: Ordem no POSITIVO (roiPuro >= +1.50%) — Proteção Rápida do Lucro ──
   if (roiPuro >= 1.50) {
     const quedaGraveHp = (hpAtual < hpAnt) && (hpAtual <= 65 || (hpAnt - hpAtual) >= 25);
-    // Se ainda não executou parcial de +2.30%, mas pico >= +1.50% e queda de saúde confirmada (T2 <= 65 ou queda >= 25 pts)
+    // Se ainda não executou parcial de +2.20%, mas pico >= +1.50% e queda de saúde confirmada (T2 <= 65 ou queda >= 25 pts)
     if (!alvo.parcialExecutada && (alvo.maxRoiReached >= 1.50) && quedaGraveHp) {
       alvo.beArmed = true;
       alvo.lockedRoi = Math.max(alvo.lockedRoi || 0, 0.80);
@@ -1203,7 +1469,7 @@ async function avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracao
     else if (hpAnt <= 42 && hpAtual < hpAnt && hpAtual <= 32) {
       if (!alvo.modoResgateAtivo) {
         alvo.modoResgateAtivo = true;
-        alvo.tpResgateRoi = 0.35; // Alvo de saída no repique (+0.35% ROI para empate técnico com taxas)
+        alvo.tpResgateRoi = 0.25; // Alvo de saída no repique (+0.25% ROI para empate técnico com taxas)
         
         // Comprime o Stop Loss em 25% (ex: se era -5.60%, sobe para -4.20% ROI)
         const funil = calcularFunilTempo(alvo, duracaoMin);
@@ -1278,30 +1544,21 @@ setInterval(async () => {
         if (alvo.maxRoiReached === undefined || roi > alvo.maxRoiReached) {
           alvo.maxRoiReached = roi;
         }
+        if (alvo.minRoiReached === undefined || roi < alvo.minRoiReached) {
+          alvo.minRoiReached = roi;
+        }
         alvo.lastRoiPuro = roiPuro;
         const maxRoi = alvo.maxRoiReached || 0;
 
         // ── BLOCO 3 & 4: AVALIAÇÃO GAMIFICADA DE SAÚDE (HP 0-100 A CADA 120s) ──
         await avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracaoMin).catch(e => console.error(`[HP-ERRO] ${sym}:`, e.message));
 
-        // ── BLOCO 4.2: TIRO RÁPIDO AOS +2.30% ROI — PARCIAL DE 50% + TRAVA EM +1.20% ──
-        if (roiPuro >= 2.30) {
-          partialTicks[sym] = (partialTicks[sym] || 0) + 1;
-          if (partialTicks[sym] >= 2) {
-            // Armar trava em +1.20% ROI
-            alvo.beArmed = true;
-            alvo.lockedRoi = Math.max(alvo.lockedRoi || 0, 1.20);
-            const beDist = entryPrice * ((alvo.lockedRoi / alav) / 100);
-            const calcStopPrice = isLong ? (entryPrice + beDist) : (entryPrice - beDist);
-            if (!alvo.beStopPrice) {
-              alvo.beStopPrice = calcStopPrice;
-            } else {
-              alvo.beStopPrice = isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice);
-            }
-
-            // Realização Parcial de 50% com contabilidade unificada
-            if (!alvo.parcialExecutada) {
-              await executarParcial50(sym, alvo, pos, curPrice, 'TIRO_RAPIDO_230');
+        // ── BLOCO 4.2: TIRO RÁPIDO AOS +2.20% ROI — PARCIAL DE 50% ──
+        if (roiPuro >= 2.20 || alvo.maxRoiReached >= 2.20) {
+          if (!alvo.parcialExecutada) {
+            partialTicks[sym] = (partialTicks[sym] || 0) + 1;
+            if (partialTicks[sym] >= 2) {
+              await executarParcial50(sym, alvo, pos, curPrice, 'TIRO_RAPIDO_220');
             }
           }
         } else {
@@ -1312,24 +1569,22 @@ setInterval(async () => {
         const prevArmed = alvo.beArmed || false;
         const prevLockedRoi = alvo.lockedRoi || 0;
 
-        if (alvo.maxRoiReached < 2.30) {
-          // Abaixo de +2.30% de ROI: se Catraca não foi armada por Defesa de Lucro HP, mantém respiro
+        if (alvo.maxRoiReached < 1.60) {
+          // Abaixo de +1.60% de ROI: se Catraca não foi armada por Defesa de Lucro HP/JEV, mantém respiro
           if (!alvo.beArmed) {
             alvo.lockedRoi = 0;
             alvo.beStopPrice = null;
           }
         } else {
           alvo.beArmed = true;
-          let novoLocked = 1.20;
+          let novoLocked = 0.65;
           if (alvo.maxRoiReached >= 8.00) novoLocked = 8.00;
-          else if (alvo.maxRoiReached >= 7.10) novoLocked = 6.20;
-          else if (alvo.maxRoiReached >= 6.30) novoLocked = 5.30;
-          else if (alvo.maxRoiReached >= 5.50) novoLocked = 4.50;
+          else if (alvo.maxRoiReached >= 6.00) novoLocked = 5.00;
           else if (alvo.maxRoiReached >= 4.80) novoLocked = 3.80;
-          else if (alvo.maxRoiReached >= 4.20) novoLocked = 3.20;
-          else if (alvo.maxRoiReached >= 3.60) novoLocked = 2.50;
-          else if (alvo.maxRoiReached >= 3.00) novoLocked = 1.90;
-          else novoLocked = 1.20;
+          else if (alvo.maxRoiReached >= 3.80) novoLocked = 2.80;
+          else if (alvo.maxRoiReached >= 3.00) novoLocked = 1.95;
+          else if (alvo.maxRoiReached >= 2.20) novoLocked = 1.25;
+          else novoLocked = 0.65;
 
           alvo.lockedRoi = Math.max(alvo.lockedRoi || 0, novoLocked);
 
@@ -1355,14 +1610,18 @@ setInterval(async () => {
         const hp2 = alvo.hpLeitura2 ?? hp1;
         let hpBadge = '';
 
-        if (alvo.modoResgateAtivo) {
-          hpBadge = `[🚑 MODO RESGATE ATIVO (HP ${hp1} ➔ ${hp2}/100) | SAÍDA PROGRAMADA NO REPIQUE (+0.35% ROI)]`;
+        if (alvo.jevDecisao) {
+          hpBadge = `[🤖 JEV-AI: ${alvo.jevDecisao.acao} | "${alvo.jevDecisao.motivo_curto}" | HP: ${hp2}/100]`;
+        } else if (alvo.modoResgateAtivo) {
+          hpBadge = `[🚑 MODO RESGATE ATIVO (HP ${hp1} ➔ ${hp2}/100) | SAÍDA PROGRAMADA NO REPIQUE (+${(alvo.tpResgateRoi || 0.25).toFixed(2)}% ROI)]`;
         } else if (alvo.defesaLucroAtiva || (roiPuro >= 1.50 && hp2 < hp1 && (hp2 <= 65 || (hp1 - hp2) >= 25))) {
           hpBadge = `[🛡️ HP EM QUEDA (${hp1} ➔ ${hp2}/100) | DEFESA DE LUCRO ANTECIPADA ATIVA]`;
         } else if (hp2 >= 60) {
           hpBadge = `[💚 HP DA ORDEM: ${hp2}/100 (T1:${hp1} ➔ T2:${hp2}) | ESTRUTURA FIRME]`;
-        } else {
+        } else if (hp2 >= 35) {
           hpBadge = `[⚠️ HP DA ORDEM: ${hp2}/100 (T1:${hp1} ➔ T2:${hp2}) | MONITORANDO]`;
+        } else {
+          hpBadge = `[🚨 HP DA ORDEM: ${hp2}/100 (T1:${hp1} ➔ T2:${hp2}) | CRÍTICO]`;
         }
 
         let statusBadge = hpBadge;
@@ -1370,11 +1629,11 @@ setInterval(async () => {
           const stopFmt = formatarPrecoAtivo(sym, alvo.beStopPrice);
           statusBadge += ` [🛡️ CATRACA +${alvo.lockedRoi.toFixed(2)}%: GARANTIDO ($${stopFmt}) | PICO +${maxRoi.toFixed(2)}%]`;
         } else {
-          statusBadge += ` [🌱 RESPIRO LIVRE ATÉ +2.30% ROI (PICO: +${maxRoi.toFixed(2)}%)]`;
+          statusBadge += ` [🌱 RESPIRO LIVRE ATÉ +1.60% ROI (PICO: +${maxRoi.toFixed(2)}%)]`;
         }
         if (duracaoMin > 40) {
           const stopStr = (alvo.beArmed && alvo.lockedRoi > 0) ? `+${alvo.lockedRoi.toFixed(2)}%` : ((alvo.modoResgateAtivo && alvo.slResgateRoi) ? `${alvo.slResgateRoi.toFixed(2)}%` : `${funil.slRoiDinamico.toFixed(2)}%`);
-          const alvoStr = alvo.modoResgateAtivo ? '+0.35%' : `+${funil.tpRoiDinamico.toFixed(2)}%`;
+          const alvoStr = alvo.modoResgateAtivo ? `+${(alvo.tpResgateRoi || 0.25).toFixed(2)}%` : `+${funil.tpRoiDinamico.toFixed(2)}%`;
           statusBadge += ` [⏳ FUNIL ${Math.floor(duracaoMin)}m: ALVO ${alvoStr} | STOP ${stopStr}]`;
         }
         if (alvo.parcialExecutada) {
@@ -1386,11 +1645,17 @@ setInterval(async () => {
         let deveFechar = false;
         let motivoFechamento = '';
 
-        // 1. Take Profit pelo Modo Resgate (+0.35% ROI), Funil Dinâmico ou TP Cheio Fixo
+        // 0. Encerramento Preventivo JEV-AI
+        if (!deveFechar && alvo.fecharImediatoJev) {
+          deveFechar = true;
+          motivoFechamento = alvo.motivoFechamentoJev || `[JEV_AI_STOP_PREVENTIVO] Quebra estrutural via IA (ROI: ${roi.toFixed(2)}%)`;
+        }
+
+        // 1. Take Profit pelo Modo Resgate (+0.25% ROI), Funil Dinâmico ou TP Cheio Fixo
         if (!deveFechar) {
-          if (alvo.modoResgateAtivo && roi >= (alvo.tpResgateRoi || 0.35)) {
+          if (alvo.modoResgateAtivo && roi >= (alvo.tpResgateRoi || 0.25)) {
             deveFechar = true;
-            motivoFechamento = `[SAIDA_RESGATE_REPIQUE_HP] Alvo de Resgate atingido no repique (+${roi.toFixed(2)}% ROI >= +${(alvo.tpResgateRoi || 0.35).toFixed(2)}% | Taxas cobertas | Duração: ${Math.round(duracaoMin)}m)`;
+            motivoFechamento = `[SAIDA_RESGATE_REPIQUE_HP] Alvo de Resgate atingido no repique (+${roi.toFixed(2)}% ROI >= +${(alvo.tpResgateRoi || 0.25).toFixed(2)}% | Taxas cobertas | Duração: ${Math.round(duracaoMin)}m)`;
           } else if (roi >= funil.tpRoiDinamico || (alvo.tpPrice && (isLong ? curPrice >= alvo.tpPrice : curPrice <= alvo.tpPrice))) {
             deveFechar = true;
             const tpTag = duracaoMin > 40 ? 'TP_FUNIL_TEMPO' : 'TAKE PROFIT';
@@ -1468,7 +1733,9 @@ setInterval(async () => {
             await fut.fecharMercado(symFechado, pos.lado, pos.quantidade);
 
             let exitTipo = 'TIMEOUT';
-            if (motivoFechamento.includes('TP_FUNIL') || motivoFechamento.includes('TP_FUNIL_TEMPO')) {
+            if (motivoFechamento.includes('JEV_AI_STOP_PREVENTIVO')) {
+              exitTipo = 'JEV_AI_STOP_PREVENTIVO';
+            } else if (motivoFechamento.includes('TP_FUNIL') || motivoFechamento.includes('TP_FUNIL_TEMPO')) {
               exitTipo = 'TP_FUNIL_TEMPO';
             } else if (motivoFechamento.includes('TP') || motivoFechamento.includes('TAKE PROFIT')) {
               exitTipo = 'TP';
@@ -1556,6 +1823,7 @@ async function atualizarTopSetups() {
         const sym = t.symbol;
         if (!isSimboloValido(sym)) return false;
         if (vetadosSet.has(sym)) return false;
+        if (symbolLossCooldown && symbolLossCooldown[sym] && now < symbolLossCooldown[sym]) return false;
         if (gatekeeperVetoedUntil[sym] && now < gatekeeperVetoedUntil[sym]) return false;
         if (parseFloat(t.count || 0) <= 500) return false;
         const p24 = parseFloat(t.priceChangePercent || 0);
@@ -1825,6 +2093,7 @@ setInterval(async () => {
         !openingOrActiveSymbols.has(s.symbol) &&
         s.symbol !== outroMoedaAtiva &&
         s.symbol !== outroMoedaAlvo &&
+        (!symbolLossCooldown || !symbolLossCooldown[s.symbol] || now >= symbolLossCooldown[s.symbol]) &&
         (!gatekeeperVetoedUntil[s.symbol] || now >= gatekeeperVetoedUntil[s.symbol])
       );
 
@@ -1832,6 +2101,7 @@ setInterval(async () => {
         !openingOrActiveSymbols.has(s.symbol) &&
         s.symbol !== outroMoedaAtiva &&
         s.symbol !== outroMoedaAlvo &&
+        (!symbolLossCooldown || !symbolLossCooldown[s.symbol] || now >= symbolLossCooldown[s.symbol]) &&
         (!gatekeeperVetoedUntil[s.symbol] || now >= gatekeeperVetoedUntil[s.symbol])
       );
 
@@ -1934,7 +2204,7 @@ setInterval(async () => {
         evaluatedAt: now
       };
 
-      if ((dec.action === 'LONG' || dec.action === 'SHORT') && dec.confidence >= 65) {
+      if ((dec.action === 'LONG' || dec.action === 'SHORT') && dec.aprovado !== false && dec.confidence >= 75) {
         const ladoTrade = dec.action === 'LONG' ? 'BUY' : 'SELL';
         const alav = Math.min(5, Math.max(1, dec.leverage || dados.leverageSugerida));
         const valorUSDT = 10;
@@ -2069,7 +2339,7 @@ setInterval(async () => {
           }
           tpPrecoDefinido = dec.action === 'LONG' ? (precoExec + tpDistExec) : (precoExec - tpDistExec);
 
-          const beTriggerDist = precoExec * ((2.30 / alav) / 100);
+          const beTriggerDist = precoExec * ((1.60 / alav) / 100);
           const beTriggerPrice = dec.action === 'LONG' ? (precoExec + beTriggerDist) : (precoExec - beTriggerDist);
 
           console.log(`[ORDEM-EXECUTADA] Slot ${slotNum} (${cand}) [${modoTxt}]: ${dec.action} ${alav}x a ${formatarPrecoAtivo(cand, precoExec)} | Qty: ${filledQty} | SL: ${formatarPrecoAtivo(cand, slPrecoDefinido)} (-${slRoeExec.toFixed(1)}% ROI) | TP: ${formatarPrecoAtivo(cand, tpPrecoDefinido)}`);
@@ -2097,7 +2367,7 @@ setInterval(async () => {
             beArmed: false,
             beStage: 0,
             beStopPrice: null,
-            beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.30% ROI (PICO ATUAL: +0.00%)]',
+            beLabel: '[🌱 RESPIRO LIVRE ATÉ +1.60% ROI (PICO ATUAL: +0.00%)]',
             lockedRoi: 0,
             leverage: alav,
             quantidade: filledQty,
@@ -2399,6 +2669,7 @@ app.get('/api/ia-advise/:symbol', async (req, res) => {
       success: true,
       symbol,
       decisao: dec.action,
+      aprovado: dec.aprovado !== false,
       confianca: dec.confidence,
       alavancagem: dec.leverage || dados.leverageSugerida,
       slPrice: dados.slPrice,
@@ -2465,7 +2736,7 @@ app.post('/api/trade', async (req, res) => {
       }
       let tpCalc = lado === 'BUY' ? (preco + tpDistMan) : (preco - tpDistMan);
 
-      const beTriggerDist = preco * ((2.30 / alav) / 100);
+      const beTriggerDist = preco * ((1.60 / alav) / 100);
       const beTriggerPrice = lado === 'BUY' ? (preco + beTriggerDist) : (preco - beTriggerDist);
 
       localAlvos[symbol] = {
@@ -2490,7 +2761,7 @@ app.post('/api/trade', async (req, res) => {
         beArmed: false,
         beStage: 0,
         beStopPrice: null,
-        beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.30% ROI (PICO ATUAL: +0.00%)]',
+        beLabel: '[🌱 RESPIRO LIVRE ATÉ +1.60% ROI (PICO ATUAL: +0.00%)]',
         lockedRoi: 0,
         leverage: alav,
         quantidade: fill,
@@ -3616,7 +3887,7 @@ app.get('/', (req, res) => {
             const lockR = (data.lockedRoi || 0).toFixed(2);
             const stopP = data.beStopPrice ? ('$' + Number(data.beStopPrice).toFixed(prec)) : '';
 
-            if (data.maxRoiReached >= 2.30) {
+            if (data.maxRoiReached >= 1.60) {
               beEl.style.background = 'rgba(16, 185, 129, 0.22)';
               beEl.style.borderColor = 'var(--green)';
               beEl.style.color = 'var(--green)';
@@ -3625,7 +3896,7 @@ app.get('/', (req, res) => {
               beEl.style.background = 'rgba(255, 255, 255, 0.06)';
               beEl.style.borderColor = 'rgba(255, 255, 255, 0.2)';
               beEl.style.color = 'var(--gold)';
-              beEl.innerText = data.beLabel || ('[🌱 RESPIRO LIVRE ATÉ +2.30% ROI (PICO ATUAL: +' + maxR + '%)]');
+              beEl.innerText = data.beLabel || ('[🌱 RESPIRO LIVRE ATÉ +1.60% ROI (PICO ATUAL: +' + maxR + '%)]');
             }
           }
         } else {
@@ -4431,7 +4702,7 @@ app.get('/', (req, res) => {
               entryPrice: pEntrada,
               slPrice: isLong ? pEntrada * (1 - (5.60 / alav) / 100) : pEntrada * (1 + (5.60 / alav) / 100),
               tpPrice: isLong ? pEntrada * (1 + (8.00 / alav) / 100) : pEntrada * (1 - (8.00 / alav) / 100),
-              beTriggerPrice: isLong ? pEntrada * (1 + (2.30 / alav) / 100) : pEntrada * (1 - (2.30 / alav) / 100),
+              beTriggerPrice: isLong ? pEntrada * (1 + (1.60 / alav) / 100) : pEntrada * (1 - (1.60 / alav) / 100),
               slDistPct: 0.056 / alav,
               slRoiInicial: 5.60,
               parcialExecutada: false,
@@ -4448,7 +4719,7 @@ app.get('/', (req, res) => {
               beArmed: false,
               beStage: 0,
               beStopPrice: null,
-              beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.30% ROI (PICO ATUAL: +0.00%)]',
+              beLabel: '[🌱 RESPIRO LIVRE ATÉ +1.60% ROI (PICO ATUAL: +0.00%)]',
               lockedRoi: 0,
               leverage: p.alavancagem,
               maxRoiReached: 0,
