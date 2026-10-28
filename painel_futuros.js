@@ -45,6 +45,7 @@ const AUTOBOT_FILE = path.join(__dirname, '.auto_bot_config.json');
 const TOKENS_FILE = path.join(__dirname, '.tokens_usage.json');
 const PLACAR_FILE = path.join(__dirname, '.placar_stats.json');
 const MARCO_ZERO_FILE = path.join(__dirname, '.marco_zero_painel');
+const BASE_CAPITAL_FILE = path.join(__dirname, '.base_capital_ref.json');
 
 let marcoZero = 0;
 try {
@@ -56,6 +57,14 @@ if (!marcoZero) {
   marcoZero = Date.now();
   try { fs.writeFileSync(MARCO_ZERO_FILE, marcoZero.toString()); } catch(e){}
 }
+
+let baseCapitalReferencia = 20.0;
+try {
+  if (fs.existsSync(BASE_CAPITAL_FILE)) {
+    const b = JSON.parse(fs.readFileSync(BASE_CAPITAL_FILE, 'utf8'));
+    if (b && parseFloat(b.baseCapital) > 0) baseCapitalReferencia = parseFloat(b.baseCapital);
+  }
+} catch(e) {}
 
 
 // ── BLOCO 2.1: FUSO HORÁRIO OFICIAL DO BRASIL (UTC-3) ──
@@ -2177,10 +2186,11 @@ app.get('/api/saldo', async (req, res) => {
   }
 });
 
-// Retorno Líquido Base Capital (20 USDT = 2 slots x 10 USDT)
+// Retorno Líquido Base Capital (referência dinâmica sincronizada no reset)
 app.get('/api/base-capital-pnl', async (req, res) => {
   try {
     const hojeInicio = getInicioHojeBrasil();
+    const marcoRef = Math.max(hojeInicio, marcoZero || 0);
     const ontemInicio = hojeInicio - (24 * 60 * 60 * 1000);
     const ontemFim = hojeInicio - 1;
 
@@ -2194,7 +2204,7 @@ app.get('/api/base-capital-pnl', async (req, res) => {
       const val = parseFloat(r.income);
       if (r.symbol === 'HEMIUSDT') continue;
 
-      if (t >= hojeInicio) {
+      if (t >= marcoRef) {
         if (r.incomeType === 'REALIZED_PNL') { pnlBrutoHoje += val; countHoje++; }
         else if (r.incomeType === 'COMMISSION') { taxaHoje += val; }
         else if (r.incomeType === 'FUNDING_FEE') { fundingHoje += val; }
@@ -2208,7 +2218,7 @@ app.get('/api/base-capital-pnl', async (req, res) => {
     const pnlLiquidoHoje = pnlBrutoHoje + taxaHoje + fundingHoje;
     const pnlLiquidoOntem = pnlBrutoOntem + taxaOntem + fundingOntem;
 
-    const baseCapital = 20.0;
+    const baseCapital = baseCapitalReferencia || 20.0;
     const roiHoje = (pnlLiquidoHoje / baseCapital) * 100;
     const roiOntem = (pnlLiquidoOntem / baseCapital) * 100;
 
@@ -2217,7 +2227,7 @@ app.get('/api/base-capital-pnl', async (req, res) => {
       baseCapital,
       brl: brlGlobal,
       hoje: {
-        dataStr: new Date(hojeInicio).toLocaleDateString('pt-BR'),
+        dataStr: new Date(marcoRef).toLocaleDateString('pt-BR'),
         pnlBruto: pnlBrutoHoje,
         taxas: taxaHoje,
         funding: fundingHoje,
@@ -2623,12 +2633,38 @@ app.get('/api/win-loss', (req, res) => {
   });
 });
 
-app.post('/api/limpar-placar', (req, res) => {
-  placarStats = { wins: 0, losses: 0, total: 0 };
-  salvarPlacarStats();
-  marcoZero = Date.now();
-  try { fs.writeFileSync(MARCO_ZERO_FILE, marcoZero.toString()); } catch(e){}
-  res.json({ success: true, wins: 0, losses: 0, total: 0 });
+app.post('/api/limpar-placar', async (req, res) => {
+  try {
+    marcoZero = Date.now();
+    try { fs.writeFileSync(MARCO_ZERO_FILE, marcoZero.toString()); } catch(e){}
+
+    placarStats = { wins: 0, losses: 0, total: 0, pnlHoje: 0 };
+    salvarPlacarStats();
+
+    // Atualiza a Base Capital de referência para o saldo exato atual da Binance (/fapi/v2/account -> totalWalletBalance)
+    try {
+      const acc = await fut.assinado('get', '/fapi/v2/account').catch(() => null);
+      const walletBal = parseFloat(acc?.totalWalletBalance || acc?.totalMarginBalance || 0);
+      if (walletBal > 0) {
+        baseCapitalReferencia = walletBal;
+        try {
+          fs.writeFileSync(BASE_CAPITAL_FILE, JSON.stringify({ baseCapital: walletBal, timestamp: marcoZero }, null, 2));
+        } catch(e){}
+      }
+    } catch(e) {}
+
+    res.json({
+      success: true,
+      wins: 0,
+      losses: 0,
+      total: 0,
+      pnlHoje: 0,
+      marcoZero,
+      baseCapital: baseCapitalReferencia
+    });
+  } catch(err) {
+    res.json({ success: false, error: err.message });
+  }
 });
 
 app.get('/api/historico-completo', async (req, res) => {
@@ -2861,34 +2897,79 @@ app.get('/', (req, res) => {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      flex-wrap: wrap;
-      gap: 16px;
+      flex-wrap: nowrap;
+      gap: 12px;
       box-shadow: 0 4px 25px rgba(0,0,0,0.45);
     }
-    .header-stat-group { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
-    .stat-box { display: flex; flex-direction: column; gap: 4px; }
-    .stat-label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; font-weight: 700; }
-    .stat-value-gold { font-size: 1.55rem; font-weight: 900; color: var(--gold); letter-spacing: 0.5px; }
-    .stat-sub { font-size: 0.85rem; color: var(--blue); font-weight: 700; }
+    .header-stat-group {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      flex-wrap: nowrap;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .stat-box { display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; }
+    .stat-label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; font-weight: 700; white-space: nowrap; }
+    .stat-value-gold { font-size: 1.55rem; font-weight: 900; color: var(--gold); letter-spacing: 0.5px; white-space: nowrap; }
+    .stat-sub { font-size: 0.85rem; color: var(--blue); font-weight: 700; white-space: nowrap; }
 
-    /* PLACAR DE TRADES INSTITUCIONAL COM WIN RATE */
+    /* PLACAR DE TRADES INSTITUCIONAL COM WIN RATE (LARGURA FIXA RÍGIDA) */
     .placar-box {
       display: flex;
       align-items: center;
+      justify-content: center;
       gap: 8px;
       background: rgba(0,0,0,0.45);
       border: 1px solid var(--border);
-      padding: 8px 16px;
+      padding: 8px 12px;
       border-radius: 12px;
+      flex: 0 0 295px;
+      width: 295px;
+      min-width: 295px;
+      max-width: 295px;
+      box-sizing: border-box;
     }
-    .badge-win { font-size: 1rem; font-weight: 800; color: var(--green); background: rgba(16,185,129,0.2); border: 1px solid rgba(16,185,129,0.4); padding: 4px 10px; border-radius: 6px; }
-    .badge-loss { font-size: 1rem; font-weight: 800; color: var(--red); background: rgba(239,68,68,0.2); border: 1px solid rgba(239,68,68,0.4); padding: 4px 10px; border-radius: 6px; }
-    .badge-wr { font-size: 0.8rem; font-weight: 800; color: var(--gold); background: rgba(212,175,55,0.18); border: 1px solid rgba(212,175,55,0.35); padding: 4px 10px; border-radius: 6px; }
-    .btn-zerar { padding: 4px 10px; font-size: 0.72rem; background: rgba(255,255,255,0.08); border: 1px solid var(--border); color: var(--text-muted); border-radius: 6px; cursor: pointer; font-weight: 800; transition: 0.2s; }
-    .btn-zerar:hover { background: rgba(255,255,255,0.16); color: #FFF; }
+    .placar-box .stat-label { flex-shrink: 0; margin-right: 2px; }
+    .badge-win { font-size: 0.95rem; font-weight: 800; color: var(--green); background: rgba(16,185,129,0.2); border: 1px solid rgba(16,185,129,0.4); padding: 4px 6px; border-radius: 6px; flex: 0 0 46px; width: 46px; text-align: center; }
+    .badge-loss { font-size: 0.95rem; font-weight: 800; color: var(--red); background: rgba(239,68,68,0.2); border: 1px solid rgba(239,68,68,0.4); padding: 4px 6px; border-radius: 6px; flex: 0 0 46px; width: 46px; text-align: center; }
+    .badge-wr { font-size: 0.8rem; font-weight: 800; color: var(--gold); background: rgba(212,175,55,0.18); border: 1px solid rgba(212,175,55,0.35); padding: 4px 6px; border-radius: 6px; flex: 0 0 58px; width: 58px; text-align: center; }
+    .btn-zerar {
+      padding: 5px 8px;
+      font-size: 0.72rem;
+      background: rgba(239,68,68,0.15);
+      border: 1px solid rgba(239,68,68,0.4);
+      color: var(--red);
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 800;
+      transition: 0.2s;
+      flex: 0 0 54px;
+      width: 54px;
+      text-align: center;
+    }
+    .btn-zerar:hover { background: var(--red); color: #FFF; }
 
-    .header-btns { display: flex; gap: 10px; }
-    .header-btns button { padding: 10px 16px; font-size: 0.85rem; background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--text); border-radius: 10px; cursor: pointer; font-weight: 700; transition: 0.2s; }
+    .header-btns {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: nowrap;
+      flex-shrink: 0;
+    }
+    .header-btns button {
+      padding: 10px 16px;
+      font-size: 0.85rem;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 10px;
+      cursor: pointer;
+      font-weight: 700;
+      transition: 0.2s;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
     .header-btns button:hover { background: rgba(255,255,255,0.14); border-color: rgba(255,255,255,0.25); }
 
     /* CARROSSEL SUPERIOR DE MOEDAS */
@@ -3074,10 +3155,12 @@ app.get('/', (req, res) => {
     .trade-pnl { font-size: 1.15rem; font-weight: 900; }
     .trade-fee { font-size: 0.72rem; color: var(--text-muted); }
 
-    @media (max-width: 820px) {
+    @media (max-width: 960px) {
       .grid { grid-template-columns: 1fr; }
-      .perf-header-bar { flex-direction: column; text-align: center; }
-      .header-stat-group { justify-content: center; }
+      .perf-header-bar { flex-direction: column; text-align: center; flex-wrap: wrap; }
+      .header-stat-group { justify-content: center; flex-wrap: wrap; }
+      .header-btns { justify-content: center; flex-wrap: wrap; }
+      .placar-box { flex: 0 0 auto; width: auto; min-width: auto; max-width: none; }
       .hist-summary-grid { grid-template-columns: 1fr; }
     }
   </style>
@@ -3749,7 +3832,7 @@ app.get('/', (req, res) => {
     }
 
     async function zerarPlacar() {
-      if (!(await askConfirm('Zerar Placar', 'Deseja reiniciar a contagem de acertos e erros a partir deste momento?'))) return;
+      if (!(await askConfirm('⚠️ Reset Total de Ciclo', 'Deseja ZERAR o placar, marco zero e atualizar a Base Capital com o saldo atual da Binance?'))) return;
       try {
         const r = await fetch('/api/limpar-placar', { method: 'POST' });
         const d = await r.json();
@@ -3758,8 +3841,12 @@ app.get('/', (req, res) => {
           document.getElementById('placar-losses').innerText = '0 L';
           const wrEl = document.getElementById('placar-wr');
           if (wrEl) wrEl.innerText = '0% WR';
+          historicoMarcoZero = d.marcoZero || Date.now();
           carregarSaldo();
-          askConfirm('✓ Sucesso', 'Placar zerado com sucesso.', true);
+          carregarPlacar();
+          if (typeof carregarBaseCapital === 'function') carregarBaseCapital();
+          if (typeof carregarHistoricoCompleto === 'function') carregarHistoricoCompleto();
+          askConfirm('✓ Sucesso', 'Ciclo resetado com sucesso! Placar, Marco Zero e Base Capital sincronizados.', true);
         }
       } catch(e) {}
     }
@@ -4141,20 +4228,19 @@ app.get('/', (req, res) => {
       }
 
       if (abaAtualHist === 'hoje') {
-        const spHojeStr = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+        const marcoRef = historicoMarcoZero || 0;
         const hojeTrades = todosTradesCache.filter(g => {
           const t = g.time || g.entryTime;
-          if (!t) return false;
-          return new Date(t).toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' }) === spHojeStr;
+          return t && (t >= marcoRef);
         });
-        container.innerHTML = renderAbaComResumo(hojeTrades, 'Hoje', 'Operações de Hoje');
+        container.innerHTML = renderAbaComResumo(hojeTrades, 'Hoje', 'Operações do Ciclo Atual (Hoje)');
       } else if (abaAtualHist === 'todas') {
         container.innerHTML = renderAbaComResumo(todosTradesCache, 'Todas', 'Todas as Operações');
       } else {
         const cicloTrades = (historicoMarcoZero && historicoMarcoZero > 0)
           ? todosTradesCache.filter(g => g.time >= historicoMarcoZero)
-          : todosTradesCache.slice(0, 35);
-        const listaPeriodo = cicloTrades.length > 0 ? cicloTrades : todosTradesCache.slice(0, 35);
+          : [];
+        const listaPeriodo = cicloTrades.length > 0 ? cicloTrades : [];
         container.innerHTML = renderAbaComResumo(listaPeriodo, 'Ciclo Atual', 'Operações do Ciclo Atual');
       }
     }
