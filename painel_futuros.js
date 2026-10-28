@@ -776,9 +776,9 @@ async function analisarEstruturaEMercado(symbol) {
       tpRoe = 8.0;
     }
 
-    const beTriggerDist = curPrice * ((2.60 / leverageSugerida) / 100);
+    const beTriggerDist = curPrice * ((2.30 / leverageSugerida) / 100);
     const beTriggerPctReal = (beTriggerDist / curPrice) * 100;
-    const beTriggerRoe = 2.60;
+    const beTriggerRoe = 2.30;
     const beTriggerPrice = ladoOp === 'LONG' ? (curPrice + beTriggerDist) : (curPrice - beTriggerDist);
 
     const last5mOpenTime = (k5m && k5m.length > 0) ? k5m[k5m.length - 1][0] : 0;
@@ -1144,19 +1144,20 @@ async function avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracao
 
   // ── CASO 1: Ordem no POSITIVO (roiPuro >= +1.50%) — Proteção Rápida do Lucro ──
   if (roiPuro >= 1.50) {
-    // Se ainda não executou parcial de +2.60%, mas pico >= +1.60% e queda de saúde confirmada (T2 < T1 e T2 <= 55)
-    if (!alvo.parcialExecutada && (alvo.maxRoiReached >= 1.60) && (hpAtual < hpAnt && hpAtual <= 55)) {
+    const quedaGraveHp = (hpAtual < hpAnt) && (hpAtual <= 65 || (hpAnt - hpAtual) >= 25);
+    // Se ainda não executou parcial de +2.30%, mas pico >= +1.50% e queda de saúde confirmada (T2 <= 65 ou queda >= 25 pts)
+    if (!alvo.parcialExecutada && (alvo.maxRoiReached >= 1.50) && quedaGraveHp) {
       alvo.beArmed = true;
       alvo.lockedRoi = Math.max(alvo.lockedRoi || 0, 0.80);
       const beDist = entryPrice * ((alvo.lockedRoi / alav) / 100);
       const calcStopPrice = isLong ? (entryPrice + beDist) : (entryPrice - beDist);
       alvo.beStopPrice = alvo.beStopPrice ? (isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice)) : calcStopPrice;
       alvo.defesaLucroAtiva = true;
-      console.log(`[🛡️ DEFESA LUCRO ANTECIPADA] ${sym}: Catraca antecipada para +0.80% ROI devido à queda de HP (${hpAnt} ➔ ${hpAtual}) com pico de +${alvo.maxRoiReached.toFixed(2)}%`);
+      console.log(`[🛡️ DEFESA LUCRO ANTECIPADA] ${sym}: Catraca antecipada para +0.80% ROI devido à queda de HP (${hpAnt} ➔ ${hpAtual} | ΔHP: ${hpAnt - hpAtual}) com pico de +${alvo.maxRoiReached.toFixed(2)}%`);
 
-      // Se roiPuro >= +1.85%, antecipa e executa Parcial de 50% imediatamente!
-      if (roiPuro >= 1.85) {
-        console.log(`[🛡️ PARCIAL 50% ANTECIPADA POR QUEDA DE HP (T1:${hpAnt} ➔ T2:${hpAtual})] ${sym}: ROI +${roiPuro.toFixed(2)}% >= +1.85%`);
+      // Se roiPuro >= +1.75%, antecipa e executa Parcial de 50% imediatamente!
+      if (roiPuro >= 1.75) {
+        console.log(`[🛡️ PARCIAL 50% ANTECIPADA POR QUEDA DE HP (T1:${hpAnt} ➔ T2:${hpAtual})] ${sym}: ROI +${roiPuro.toFixed(2)}% >= +1.75%`);
         await executarParcial50(sym, alvo, pos, curPrice, `ANTECIPADA_HP_${hpAnt}_${hpAtual}`);
       }
     }
@@ -1274,8 +1275,8 @@ setInterval(async () => {
         // ── BLOCO 3 & 4: AVALIAÇÃO GAMIFICADA DE SAÚDE (HP 0-100 A CADA 120s) ──
         await avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracaoMin).catch(e => console.error(`[HP-ERRO] ${sym}:`, e.message));
 
-        // ── BLOCO 4.2: TIRO RÁPIDO AOS +2.60% ROI — PARCIAL DE 50% + TRAVA EM +1.20% ──
-        if (roiPuro >= 2.60) {
+        // ── BLOCO 4.2: TIRO RÁPIDO AOS +2.30% ROI — PARCIAL DE 50% + TRAVA EM +1.20% ──
+        if (roiPuro >= 2.30) {
           partialTicks[sym] = (partialTicks[sym] || 0) + 1;
           if (partialTicks[sym] >= 2) {
             // Armar trava em +1.20% ROI
@@ -1291,7 +1292,7 @@ setInterval(async () => {
 
             // Realização Parcial de 50% com contabilidade unificada
             if (!alvo.parcialExecutada) {
-              await executarParcial50(sym, alvo, pos, curPrice, 'TIRO_RAPIDO_260');
+              await executarParcial50(sym, alvo, pos, curPrice, 'TIRO_RAPIDO_230');
             }
           }
         } else {
@@ -1302,8 +1303,8 @@ setInterval(async () => {
         const prevArmed = alvo.beArmed || false;
         const prevLockedRoi = alvo.lockedRoi || 0;
 
-        if (alvo.maxRoiReached < 2.60) {
-          // Abaixo de +2.60% de ROI: se Catraca não foi armada por Defesa de Lucro HP, mantém respiro
+        if (alvo.maxRoiReached < 2.30) {
+          // Abaixo de +2.30% de ROI: se Catraca não foi armada por Defesa de Lucro HP, mantém respiro
           if (!alvo.beArmed) {
             alvo.lockedRoi = 0;
             alvo.beStopPrice = null;
@@ -1311,10 +1312,14 @@ setInterval(async () => {
         } else {
           alvo.beArmed = true;
           let novoLocked = 1.20;
-          if (alvo.maxRoiReached >= 7.20) novoLocked = 6.00;
-          else if (alvo.maxRoiReached >= 6.20) novoLocked = 4.80;
-          else if (alvo.maxRoiReached >= 5.00) novoLocked = 3.50;
-          else if (alvo.maxRoiReached >= 3.80) novoLocked = 2.20;
+          if (alvo.maxRoiReached >= 8.00) novoLocked = 8.00;
+          else if (alvo.maxRoiReached >= 7.10) novoLocked = 6.20;
+          else if (alvo.maxRoiReached >= 6.30) novoLocked = 5.30;
+          else if (alvo.maxRoiReached >= 5.50) novoLocked = 4.50;
+          else if (alvo.maxRoiReached >= 4.80) novoLocked = 3.80;
+          else if (alvo.maxRoiReached >= 4.20) novoLocked = 3.20;
+          else if (alvo.maxRoiReached >= 3.60) novoLocked = 2.50;
+          else if (alvo.maxRoiReached >= 3.00) novoLocked = 1.90;
           else novoLocked = 1.20;
 
           alvo.lockedRoi = Math.max(alvo.lockedRoi || 0, novoLocked);
@@ -1343,7 +1348,7 @@ setInterval(async () => {
 
         if (alvo.modoResgateAtivo) {
           hpBadge = `[🚑 MODO RESGATE ATIVO (HP ${hp1} ➔ ${hp2}/100) | SAÍDA PROGRAMADA NO REPIQUE (+0.35% ROI)]`;
-        } else if (alvo.defesaLucroAtiva || (roiPuro >= 1.50 && hp2 < hp1 && hp2 <= 55)) {
+        } else if (alvo.defesaLucroAtiva || (roiPuro >= 1.50 && hp2 < hp1 && (hp2 <= 65 || (hp1 - hp2) >= 25))) {
           hpBadge = `[🛡️ HP EM QUEDA (${hp1} ➔ ${hp2}/100) | DEFESA DE LUCRO ANTECIPADA ATIVA]`;
         } else if (hp2 >= 60) {
           hpBadge = `[💚 HP DA ORDEM: ${hp2}/100 (T1:${hp1} ➔ T2:${hp2}) | ESTRUTURA FIRME]`;
@@ -1356,7 +1361,7 @@ setInterval(async () => {
           const stopFmt = formatarPrecoAtivo(sym, alvo.beStopPrice);
           statusBadge += ` [🛡️ CATRACA +${alvo.lockedRoi.toFixed(2)}%: GARANTIDO ($${stopFmt}) | PICO +${maxRoi.toFixed(2)}%]`;
         } else {
-          statusBadge += ` [🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO: +${maxRoi.toFixed(2)}%)]`;
+          statusBadge += ` [🌱 RESPIRO LIVRE ATÉ +2.30% ROI (PICO: +${maxRoi.toFixed(2)}%)]`;
         }
         if (duracaoMin > 40) {
           const stopStr = (alvo.beArmed && alvo.lockedRoi > 0) ? `+${alvo.lockedRoi.toFixed(2)}%` : ((alvo.modoResgateAtivo && alvo.slResgateRoi) ? `${alvo.slResgateRoi.toFixed(2)}%` : `${funil.slRoiDinamico.toFixed(2)}%`);
@@ -1453,9 +1458,25 @@ setInterval(async () => {
             await fut.cancelarTodasOrdens(symFechado);
             await fut.fecharMercado(symFechado, pos.lado, pos.quantidade);
 
-            const exitTipo = (motivoFechamento.includes('TP') || motivoFechamento.includes('TAKE PROFIT') || motivoFechamento.includes('RESGATE_REPIQUE')) ? 'TP' :
-              ((motivoFechamento.includes('CATRACA') || motivoFechamento.includes('BREAKEVEN')) ? 'BREAKEVEN' :
-              (motivoFechamento.includes('SL') ? 'SL' : 'TIMEOUT'));
+            let exitTipo = 'TIMEOUT';
+            if (motivoFechamento.includes('TP_FUNIL') || motivoFechamento.includes('TP_FUNIL_TEMPO')) {
+              exitTipo = 'TP_FUNIL_TEMPO';
+            } else if (motivoFechamento.includes('TP') || motivoFechamento.includes('TAKE PROFIT')) {
+              exitTipo = 'TP';
+            } else if (motivoFechamento.includes('RESGATE_REPIQUE') || motivoFechamento.includes('SAIDA_RESGATE_REPIQUE_HP')) {
+              exitTipo = 'SAIDA_RESGATE_REPIQUE_HP';
+            } else if (motivoFechamento.includes('CATRACA')) {
+              const lockVal = alvoBackup?.lockedRoi ? Number(alvoBackup.lockedRoi).toFixed(1) : '1.2';
+              exitTipo = alvoBackup?.parcialExecutada ? `CATRACA_PARCIAL (+${lockVal}%)` : `CATRACA (+${lockVal}%)`;
+            } else if (motivoFechamento.includes('SL_MODO_RESGATE')) {
+              exitTipo = 'SL_MODO_RESGATE_25%';
+            } else if (motivoFechamento.includes('SL_FUNIL')) {
+              exitTipo = 'SL_FUNIL_TEMPO';
+            } else if (motivoFechamento.includes('SL') || motivoFechamento.includes('STOP LOSS')) {
+              exitTipo = 'SL';
+            } else if (motivoFechamento.includes('FUNDING')) {
+              exitTipo = 'SAIDA_PROTECAO_FUNDING';
+            }
 
             const pnlBrutoTotal = pos.pnlNaoRealizado + (alvoBackup.pnlParcialBruto || 0);
 
@@ -1505,88 +1526,60 @@ setInterval(async () => {
   }
 }, 1500);
 
-// ── SCANNER INTELIGENTE DE CANDIDATOS DO CARROSSEL ───────────────────
+// ── SCANNER INTELIGENTE DE CANDIDATOS DA WHITELIST VIP ───────────────────
 let topCandidatosComSetup = [];
+let todasAvaliadasWhitelist = [];
 let ultimoScanSetups = 0;
 
 async function atualizarTopSetups() {
   const now = Date.now();
-  if (now - ultimoScanSetups < 20000 && topCandidatosComSetup.length > 0) {
-    return topCandidatosComSetup;
+  if (now - ultimoScanSetups < 20000 && (topCandidatosComSetup.length > 0 || todasAvaliadasWhitelist.length > 0)) {
+    return { setups: topCandidatosComSetup, avaliadas: todasAvaliadasWhitelist };
   }
   try {
     const volData = await fut.ticker24h().catch(() => []);
     const vetados = await rag.consultarParesVetados(45).catch(() => []);
     const vetadosSet = new Set(vetados.map(v => v.symbol));
 
-    // Top 15 moedas mais voláteis do carrossel (24h)
+    // Moedas da WHITELIST_VIP ordenadas por volatilidade 24h
     const candidatos = volData
       .filter(t => {
         const sym = t.symbol;
         if (!isSimboloValido(sym)) return false;
         if (vetadosSet.has(sym)) return false;
         if (gatekeeperVetoedUntil[sym] && now < gatekeeperVetoedUntil[sym]) return false;
-        if (parseFloat(t.count || 0) <= 1000) return false;
+        if (parseFloat(t.count || 0) <= 500) return false;
         const p24 = parseFloat(t.priceChangePercent || 0);
         if (p24 > 40.0 || p24 < -25.0) return false;
         return true;
       })
-      .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)))
-      .slice(0, 15);
+      .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)));
 
     const setups = [];
-    for (const c of candidatos) {
+    const avaliadas = [];
+
+    for (const c of candidatos.slice(0, 15)) {
       const liq = await validarLiquidezMoeda(c.symbol);
       if (!liq.ok) continue;
 
       const dados = await analisarEstruturaEMercado(c.symbol);
       if (!dados) continue;
 
-      // Filtro prévio de exaustão 24h e funding tóxico no scanner
+      // Filtro prévio de exaustão 24h e funding tóxico no scanner (apenas pula o par sem veto duradouro)
       const p24Cand = parseFloat(c.priceChangePercent || dados.priceChangePercent || 0);
-      if (dados.direcaoModo === 'SHORT' && p24Cand < -22.0 && dados.modoDetectado !== 'EXAUSTAO_REVERSAO') {
-        gatekeeperVetoedUntil[c.symbol] = now + 15 * 60 * 1000;
-        continue;
-      }
-      if (dados.direcaoModo === 'LONG' && p24Cand > 35.0 && dados.modoDetectado !== 'EXAUSTAO_REVERSAO') {
-        gatekeeperVetoedUntil[c.symbol] = now + 15 * 60 * 1000;
-        continue;
-      }
-      if (dados.direcaoModo === 'SHORT' && dados.fundingRate < -0.0015) {
-        gatekeeperVetoedUntil[c.symbol] = now + 15 * 60 * 1000;
-        continue;
-      }
-      if (dados.direcaoModo === 'LONG' && dados.fundingRate > 0.0015) {
-        gatekeeperVetoedUntil[c.symbol] = now + 15 * 60 * 1000;
-        continue;
-      }
+      if (dados.direcaoModo === 'SHORT' && p24Cand < -22.0 && dados.modoDetectado !== 'EXAUSTAO_REVERSAO') continue;
+      if (dados.direcaoModo === 'LONG' && p24Cand > 35.0 && dados.modoDetectado !== 'EXAUSTAO_REVERSAO') continue;
+      if (dados.direcaoModo === 'SHORT' && dados.fundingRate < -0.0015) continue;
+      if (dados.direcaoModo === 'LONG' && dados.fundingRate > 0.0015) continue;
 
       // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.80% a 2.50%)
-      if (dados.atrPct15m < 0.80 || dados.atrPct15m > 2.50) {
-        if (dados.atrPct15m < 0.80) {
-          gatekeeperVetoedUntil[c.symbol] = now + 15 * 60 * 1000; // Moeda lenta (ex: KASUSDT): 15m de veto
-        }
-        continue;
-      }
-
-      // 2. Piso de Volume (RVOL >= 0.85x)
-      if (dados.rvol15m < 0.85) {
-        gatekeeperVetoedUntil[c.symbol] = now + 120000;
-        continue;
-      }
-
-      // 3. Gatekeeper (exige setup ativo MODO A, B ou C e directionalScore condizente - sem confirmação de vela 5m no scanner de candidatos)
-      const gk = await verificarGatekeeper(dados, false);
-      if (!gk.passou) {
-        gatekeeperVetoedUntil[c.symbol] = now + 120000;
-        continue;
-      }
+      if (dados.atrPct15m < 0.80 || dados.atrPct15m > 2.50) continue;
 
       // Bônus por modo para o ranking inteligente: Momentum +15, Exaustão +12, Pullback +10
       const bonusModo = (dados.modoDetectado === 'MOMENTUM') ? 15 : ((dados.modoDetectado === 'EXAUSTAO_REVERSAO') ? 12 : 10);
       const scoreEfetivo = Math.abs(dados.directionalScore) + bonusModo;
 
-      setups.push({
+      const itemInfo = {
         symbol: c.symbol,
         dados,
         modoDetectado: dados.modoDetectado,
@@ -1597,17 +1590,28 @@ async function atualizarTopSetups() {
         atrPct15m: dados.atrPct15m,
         rvol15m: dados.rvol15m,
         bonusModo
-      });
+      };
 
-      if (setups.length >= 15) break;
+      avaliadas.push(itemInfo);
+
+      // Gatekeeper para setup ativo pronto para entrada
+      if (dados.rvol15m >= 0.85) {
+        const gk = await verificarGatekeeper(dados, false);
+        if (gk.passou) {
+          setups.push(itemInfo);
+        }
+      }
     }
 
     setups.sort((a, b) => b.scoreEfetivo - a.scoreEfetivo);
+    avaliadas.sort((a, b) => b.scoreEfetivo - a.scoreEfetivo);
+
     topCandidatosComSetup = setups;
+    todasAvaliadasWhitelist = avaliadas;
     ultimoScanSetups = now;
-    return topCandidatosComSetup;
+    return { setups, avaliadas };
   } catch(e) {
-    return topCandidatosComSetup;
+    return { setups: topCandidatosComSetup, avaliadas: todasAvaliadasWhitelist };
   }
 }
 
@@ -1796,42 +1800,59 @@ setInterval(async () => {
         continue;
       }
 
-      // 3. Buscar moeda candidata líquida se não tiver
-      if (!slot.targetSymbol) {
-        slot.status = 'ESCANEANDO_MERCADO';
+      // 3. Buscar moeda candidata líquida da WHITELIST_VIP
+      const scanRes = await atualizarTopSetups();
+      const setupsDisponiveis = scanRes.setups || [];
+      const avaliadasDisponiveis = scanRes.avaliadas || [];
 
-        // Conjunto global de símbolos ativos ou em avaliação nos 2 slots
-        const openingOrActiveSymbols = new Set();
-        [1, 2].forEach(s => {
-          if (autoBotState.slots[s].symbol) openingOrActiveSymbols.add(autoBotState.slots[s].symbol);
-          if (autoBotState.slots[s].targetSymbol) openingOrActiveSymbols.add(autoBotState.slots[s].targetSymbol);
-        });
-        Object.keys(localAlvos).forEach(s => openingOrActiveSymbols.add(s));
-
-        // Prioriza as top moedas mais voláteis do carrossel com setup ativo e ATR saudável
-        const setups = await atualizarTopSetups();
-        const melhorCandidato = setups.find(s =>
-          !openingOrActiveSymbols.has(s.symbol) &&
-          (!gatekeeperVetoedUntil[s.symbol] || now >= gatekeeperVetoedUntil[s.symbol])
-        );
-
-        if (!melhorCandidato) {
-          slot.status = 'SEM_MOEDAS_LIQUIDAS';
-          continue;
-        }
-
-        slot.targetSymbol = melhorCandidato.symbol;
-        slot.targetAssignedTime = now;
-        slot.lastChecked60sTime = 0;
-        slot.status = `CANDIDATO: ${melhorCandidato.symbol} [${melhorCandidato.modoLabel} | Score: ${melhorCandidato.directionalScore}]`;
-        console.log(`[AUTOBOT] Slot ${slotNum} escolheu Top 1 candidato: ${melhorCandidato.symbol} (Score: ${melhorCandidato.scoreEfetivo} [${melhorCandidato.modoLabel}])`);
-      }
-
-      // 4. Analisar candidato
-      const cand = slot.targetSymbol;
+      // Conjunto global de símbolos ativos nos slots e posições abertas
+      const openingOrActiveSymbols = new Set();
+      [1, 2].forEach(s => {
+        if (autoBotState.slots[s].symbol) openingOrActiveSymbols.add(autoBotState.slots[s].symbol);
+      });
+      Object.keys(localAlvos).forEach(s => openingOrActiveSymbols.add(s));
       const outroSlotNum = (slotNum === 1 ? 2 : 1);
       const outroMoedaAtiva = autoBotState.slots[outroSlotNum].symbol;
       const outroMoedaAlvo = autoBotState.slots[outroSlotNum].targetSymbol;
+
+      const melhorCandidatoComSetup = setupsDisponiveis.find(s =>
+        !openingOrActiveSymbols.has(s.symbol) &&
+        s.symbol !== outroMoedaAtiva &&
+        s.symbol !== outroMoedaAlvo &&
+        (!gatekeeperVetoedUntil[s.symbol] || now >= gatekeeperVetoedUntil[s.symbol])
+      );
+
+      const melhorCandidatoWhitelist = avaliadasDisponiveis.find(s =>
+        !openingOrActiveSymbols.has(s.symbol) &&
+        s.symbol !== outroMoedaAtiva &&
+        s.symbol !== outroMoedaAlvo &&
+        (!gatekeeperVetoedUntil[s.symbol] || now >= gatekeeperVetoedUntil[s.symbol])
+      );
+
+      const melhorCandidata = melhorCandidatoComSetup || melhorCandidatoWhitelist;
+
+      if (!melhorCandidata) {
+        slot.targetSymbol = null;
+        slot.status = 'ESCANEANDO_WHITELIST';
+        autoBotState.lastLog = `[🔍 SLOT ${slotNum} PESQUISANDO WHITELIST: Varrendo 26 pares VIP...]`;
+        continue;
+      }
+
+      // Rotação visual ativa no card vazio e log de varredura
+      slot.targetSymbol = melhorCandidata.symbol;
+      const scoreTxtRot = (melhorCandidata.directionalScore > 0 ? '+' : '') + melhorCandidata.directionalScore;
+      const distTxtRot = melhorCandidata.dados?.distEma21Atr ? melhorCandidata.dados.distEma21Atr.toFixed(1) : '1.0';
+      autoBotState.lastLog = `[🔍 SLOT ${slotNum} PESQUISANDO WHITELIST: Avaliando ${melhorCandidata.symbol} (Score: ${scoreTxtRot} | Dist EMA21: ${distTxtRot}x ATR)]`;
+
+      if (!melhorCandidatoComSetup) {
+        slot.status = `[AVALIANDO: ${melhorCandidata.symbol}] (Score: ${scoreTxtRot} | Dist: ${distTxtRot}x ATR)`;
+        continue; // Continua girando a pesquisa visualmente sem abrir ordem
+      }
+
+      slot.status = `CANDIDATO: ${melhorCandidatoComSetup.symbol} [${melhorCandidatoComSetup.modoLabel} | Score: ${scoreTxtRot}]`;
+
+      // 4. Analisar candidato
+      const cand = melhorCandidatoComSetup.symbol;
 
       // Trava estrita anti-conflito: Slot 1 e Slot 2 NUNCA operam nem avaliam a mesma moeda
       if (cand === outroMoedaAtiva || (outroMoedaAlvo && cand === outroMoedaAlvo && slotNum > outroSlotNum) || (localAlvos[cand] && slot.symbol !== cand)) {
@@ -1865,7 +1886,7 @@ setInterval(async () => {
         console.log(`[GATEKEEPER-RECUSA] Slot ${slotNum} (${cand}) [${modoTxt} | Score: ${scoreTxt}]: ${gk.motivo}`);
         slot.status = `[RECUSADO: ${gk.motivo}]`;
         autoBotState.lastLog = `Slot ${slotNum} (${cand}): ${gk.motivo}`;
-        gatekeeperVetoedUntil[cand] = now + 120000; // 2 min de respiro para testar outros pares
+        gatekeeperVetoedUntil[cand] = now + 45000; // 45s de respiro para testar outros pares
         slot.targetSymbol = null;
         continue;
       }
@@ -2042,7 +2063,7 @@ setInterval(async () => {
           }
           tpPrecoDefinido = dec.action === 'LONG' ? (precoExec + tpDistExec) : (precoExec - tpDistExec);
 
-          const beTriggerDist = precoExec * ((2.60 / alav) / 100);
+          const beTriggerDist = precoExec * ((2.30 / alav) / 100);
           const beTriggerPrice = dec.action === 'LONG' ? (precoExec + beTriggerDist) : (precoExec - beTriggerDist);
 
           console.log(`[ORDEM-EXECUTADA] Slot ${slotNum} (${cand}) [${modoTxt}]: ${dec.action} ${alav}x a ${formatarPrecoAtivo(cand, precoExec)} | Qty: ${filledQty} | SL: ${formatarPrecoAtivo(cand, slPrecoDefinido)} (-${slRoeExec.toFixed(1)}% ROI) | TP: ${formatarPrecoAtivo(cand, tpPrecoDefinido)}`);
@@ -2070,7 +2091,7 @@ setInterval(async () => {
             beArmed: false,
             beStage: 0,
             beStopPrice: null,
-            beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO ATUAL: +0.00%)]',
+            beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.30% ROI (PICO ATUAL: +0.00%)]',
             lockedRoi: 0,
             leverage: alav,
             quantidade: filledQty,
@@ -2437,7 +2458,7 @@ app.post('/api/trade', async (req, res) => {
       }
       let tpCalc = lado === 'BUY' ? (preco + tpDistMan) : (preco - tpDistMan);
 
-      const beTriggerDist = preco * ((2.60 / alav) / 100);
+      const beTriggerDist = preco * ((2.30 / alav) / 100);
       const beTriggerPrice = lado === 'BUY' ? (preco + beTriggerDist) : (preco - beTriggerDist);
 
       localAlvos[symbol] = {
@@ -2462,7 +2483,7 @@ app.post('/api/trade', async (req, res) => {
         beArmed: false,
         beStage: 0,
         beStopPrice: null,
-        beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO ATUAL: +0.00%)]',
+        beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.30% ROI (PICO ATUAL: +0.00%)]',
         lockedRoi: 0,
         leverage: alav,
         quantidade: fill,
@@ -2558,7 +2579,7 @@ app.get('/api/auto-status', (req, res) => {
     enabled: autoBotState.enabled,
     slots: autoBotState.slots,
     lastLog: autoBotState.lastLog,
-    topCandidatos: topCandidatosComSetup.map(c => ({
+    topCandidatos: (topCandidatosComSetup.length > 0 ? topCandidatosComSetup : todasAvaliadasWhitelist.slice(0, 10)).map(c => ({
       symbol: c.symbol,
       modoDetectado: c.modoDetectado,
       modoLabel: c.modoLabel,
@@ -3515,7 +3536,7 @@ app.get('/', (req, res) => {
             const lockR = (data.lockedRoi || 0).toFixed(2);
             const stopP = data.beStopPrice ? ('$' + Number(data.beStopPrice).toFixed(prec)) : '';
 
-            if (data.maxRoiReached >= 2.60) {
+            if (data.maxRoiReached >= 2.30) {
               beEl.style.background = 'rgba(16, 185, 129, 0.22)';
               beEl.style.borderColor = 'var(--green)';
               beEl.style.color = 'var(--green)';
@@ -3524,7 +3545,7 @@ app.get('/', (req, res) => {
               beEl.style.background = 'rgba(255, 255, 255, 0.06)';
               beEl.style.borderColor = 'rgba(255, 255, 255, 0.2)';
               beEl.style.color = 'var(--gold)';
-              beEl.innerText = data.beLabel || ('[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO ATUAL: +' + maxR + '%)]');
+              beEl.innerText = data.beLabel || ('[🌱 RESPIRO LIVRE ATÉ +2.30% ROI (PICO ATUAL: +' + maxR + '%)]');
             }
           }
         } else {
@@ -4184,7 +4205,19 @@ app.get('/', (req, res) => {
         const bgBadge = isWin ? 'rgba(16,185,129,0.18)' : 'rgba(239,68,68,0.18)';
         const dataStr = g.dataBrasil || new Date(g.time || g.entryTime).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
         const tag = isWin ? 'WIN' : 'LOSS';
-        const motivoTxt = g.exitReason ? ('[' + g.exitReason + ']') : '';
+        let motivoFmt = g.exitReason || '';
+        if (motivoFmt.includes('CATRACA_PARCIAL')) {
+          motivoFmt = '💰 PARCIAL + CATRACA';
+        } else if (motivoFmt.includes('CATRACA') || motivoFmt === 'BREAKEVEN') {
+          motivoFmt = '🛡️ CATRACA';
+        } else if (motivoFmt.includes('RESGATE')) {
+          motivoFmt = '🚑 RESGATE REPIQUE';
+        } else if (motivoFmt.includes('TP_FUNIL')) {
+          motivoFmt = '⏳ TP FUNIL';
+        } else if (motivoFmt.includes('SL_FUNIL')) {
+          motivoFmt = '⏳ SL FUNIL';
+        }
+        const motivoTxt = motivoFmt ? ('[' + motivoFmt + ']') : '';
         const roiVal = parseFloat(g.roi || 0);
         const roiTxt = (roiVal >= 0 ? '+' : '') + roiVal.toFixed(2) + '% ROI';
         const isShort = String(g.side).toUpperCase() === 'SHORT';
@@ -4315,7 +4348,7 @@ app.get('/', (req, res) => {
               entryPrice: pEntrada,
               slPrice: isLong ? pEntrada * (1 - (5.60 / alav) / 100) : pEntrada * (1 + (5.60 / alav) / 100),
               tpPrice: isLong ? pEntrada * (1 + (8.00 / alav) / 100) : pEntrada * (1 - (8.00 / alav) / 100),
-              beTriggerPrice: isLong ? pEntrada * (1 + (2.60 / alav) / 100) : pEntrada * (1 - (2.60 / alav) / 100),
+              beTriggerPrice: isLong ? pEntrada * (1 + (2.30 / alav) / 100) : pEntrada * (1 - (2.30 / alav) / 100),
               slDistPct: 0.056 / alav,
               slRoiInicial: 5.60,
               parcialExecutada: false,
@@ -4332,7 +4365,7 @@ app.get('/', (req, res) => {
               beArmed: false,
               beStage: 0,
               beStopPrice: null,
-              beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO ATUAL: +0.00%)]',
+              beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.30% ROI (PICO ATUAL: +0.00%)]',
               lockedRoi: 0,
               leverage: p.alavancagem,
               maxRoiReached: 0,
