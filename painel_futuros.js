@@ -1572,10 +1572,6 @@ async function atualizarTopSetups() {
       if (dados.direcaoModo === 'SHORT' && dados.fundingRate < -0.0015) continue;
       if (dados.direcaoModo === 'LONG' && dados.fundingRate > 0.0015) continue;
 
-      // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.80% a 2.50%)
-      if (dados.atrPct15m < 0.80 || dados.atrPct15m > 2.50) continue;
-
-      // Bônus por modo para o ranking inteligente: Momentum +15, Exaustão +12, Pullback +10
       const bonusModo = (dados.modoDetectado === 'MOMENTUM') ? 15 : ((dados.modoDetectado === 'EXAUSTAO_REVERSAO') ? 12 : 10);
       const scoreEfetivo = Math.abs(dados.directionalScore) + bonusModo;
 
@@ -1594,12 +1590,13 @@ async function atualizarTopSetups() {
 
       avaliadas.push(itemInfo);
 
+      // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.80% a 2.50%) e RVOL para entradas
+      if (dados.atrPct15m < 0.80 || dados.atrPct15m > 2.50 || dados.rvol15m < 0.85) continue;
+
       // Gatekeeper para setup ativo pronto para entrada
-      if (dados.rvol15m >= 0.85) {
-        const gk = await verificarGatekeeper(dados, false);
-        if (gk.passou) {
-          setups.push(itemInfo);
-        }
+      const gk = await verificarGatekeeper(dados, false);
+      if (gk.passou) {
+        setups.push(itemInfo);
       }
     }
 
