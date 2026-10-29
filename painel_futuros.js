@@ -58,11 +58,16 @@ if (!marcoZero) {
   try { fs.writeFileSync(MARCO_ZERO_FILE, marcoZero.toString()); } catch(e){}
 }
 
-let baseCapitalReferencia = 20.0;
+const MAX_SLOTS = 2;
+const MARGEM_POR_SLOT = 10.0;
+const BASE_CAPITAL_SLOTS = MAX_SLOTS * MARGEM_POR_SLOT; // 20.00 USDT
+let saldoReferenciaCiclo = 0;
+let baseCapitalReferencia = BASE_CAPITAL_SLOTS;
 try {
   if (fs.existsSync(BASE_CAPITAL_FILE)) {
     const b = JSON.parse(fs.readFileSync(BASE_CAPITAL_FILE, 'utf8'));
-    if (b && parseFloat(b.baseCapital) > 0) baseCapitalReferencia = parseFloat(b.baseCapital);
+    if (b && parseFloat(b.saldoReferenciaCiclo) > 0) saldoReferenciaCiclo = parseFloat(b.saldoReferenciaCiclo);
+    else if (b && parseFloat(b.baseCapital) > 0) saldoReferenciaCiclo = parseFloat(b.baseCapital);
   }
 } catch(e) {}
 
@@ -2495,13 +2500,15 @@ app.get('/api/base-capital-pnl', async (req, res) => {
     const pnlLiquidoHoje = pnlBrutoHoje + taxaHoje + fundingHoje;
     const pnlLiquidoOntem = pnlBrutoOntem + taxaOntem + fundingOntem;
 
-    const baseCapital = baseCapitalReferencia || 20.0;
-    const roiHoje = (pnlLiquidoHoje / baseCapital) * 100;
-    const roiOntem = (pnlLiquidoOntem / baseCapital) * 100;
+    const baseCapitalOperacional = MAX_SLOTS * MARGEM_POR_SLOT; // 20.00 USDT
+    const roiHoje = (pnlLiquidoHoje / baseCapitalOperacional) * 100;
+    const roiOntem = (pnlLiquidoOntem / baseCapitalOperacional) * 100;
 
     res.json({
       success: true,
-      baseCapital,
+      baseCapital: baseCapitalOperacional,
+      baseCapitalOperacional,
+      saldoReferenciaCiclo: saldoReferenciaCiclo || 0,
       brl: brlGlobal,
       hoje: {
         dataStr: new Date(marcoRef).toLocaleDateString('pt-BR'),
@@ -2919,16 +2926,21 @@ app.post('/api/limpar-placar', async (req, res) => {
     placarStats = { wins: 0, losses: 0, total: 0, pnlHoje: 0 };
     salvarPlacarStats();
 
-    // Atualiza a Base Capital de referência para o saldo exato atual da Binance (/fapi/v2/account -> totalWalletBalance)
+    // Mantém estritamente 20.00 USDT de Base Capital Operacional e guarda o saldo total da carteira em separado
+    const baseCapitalOperacional = MAX_SLOTS * MARGEM_POR_SLOT;
     try {
       const acc = await fut.assinado('get', '/fapi/v2/account').catch(() => null);
       const walletBal = parseFloat(acc?.totalWalletBalance || acc?.totalMarginBalance || 0);
       if (walletBal > 0) {
-        baseCapitalReferencia = walletBal;
-        try {
-          fs.writeFileSync(BASE_CAPITAL_FILE, JSON.stringify({ baseCapital: walletBal, timestamp: marcoZero }, null, 2));
-        } catch(e){}
+        saldoReferenciaCiclo = walletBal;
       }
+      try {
+        fs.writeFileSync(BASE_CAPITAL_FILE, JSON.stringify({
+          baseCapital: baseCapitalOperacional,
+          saldoReferenciaCiclo: saldoReferenciaCiclo || walletBal || 0,
+          timestamp: marcoZero
+        }, null, 2));
+      } catch(e){}
     } catch(e) {}
 
     res.json({
@@ -2938,7 +2950,9 @@ app.post('/api/limpar-placar', async (req, res) => {
       total: 0,
       pnlHoje: 0,
       marcoZero,
-      baseCapital: baseCapitalReferencia
+      saldoReferenciaCiclo,
+      baseCapital: baseCapitalOperacional,
+      baseCapitalOperacional
     });
   } catch(err) {
     res.json({ success: false, error: err.message });
@@ -4110,7 +4124,7 @@ app.get('/', (req, res) => {
     }
 
     async function zerarPlacar() {
-      if (!(await askConfirm('⚠️ Reset Total de Ciclo', 'Deseja ZERAR o placar, marco zero e atualizar a Base Capital com o saldo atual da Binance?'))) return;
+      if (!(await askConfirm('⚠️ Reset Total de Ciclo', 'Deseja ZERAR o placar e marco zero (mantendo Base Capital Operacional de 20.00 USDT)?'))) return;
       try {
         const r = await fetch('/api/limpar-placar', { method: 'POST' });
         const d = await r.json();
@@ -4124,7 +4138,7 @@ app.get('/', (req, res) => {
           carregarPlacar();
           if (typeof carregarBaseCapital === 'function') carregarBaseCapital();
           if (typeof carregarHistoricoCompleto === 'function') carregarHistoricoCompleto();
-          askConfirm('✓ Sucesso', 'Ciclo resetado com sucesso! Placar, Marco Zero e Base Capital sincronizados.', true);
+          askConfirm('✓ Sucesso', 'Ciclo resetado com sucesso! Placar e Marco Zero sincronizados na Base Operacional de 20.00 USDT.', true);
         }
       } catch(e) {}
     }
@@ -4402,7 +4416,8 @@ app.get('/', (req, res) => {
       const sinalBrl = d.pnlBrl >= 0 ? '+R$ ' : '-R$ ';
 
       const brlRate = baseCapitalCache.brl || 5.20;
-      const baseBrl = (baseCapitalCache.baseCapital * brlRate).toFixed(2);
+      const baseOp = baseCapitalCache.baseCapitalOperacional || baseCapitalCache.baseCapital || 20.00;
+      const baseBrl = (baseOp * brlRate).toFixed(2);
 
       let html = '<div style="background:' + bgCard + '; border: 1.5px solid ' + cor + '; border-radius: 16px; padding: 20px; box-shadow: 0 0 25px ' + glow + '; margin-bottom: 20px;">' +
           '<div style="font-size: 0.8rem; color: var(--text-muted); font-weight: 700; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px;">' +
@@ -4418,7 +4433,7 @@ app.get('/', (req, res) => {
             sinalBrl + Math.abs(d.pnlBrl).toFixed(2) + ' BRL' +
           '</div>' +
           '<div style="font-size: 0.78rem; color: var(--text-muted); border-top: 1px dashed rgba(255,255,255,0.12); padding-top: 10px;">' +
-            'Capital Base: <b style="color:var(--gold);">' + baseCapitalCache.baseCapital.toFixed(2) + ' USDT</b> (R$ ' + baseBrl + ')' +
+            'Capital Base Operacional: <b style="color:var(--gold);">' + Number(baseOp).toFixed(2) + ' USDT (2x 10 USDT)</b> (R$ ' + baseBrl + ')' +
           '</div>' +
         '</div>';
 
