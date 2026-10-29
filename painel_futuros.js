@@ -212,9 +212,9 @@ function registrarDesfechoTrade(symbol, exitReason, roi, pnlUsdt, alvoContext = 
     placarStats.wins = (placarStats.wins || 0) + 1;
   } else {
     placarStats.losses = (placarStats.losses || 0) + 1;
-    symbolLossCooldown[symbol] = Date.now() + 3 * 60 * 60 * 1000; // 180m (3 horas) de quarentena anti-revanche
+    symbolLossCooldown[symbol] = Date.now() + 1 * 60 * 60 * 1000; // 60m (1 hora) de quarentena anti-revanche
     salvarLossCooldown();
-    console.log(`[COOLDOWN-POS-LOSS-3H] ${symbol} registrou LOSS (${exitReason} | ROI ${roiNum.toFixed(2)}%). Quarentena anti-revanche ativada por 180 minutos (3h).`);
+    console.log(`[COOLDOWN-POS-LOSS-1H] ${symbol} registrou LOSS (${exitReason} | ROI ${roiNum.toFixed(2)}%). Quarentena anti-revanche ativada por 60 minutos (1h).`);
   }
   placarStats.total = (placarStats.wins || 0) + (placarStats.losses || 0);
   salvarPlacarStats();
@@ -511,14 +511,14 @@ async function analisarEstruturaEMercado(symbol) {
     // Status da Distância da EMA 21
     let distEmaText = '';
     let distEmaColor = 'var(--gold)';
-    if (distEma21Atr >= 0.25 && distEma21Atr <= 2.00) {
+    if (distEma21Atr >= 0.25 && distEma21Atr <= 2.60) {
       distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Zona de Pullback - OK]`;
       distEmaColor = 'var(--green)';
     } else if (distEma21Atr < 0.25) {
       distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Colado na EMA21]`;
       distEmaColor = 'var(--gold)';
-    } else if (distEma21Atr <= 2.40) {
-      distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Zona Momentum]`;
+    } else if (distEma21Atr <= 3.20) {
+      distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Zona Tendência/Momentum]`;
       distEmaColor = 'var(--gold)';
     } else {
       distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Esticado - Exaustão]`;
@@ -528,13 +528,13 @@ async function analisarEstruturaEMercado(symbol) {
     // Qualidade do Setup
     let qualidadeSetup = 'CONTRA-TENDÊNCIA (BLOQUEADO)';
     let qualidadeCor = 'var(--red)';
-    if (distEma21Atr > 2.60) {
-      qualidadeSetup = 'ESTICADO (AGUARDAR RECUO)';
-      qualidadeCor = 'var(--red)';
-    } else if (aptoLong && distEma21Atr >= 0.25 && distEma21Atr <= 2.00) {
+    if (distEma21Atr > 3.20) {
+      qualidadeSetup = (rsi15m <= 21 || rsi15m >= 79) ? 'EXAUSTÃO REVERSÃO' : 'ESTICADO (AGUARDAR RECUO)';
+      qualidadeCor = (rsi15m <= 21 || rsi15m >= 79) ? 'var(--blue)' : 'var(--red)';
+    } else if (aptoLong && distEma21Atr >= 0.25 && distEma21Atr <= 2.60) {
       qualidadeSetup = 'PULLBACK A FAVOR DA TENDÊNCIA';
       qualidadeCor = 'var(--green)';
-    } else if (aptoShort && distEma21Atr >= 0.25 && distEma21Atr <= 2.00) {
+    } else if (aptoShort && distEma21Atr >= 0.25 && distEma21Atr <= 2.60) {
       qualidadeSetup = 'PULLBACK A FAVOR DA TENDÊNCIA';
       qualidadeCor = 'var(--green)';
     } else if (rvol15m >= 1.30 && ((aptoLong && curPrice > ema9_15) || (aptoShort && curPrice < ema9_15))) {
@@ -621,61 +621,6 @@ async function analisarEstruturaEMercado(symbol) {
     const breakUp = curPrice > ema9_5 && curPrice > ema21_5 && curPrice > ema50_5 && curPrice > ema9_15 && curPrice > ema21_15 && curPrice > ema50_15;
     const breakDown = curPrice < ema9_5 && curPrice < ema21_5 && curPrice < ema50_5 && curPrice < ema9_15 && curPrice < ema21_15 && curPrice < ema50_15;
 
-    // ── CLASSIFICADOR DE 3 MODOS DINÂMICOS ──
-    let modoDetectado = null;
-    let modoLabel = 'SEM SETUP';
-    let direcaoModo = null;
-    let motivoModo = 'Aguardando confluência quantitativa';
-
-    // MODO A: PULLBACK DE TENDÊNCIA (Continuidade — Campeão 76% WR)
-    // Condição Limpa: MTF (1h/15m/5m) + EMAs (9/21/50) alinhados + distEma21Atr entre 0.25x e 2.00x ATR + ADX >= 18 + ATR% 0.80% a 2.50% + RVOL >= 0.85x
-    const mtfAptoPullbackLong = (dir1h === 'green' && dir15m === 'green' && (dir5m === 'green' || isGreen5m));
-    const mtfAptoPullbackShort = (dir1h === 'red' && dir15m === 'red' && (dir5m === 'red' || isRed5m));
-    const emasAlinhadasAlta = (ema9_15 > ema21_15 && ema21_15 > ema50_15) || (isBull1h && isBull15m);
-    const emasAlinhadasBaixa = (ema9_15 < ema21_15 && ema21_15 < ema50_15) || (isBear1h && isBear15m);
-
-    if (mtfAptoPullbackLong && emasAlinhadasAlta && distEma21Atr >= 0.25 && distEma21Atr <= 2.00 && adx15m >= 18 && atrPct15m >= 0.80 && atrPct15m <= 2.50 && rvol15m >= 0.85) {
-      modoDetectado = 'PULLBACK';
-      modoLabel = 'PULLBACK LONG';
-      direcaoModo = 'LONG';
-      motivoModo = `Pullback na EMA 21 (15m a ${distEma21Atr.toFixed(2)}x ATR) a favor da alta`;
-    } else if (mtfAptoPullbackShort && emasAlinhadasBaixa && distEma21Atr >= 0.25 && distEma21Atr <= 2.00 && adx15m >= 18 && atrPct15m >= 0.80 && atrPct15m <= 2.50 && rvol15m >= 0.85) {
-      modoDetectado = 'PULLBACK';
-      modoLabel = 'PULLBACK SHORT';
-      direcaoModo = 'SHORT';
-      motivoModo = `Pullback na EMA 21 (15m a ${distEma21Atr.toFixed(2)}x ATR) a favor da baixa`;
-    }
-
-    // MODO B: IGNIÇÃO DE FLUXO / BREAKOUT (Momentum) - Anti-Exaustão (dist EMA21 <= 1.15x ATR)
-    if (!modoDetectado) {
-      if ((breakUp || (emasAlinhadasAlta && aptoLong)) && distEma21Atr <= 1.15 && rvol15m >= 1.30 && takerRatioVal >= 1.15) {
-        modoDetectado = 'MOMENTUM';
-        modoLabel = 'MOMENTUM LONG';
-        direcaoModo = 'LONG';
-        motivoModo = 'Rompimento de alta com RVOL >= 1.30x e agressão compradora no Taker >= 1.15 (dist EMA21 <= 1.15x ATR)';
-      } else if ((breakDown || (emasAlinhadasBaixa && aptoShort)) && distEma21Atr <= 1.15 && rvol15m >= 1.30 && takerRatioVal <= 0.85) {
-        modoDetectado = 'MOMENTUM';
-        modoLabel = 'MOMENTUM SHORT';
-        direcaoModo = 'SHORT';
-        motivoModo = 'Rompimento de baixa com RVOL >= 1.30x e agressão vendedora no Taker <= 0.85 (dist EMA21 <= 1.15x ATR)';
-      }
-    }
-
-    // MODO C: EXAUSTÃO / RETORNO À MÉDIA (Caça-Reversão)
-    if (!modoDetectado) {
-      if (distEma21Atr >= 2.60 && rsi15m <= 26 && hasLowerRejection) {
-        modoDetectado = 'EXAUSTAO_REVERSAO';
-        modoLabel = 'EXAUSTÃO REVERSÃO LONG';
-        direcaoModo = 'LONG';
-        motivoModo = 'Fundo esticado >= 2.60x ATR com RSI <= 26 e pavio de rejeição';
-      } else if (distEma21Atr >= 2.60 && rsi15m >= 74 && hasUpperRejection) {
-        modoDetectado = 'EXAUSTAO_REVERSAO';
-        modoLabel = 'EXAUSTÃO REVERSÃO SHORT';
-        direcaoModo = 'SHORT';
-        motivoModo = 'Topo esticado >= 2.60x ATR com RSI >= 74 e pavio de rejeição';
-      }
-    }
-
     // ── SCORE DIRECIONAL AUTOMÁTICO (-100 A +100) ──
     let directionalScore = 0;
 
@@ -756,6 +701,82 @@ async function analisarEstruturaEMercado(symbol) {
     directionalScore += takerScore;
 
     directionalScore = Math.max(-100, Math.min(100, directionalScore));
+
+    // ── CLASSIFICADOR DE 3 MODOS DINÂMICOS ──
+    let modoDetectado = null;
+    let modoLabel = 'SEM SETUP';
+    let direcaoModo = null;
+    let motivoModo = 'Aguardando confluência quantitativa';
+
+    // 4 luzes alinhadas (4h, 1h, 15m, 5m)
+    const quatroLuzesAlta = (dir4h === 'green' && dir1h === 'green' && dir15m === 'green' && dir5m === 'green');
+    const quatroLuzesBaixa = (dir4h === 'red' && dir1h === 'red' && dir15m === 'red' && dir5m === 'red');
+
+    // Tendência forte / Continuation 5m
+    const forteTendenciaLong = (quatroLuzesAlta || directionalScore >= 75) && isGreen5m;
+    const forteTendenciaShort = (quatroLuzesBaixa || directionalScore <= -75) && isRed5m;
+    const maxDistEmaLong = forteTendenciaLong ? 3.20 : 2.60;
+    const maxDistEmaShort = forteTendenciaShort ? 3.20 : 2.60;
+
+    // MODO A: PULLBACK E CONTINUATION 5M (A Favor da Tendência)
+    // Permite distEma21Atr até 2.60x ATR (ou até 3.20x se 4 luzes alinhadas / |directionalScore| >= 75 com retomada 5m)
+    // RSI 15m relaxado: teto 78 p/ LONG, piso 22 p/ SHORT
+    // ATR 15m piso reduzido para 0.45%
+    const mtfAptoPullbackLong = (dir1h === 'green' && dir15m === 'green' && (dir5m === 'green' || isGreen5m));
+    const mtfAptoPullbackShort = (dir1h === 'red' && dir15m === 'red' && (dir5m === 'red' || isRed5m));
+    const emasAlinhadasAlta = (ema9_15 > ema21_15 && ema21_15 > ema50_15) || (isBull1h && isBull15m);
+    const emasAlinhadasBaixa = (ema9_15 < ema21_15 && ema21_15 < ema50_15) || (isBear1h && isBear15m);
+
+    if (mtfAptoPullbackLong && emasAlinhadasAlta && distEma21Atr >= 0.25 && distEma21Atr <= maxDistEmaLong && adx15m >= 18 && atrPct15m >= 0.45 && atrPct15m <= 2.50 && rvol15m >= 0.85 && rsi15m <= 78) {
+      modoDetectado = 'PULLBACK';
+      modoLabel = forteTendenciaLong ? 'CONTINUATION 5M LONG' : 'PULLBACK LONG';
+      direcaoModo = 'LONG';
+      motivoModo = `Pullback/Continuation na EMA 21 (15m a ${distEma21Atr.toFixed(2)}x ATR <= ${maxDistEmaLong.toFixed(2)}x) a favor da alta`;
+    } else if (mtfAptoPullbackShort && emasAlinhadasBaixa && distEma21Atr >= 0.25 && distEma21Atr <= maxDistEmaShort && adx15m >= 18 && atrPct15m >= 0.45 && atrPct15m <= 2.50 && rvol15m >= 0.85 && rsi15m >= 22) {
+      modoDetectado = 'PULLBACK';
+      modoLabel = forteTendenciaShort ? 'CONTINUATION 5M SHORT' : 'PULLBACK SHORT';
+      direcaoModo = 'SHORT';
+      motivoModo = `Pullback/Continuation na EMA 21 (15m a ${distEma21Atr.toFixed(2)}x ATR <= ${maxDistEmaShort.toFixed(2)}x) a favor da baixa`;
+    }
+
+    // MODO B: IGNIÇÃO DE FLUXO / BREAKOUT (Momentum)
+    if (!modoDetectado) {
+      if ((breakUp || (emasAlinhadasAlta && aptoLong)) && distEma21Atr <= 2.60 && rvol15m >= 1.30 && takerRatioVal >= 1.15 && rsi15m <= 78) {
+        modoDetectado = 'MOMENTUM';
+        modoLabel = 'MOMENTUM LONG';
+        direcaoModo = 'LONG';
+        motivoModo = 'Rompimento de alta com RVOL >= 1.30x e agressão compradora no Taker >= 1.15';
+      } else if ((breakDown || (emasAlinhadasBaixa && aptoShort)) && distEma21Atr <= 2.60 && rvol15m >= 1.30 && takerRatioVal <= 0.85 && rsi15m >= 22) {
+        modoDetectado = 'MOMENTUM';
+        modoLabel = 'MOMENTUM SHORT';
+        direcaoModo = 'SHORT';
+        motivoModo = 'Rompimento de baixa com RVOL >= 1.30x e agressão vendedora no Taker <= 0.85';
+      }
+    }
+
+    // MODO C: EXAUSTÃO / RETORNO À MÉDIA (Caça-Reversão)
+    if (!modoDetectado) {
+      const isExaustaoExtremaLong = (distEma21Atr >= 3.20 && rsi15m <= 21 && isGreen5m);
+      const isExaustaoPavioLong = (distEma21Atr >= 2.60 && rsi15m <= 26 && hasLowerRejection);
+      const isExaustaoExtremaShort = (distEma21Atr >= 3.20 && rsi15m >= 79 && isRed5m);
+      const isExaustaoPavioShort = (distEma21Atr >= 2.60 && rsi15m >= 74 && hasUpperRejection);
+
+      if (isExaustaoExtremaLong || isExaustaoPavioLong) {
+        modoDetectado = 'EXAUSTAO_REVERSAO';
+        modoLabel = 'EXAUSTÃO REVERSÃO LONG';
+        direcaoModo = 'LONG';
+        motivoModo = isExaustaoExtremaLong
+          ? `Exaustão extrema de baixa (${distEma21Atr.toFixed(2)}x ATR | RSI 15m: ${rsi15m.toFixed(1)}) com reação positiva no 5m`
+          : `Fundo esticado >= 2.60x ATR com RSI <= 26 e pavio de rejeição`;
+      } else if (isExaustaoExtremaShort || isExaustaoPavioShort) {
+        modoDetectado = 'EXAUSTAO_REVERSAO';
+        modoLabel = 'EXAUSTÃO REVERSÃO SHORT';
+        direcaoModo = 'SHORT';
+        motivoModo = isExaustaoExtremaShort
+          ? `Exaustão extrema de alta (${distEma21Atr.toFixed(2)}x ATR | RSI 15m: ${rsi15m.toFixed(1)}) com reação negativa no 5m`
+          : `Topo esticado >= 2.60x ATR com RSI >= 74 e pavio de rejeição`;
+      }
+    }
 
     // Projeções Dinâmicas de Risco (SL / TP / BE / Alavancagem)
     let leverageSugerida = 5;
@@ -841,6 +862,7 @@ async function analisarEstruturaEMercado(symbol) {
       posRange8Pct, max8_15m, min8_15m, var3Velas15m,
       adx15m, rvol15m, rsi15m,
       dir4h, dir1h, dir15m, dir5m,
+      isGreen5m, isRed5m, quatroLuzesAlta, quatroLuzesBaixa,
       aptoLong, aptoShort, mtfStatus, mtfText,
       emaAlignStatus, qualidadeSetup, qualidadeCor,
       deltaOI, takerRatioVal, fundingRate, oiVal,
@@ -866,36 +888,47 @@ async function verificarGatekeeper(dados, exigirConfirmacao5m = true) {
     return { passou: false, motivo: `Gatekeeper: Moeda ${dados.symbol} fora da WHITELIST_VIP` };
   }
 
-  // BLOCO 1: Quarentena Anti-Revanche Pós-Loss de 3 Horas (180m)
+  // BLOCO 1: Quarentena Anti-Revanche Pós-Loss de 1 Hora (60m)
   if (symbolLossCooldown && symbolLossCooldown[dados.symbol] && Date.now() < symbolLossCooldown[dados.symbol]) {
     const restMin = Math.round((symbolLossCooldown[dados.symbol] - Date.now()) / 60000);
-    return { passou: false, motivo: `Gatekeeper [QUARENTENA PÓS-LOSS 3H]: Moeda ${dados.symbol} em quarentena pós-loss por mais ${restMin}m` };
+    return { passou: false, motivo: `Gatekeeper [QUARENTENA PÓS-LOSS 1H]: Moeda ${dados.symbol} em quarentena pós-loss por mais ${restMin}m` };
   }
 
-  // BLOCO 1: Exigência de Zona de Valor Real (distEma21Atr <= 1.20x ATR)
-  if (dados.distEma21Atr > 1.20) {
-    return { passou: false, motivo: `Gatekeeper [ZONA DE VALOR]: Preço esticado longe da EMA 21 (${dados.distEma21Atr.toFixed(2)}x > 1.20x ATR)` };
+  // BLOCO 1: Exigência de Zona de Valor da EMA 21 (MODO 1: até 2.60x ou 3.20x em tendência forte; MODO 2: Exaustão isenta de trava de 2.60x)
+  if (dados.modoDetectado === 'EXAUSTAO_REVERSAO') {
+    // MODO 2: EXAUSTÃO REVERSÃO (Contra-Tendência no Extremo):
+    // Permitido entrar com distEma21Atr >= 3.20x sem bloqueio de distEma21Atr <= 2.60x!
+  } else {
+    // MODO 1: PULLBACK e CONTINUATION 5M (A Favor da Tendência):
+    // Ampliado de 1.20x para 2.60x ATR (e até 3.20x ATR quando 4 luzes alinhadas ou |directionalScore| >= 75 com retomada 5m)
+    const quatroLuzes = (dados.quatroLuzesAlta && dados.direcaoModo === 'LONG') || (dados.quatroLuzesBaixa && dados.direcaoModo === 'SHORT');
+    const scoreForte = Math.abs(dados.directionalScore || 0) >= 75;
+    const retomada5m = dados.direcaoModo === 'LONG' ? dados.isGreen5m : dados.isRed5m;
+    const maxDistPermitida = ((quatroLuzes || scoreForte) && retomada5m) ? 3.20 : 2.60;
+
+    if (dados.distEma21Atr > maxDistPermitida) {
+      return { passou: false, motivo: `Gatekeeper [ZONA DE VALOR]: Preço esticado longe da EMA 21 (${dados.distEma21Atr.toFixed(2)}x > ${maxDistPermitida.toFixed(2)}x ATR)` };
+    }
   }
 
-  // BLOCO 1: Desativação Estrita de MOMENTUM Esticado (> 1.15x ATR)
-  if (dados.modoDetectado === 'MOMENTUM' && dados.distEma21Atr > 1.15) {
-    return { passou: false, motivo: `Gatekeeper [MOMENTUM ESTICADO]: Distância da EMA 21 (${dados.distEma21Atr.toFixed(2)}x > 1.15x ATR) veta entrada` };
+  // BLOCO 1: Filtro de RSI 15m (Relaxado: piso 22 p/ SHORT e teto 78 p/ LONG; isento p/ EXAUSTAO_REVERSAO)
+  if (dados.modoDetectado !== 'EXAUSTAO_REVERSAO') {
+    if (dados.direcaoModo === 'LONG' && dados.rsi15m > 78) {
+      return { passou: false, motivo: `Gatekeeper [RSI EXAUSTO]: RSI 15m para LONG muito alto (${dados.rsi15m.toFixed(1)} > 78)` };
+    }
+    if (dados.direcaoModo === 'SHORT' && dados.rsi15m < 22) {
+      return { passou: false, motivo: `Gatekeeper [RSI EXAUSTO]: RSI 15m para SHORT muito baixo (${dados.rsi15m.toFixed(1)} < 22)` };
+    }
   }
 
-  // BLOCO 1: Filtro de RSI 15m (Proíbe LONG se rsi > 63, SHORT se rsi < 37)
-  if (dados.direcaoModo === 'LONG' && dados.rsi15m > 63) {
-    return { passou: false, motivo: `Gatekeeper [RSI EXAUSTO]: RSI 15m para LONG muito alto (${dados.rsi15m.toFixed(1)} > 63)` };
-  }
-  if (dados.direcaoModo === 'SHORT' && dados.rsi15m < 37) {
-    return { passou: false, motivo: `Gatekeeper [RSI EXAUSTO]: RSI 15m para SHORT muito baixo (${dados.rsi15m.toFixed(1)} < 37)` };
-  }
-
-  // BLOCO 1: Filtro Anti-Topo / Anti-Fundo (Range 8 Velas 15m)
-  if (dados.direcaoModo === 'LONG' && dados.posRange8Pct !== undefined && dados.posRange8Pct >= 85) {
-    return { passou: false, motivo: `Gatekeeper [TOPO 8 VELAS]: Preço nos 15% superiores do range das últimas 8 velas 15m (${dados.posRange8Pct.toFixed(1)}% >= 85%) sem pullback` };
-  }
-  if (dados.direcaoModo === 'SHORT' && dados.posRange8Pct !== undefined && dados.posRange8Pct <= 15) {
-    return { passou: false, motivo: `Gatekeeper [FUNDO 8 VELAS]: Preço nos 15% inferiores do range das últimas 8 velas 15m (${dados.posRange8Pct.toFixed(1)}% <= 15%) sem pullback` };
+  // BLOCO 1: Filtro Anti-Topo / Anti-Fundo (Range 8 Velas 15m: bloqueia apenas extremos absolutos >= 94% p/ LONG e <= 6% p/ SHORT; isento p/ EXAUSTAO_REVERSAO)
+  if (dados.modoDetectado !== 'EXAUSTAO_REVERSAO') {
+    if (dados.direcaoModo === 'LONG' && dados.posRange8Pct !== undefined && dados.posRange8Pct >= 94) {
+      return { passou: false, motivo: `Gatekeeper [TOPO 8 VELAS]: Preço no extremo superior do range das últimas 8 velas 15m (${dados.posRange8Pct.toFixed(1)}% >= 94%)` };
+    }
+    if (dados.direcaoModo === 'SHORT' && dados.posRange8Pct !== undefined && dados.posRange8Pct <= 6) {
+      return { passou: false, motivo: `Gatekeeper [FUNDO 8 VELAS]: Preço no extremo inferior do range das últimas 8 velas 15m (${dados.posRange8Pct.toFixed(1)}% <= 6%)` };
+    }
   }
 
   if (dados.flatCandles5m > 2) {
@@ -931,9 +964,9 @@ async function verificarGatekeeper(dados, exigirConfirmacao5m = true) {
     return { passou: false, motivo: `Gatekeeper [VETO-LIQUIDEZ-BOOK]: Top 5 níveis (${ladoExecGk}) com apenas $${volExecGk.toFixed(0)} < $150 USDT em 0.15%` };
   }
 
-  // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.80% a 2.50%)
-  if (dados.atrPct15m < 0.80) {
-    return { passou: false, motivo: `Gatekeeper: Volatilidade insuficiente (ATR 15m ${dados.atrPct15m.toFixed(2)}% < 0.80% - Moeda Lenta)` };
+  // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.45% a 2.50%)
+  if (dados.atrPct15m < 0.45) {
+    return { passou: false, motivo: `Gatekeeper: Volatilidade insuficiente (ATR 15m ${dados.atrPct15m.toFixed(2)}% < 0.45% - Moeda Lenta)` };
   }
   if (dados.atrPct15m > 2.50) {
     return { passou: false, motivo: `Gatekeeper: Volatilidade excessiva (ATR 15m ${dados.atrPct15m.toFixed(2)}% > 2.50%)` };
@@ -977,13 +1010,10 @@ async function verificarGatekeeper(dados, exigirConfirmacao5m = true) {
     }
   }
 
-  // 5. Filtro Modo A (Pullback): Proteção de distância colada (< 0.25x ATR) e esticada (> 2.00x ATR)
+  // 5. Filtro Modo A (Pullback): Proteção de distância colada (< 0.25x ATR)
   if (dados.modoDetectado === 'PULLBACK') {
     if (dados.distEma21Atr < 0.25) {
       return { passou: false, motivo: `Gatekeeper [PULLBACK]: Preço colado na EMA 21 (${dados.distEma21Atr.toFixed(2)}x < 0.25x ATR)` };
-    }
-    if (dados.distEma21Atr > 2.00) {
-      return { passou: false, motivo: `Gatekeeper [PULLBACK]: Preço esticado longe da EMA 21 (${dados.distEma21Atr.toFixed(2)}x > 2.00x ATR)` };
     }
   }
 
@@ -1032,10 +1062,11 @@ ADX 15m: ${dados.adx15m.toFixed(1)} | RVOL 15m: ${dados.rvol15m.toFixed(2)}x | T
 Alavancagem Sugerida: ${dados.leverageSugerida}x | SL Inicial: ${dados.slPrice.toFixed(4)} | TP Inicial: ${dados.tpPrice.toFixed(4)}
 Histórico RAG recente de ${symbol}: ${ragHistTxt}
 
-DIRETRIZES EXECUTIVAS ANTI-EXAUSTÃO:
-1. VETE IMEDIATAMENTE ("aprovado": false, "action": "WAIT") qualquer compra de topo esticado (preço alto no range recente > 80% ou sem pullback prévio saudável na EMA 21).
-2. VETE IMEDIATAMENTE ("aprovado": false, "action": "WAIT") qualquer venda de fundo exausto (preço baixo no range recente < 20% ou após sequência de velas de despejo).
-3. Toda aprovação exige confluência técnica limpa, distância EMA 21 controlada e confiança >= 75. Em caso de dúvida ou esticada, vete.
+DIRETRIZES EXECUTIVAS DE ENTRADA:
+1. APROVE entradas de continuidade de tendência e pullback ("aprovado": true, "confidence" >= 65) quando 1h, 15m e 5m estiverem alinhados com a direção do setup.
+2. APROVE entradas de EXAUSTÃO REVERSÃO ("aprovado": true, "confidence" >= 65) quando RSI 15m <= 22 (Long) ou >= 78 (Short) com vela de reação no 5m.
+3. VETE ("aprovado": false, "action": "WAIT") apenas topos esticados sem tendência (range recente >= 94% sem confluência) ou fundos desabando sem vela de reação.
+4. Toda aprovação exige confluência técnica e confiança >= 65. Em caso de dúvida real, vete.
 
 Responda APENAS JSON no formato exato:
 {
@@ -1250,9 +1281,9 @@ ${JSON.stringify(payloadOrdem)}
 
 DIRETRIZES EXECUTIVAS:
 1. "MANTER": Posição com estrutura saudável (HP >= 60) ou respirando normalmente na direção do setup.
-2. "TRAVAR_LUCRO": Posição com lucro acumulado (ROI >= +1.30%), mas enfrentando resistência ou sinais de exaustão de microestrutura.
-3. "MODO_RESGATE": Posição em drawdown (ROI < 0) com momentum fraco ou estagnada sem tração, mas que ainda pode dar repique técnico para saída no zero a zero (+0.25% ROI). Encurta o Stop Loss dinâmico (sugira em novo_sl_roi entre -2.50% e -4.80%).
-4. "FECHAR_AGORA": Quebra estrutural irreversível (duração >= 15m, MFE < +0.20%, fluxo institucional despejando forte contra e ROI <= -2.50%). Cortar a mercado imediatamente como stop preventivo para economizar metade do Stop Loss.
+2. "TRAVAR_LUCRO": Posição com lucro acumulado (ROI >= +1.50%), mas enfrentando resistência ou exaustão de microestrutura.
+3. "MODO_RESGATE": Posição em drawdown (ROI < 0) com momentum fraco ou estagnada. O robô prepara a saída no repique técnico (+0.30% ROI) e ajusta o Stop Loss dinâmico para -4.20% ROI. PROIBIDO fechar a mercado no fundo.
+4. "FECHAR_AGORA": Desativado para ordens negativas. Nunca sugerir corte a mercado no prejuízo.
 
 Responda APENAS um JSON no formato exato:
 {
@@ -1297,39 +1328,36 @@ Responda APENAS um JSON no formato exato:
 
       // ── Execução Automática da Decisão do JEV-AI ──
       if (dec.acao === 'TRAVAR_LUCRO') {
-        if (roiAtual >= 1.30) {
-          if (!alvo.parcialExecutada) {
+        if (roiAtual >= 1.50) {
+          if (!alvo.parcialExecutada && roiAtual >= 3.60) {
             console.log(`[JEV-AI] TRAVAR_LUCRO: Executando Parcial 50% em ${sym} (ROI: +${roiAtual.toFixed(2)}%)`);
             await executarParcial50(sym, alvo, pos, curPrice, 'JEV_AI_TRAVA_LUCRO');
           }
           alvo.beArmed = true;
-          const novoLocked = Math.max(alvo.lockedRoi || 0.50, Number((roiAtual - 0.50).toFixed(2)));
+          const novoLocked = Math.max(alvo.lockedRoi || 0.65, Number((roiAtual - 0.50).toFixed(2)));
           alvo.lockedRoi = novoLocked;
           const beDist = entryPrice * ((alvo.lockedRoi / alav) / 100);
           const calcStopPrice = isLong ? (entryPrice + beDist) : (entryPrice - beDist);
           alvo.beStopPrice = alvo.beStopPrice ? (isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice)) : calcStopPrice;
           salvarAlvos();
         }
-      } else if (dec.acao === 'MODO_RESGATE') {
+      } else if (dec.acao === 'MODO_RESGATE' || (dec.acao === 'FECHAR_AGORA' && roiAtual < 0)) {
+        // PROIBIDO FECHAR_AGORA no negativo! Sempre converte para MODO_RESGATE (+0.30% ROI repique / -4.20% ROI stop)
         alvo.modoResgateAtivo = true;
-        alvo.tpResgateRoi = 0.25; // Alvo de saída no repique em +0.25% ROI
-        let slDefinido = -3.60;
-        if (dec.novo_sl_roi !== null && dec.novo_sl_roi !== undefined) {
-          const val = Number(dec.novo_sl_roi);
-          if (!isNaN(val)) {
-            const negVal = val < 0 ? val : -val;
-            slDefinido = Math.max(-4.80, Math.min(-2.50, negVal));
-          }
-        }
-        alvo.slResgateRoi = slDefinido;
+        alvo.tpResgateRoi = 0.30; // Alvo de saída no repique em +0.30% ROI
+        alvo.slResgateRoi = -4.20; // Stop Loss dinâmico ajustado para -4.20% ROI
+        alvo.fecharImediatoJev = false;
         salvarAlvos();
-        console.log(`[JEV-AI] MODO_RESGATE ${sym}: Saída no repique em +0.25% ROI | Stop encurtado para ${slDefinido.toFixed(2)}% ROI`);
+        console.log(`[JEV-AI] MODO_RESGATE ${sym} (Decisão: ${dec.acao} convertida para RESGATE | ROI: ${roiAtual.toFixed(2)}%): Saída no repique em +0.30% ROI | Stop ajustado para -4.20% ROI`);
       } else if (dec.acao === 'FECHAR_AGORA') {
-        if (duracaoMin >= 15 && (alvo.maxRoiReached || 0) < 0.20 && roiAtual <= -2.50) {
+        // FECHAR_AGORA permitido EXCLUSIVAMENTE se ordem positiva (roiAtual >= 0)
+        if (roiAtual >= 0 && duracaoMin >= 15 && (alvo.maxRoiReached || 0) < 0.20) {
           alvo.fecharImediatoJev = true;
-          alvo.motivoFechamentoJev = `[JEV_AI_STOP_PREVENTIVO] ${dec.motivo_curto || 'Quebra estrutural irreversível'} (ROI: ${roiAtual.toFixed(2)}% | Duração: ${Math.round(duracaoMin)}m)`;
+          alvo.motivoFechamentoJev = `[JEV_AI_STOP_PREVENTIVO] ${dec.motivo_curto || 'Quebra estrutural'} (ROI: +${roiAtual.toFixed(2)}% | Duração: ${Math.round(duracaoMin)}m)`;
           salvarAlvos();
-          console.log(`[JEV-AI] FECHAR_AGORA ativado para ${sym}: ${alvo.motivoFechamentoJev}`);
+          console.log(`[JEV-AI] FECHAR_AGORA positivo ativado para ${sym}: ${alvo.motivoFechamentoJev}`);
+        } else {
+          console.log(`[JEV-AI] FECHAR_AGORA ignorado para ${sym}: roiAtual < 0 ou condições não atingidas`);
         }
       }
       return dec;
@@ -1420,7 +1448,7 @@ async function avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracao
   // ── CASO 1: Ordem no POSITIVO (roiPuro >= +1.50%) — Proteção Rápida do Lucro ──
   if (roiPuro >= 1.50) {
     const quedaGraveHp = (hpAtual < hpAnt) && (hpAtual <= 65 || (hpAnt - hpAtual) >= 25);
-    // Se ainda não executou parcial de +2.20%, mas pico >= +1.50% e queda de saúde confirmada (T2 <= 65 ou queda >= 25 pts)
+    // Se ainda não executou parcial de +3.60%, mas pico >= +1.50% e queda de saúde confirmada (T2 <= 65 ou queda >= 25 pts)
     if (!alvo.parcialExecutada && (alvo.maxRoiReached >= 1.50) && quedaGraveHp) {
       alvo.beArmed = true;
       alvo.lockedRoi = Math.max(alvo.lockedRoi || 0, 0.80);
@@ -1429,12 +1457,6 @@ async function avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracao
       alvo.beStopPrice = alvo.beStopPrice ? (isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice)) : calcStopPrice;
       alvo.defesaLucroAtiva = true;
       console.log(`[🛡️ DEFESA LUCRO ANTECIPADA] ${sym}: Catraca antecipada para +0.80% ROI devido à queda de HP (${hpAnt} ➔ ${hpAtual} | ΔHP: ${hpAnt - hpAtual}) com pico de +${alvo.maxRoiReached.toFixed(2)}%`);
-
-      // Se roiPuro >= +1.75%, antecipa e executa Parcial de 50% imediatamente!
-      if (roiPuro >= 1.75) {
-        console.log(`[🛡️ PARCIAL 50% ANTECIPADA POR QUEDA DE HP (T1:${hpAnt} ➔ T2:${hpAtual})] ${sym}: ROI +${roiPuro.toFixed(2)}% >= +1.75%`);
-        await executarParcial50(sym, alvo, pos, curPrice, `ANTECIPADA_HP_${hpAnt}_${hpAtual}`);
-      }
     }
 
     // Se já em lucro alto (roiPuro >= +3.20%) e HP cair abaixo de 45 ou RSI 5m em exaustão extrema
@@ -1469,14 +1491,9 @@ async function avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracao
     else if (hpAnt <= 42 && hpAtual < hpAnt && hpAtual <= 32) {
       if (!alvo.modoResgateAtivo) {
         alvo.modoResgateAtivo = true;
-        alvo.tpResgateRoi = 0.25; // Alvo de saída no repique (+0.25% ROI para empate técnico com taxas)
-        
-        // Comprime o Stop Loss em 25% (ex: se era -5.60%, sobe para -4.20% ROI)
-        const funil = calcularFunilTempo(alvo, duracaoMin);
-        const slBase = Math.abs(funil?.slRoiDinamico || alvo.slRoiInicial || 5.60);
-        alvo.slResgateRoi = -Number((slBase * 0.75).toFixed(2));
-
-        console.log(`[🚑 MODO RESGATE ATIVADO] ${sym}: Confirmada deterioração grave em 2 leituras (T1:${hpAnt} ➔ T2:${hpAtual}). Alvo de saída no repique baixado para +0.35% ROI. Stop Loss comprimido em 25% para ${alvo.slResgateRoi.toFixed(2)}% ROI.`);
+        alvo.tpResgateRoi = 0.30; // Alvo de saída no repique (+0.30% ROI para empate técnico com taxas)
+        alvo.slResgateRoi = -4.20; // Stop Loss dinâmico ajustado para -4.20% ROI
+        console.log(`[🚑 MODO RESGATE ATIVADO] ${sym}: Confirmada deterioração grave em 2 leituras (T1:${hpAnt} ➔ T2:${hpAtual}). Alvo de saída no repique em +0.30% ROI. Stop Loss dinâmico em -4.20% ROI.`);
       }
     }
   }
@@ -1553,12 +1570,12 @@ setInterval(async () => {
         // ── BLOCO 3 & 4: AVALIAÇÃO GAMIFICADA DE SAÚDE (HP 0-100 A CADA 120s) ──
         await avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracaoMin).catch(e => console.error(`[HP-ERRO] ${sym}:`, e.message));
 
-        // ── BLOCO 4.2: TIRO RÁPIDO AOS +2.20% ROI — PARCIAL DE 50% ──
-        if (roiPuro >= 2.20 || alvo.maxRoiReached >= 2.20) {
+        // ── BLOCO 4.2: PARCIAL DE 50% AOS +3.60% ROI (LUCRO GORDO NO BOLSO) ──
+        if (roiPuro >= 3.60 || alvo.maxRoiReached >= 3.60) {
           if (!alvo.parcialExecutada) {
             partialTicks[sym] = (partialTicks[sym] || 0) + 1;
             if (partialTicks[sym] >= 2) {
-              await executarParcial50(sym, alvo, pos, curPrice, 'TIRO_RAPIDO_220');
+              await executarParcial50(sym, alvo, pos, curPrice, 'PARCIAL_360');
             }
           }
         } else {
@@ -1569,8 +1586,8 @@ setInterval(async () => {
         const prevArmed = alvo.beArmed || false;
         const prevLockedRoi = alvo.lockedRoi || 0;
 
-        if (alvo.maxRoiReached < 1.60) {
-          // Abaixo de +1.60% de ROI: se Catraca não foi armada por Defesa de Lucro HP/JEV, mantém respiro
+        if (alvo.maxRoiReached < 1.50) {
+          // Abaixo de +1.50% de ROI: se Catraca não foi armada por Defesa de Lucro HP/JEV, mantém respiro
           if (!alvo.beArmed) {
             alvo.lockedRoi = 0;
             alvo.beStopPrice = null;
@@ -1579,11 +1596,12 @@ setInterval(async () => {
           alvo.beArmed = true;
           let novoLocked = 0.65;
           if (alvo.maxRoiReached >= 8.00) novoLocked = 8.00;
-          else if (alvo.maxRoiReached >= 6.00) novoLocked = 5.00;
-          else if (alvo.maxRoiReached >= 4.80) novoLocked = 3.80;
-          else if (alvo.maxRoiReached >= 3.80) novoLocked = 2.80;
-          else if (alvo.maxRoiReached >= 3.00) novoLocked = 1.95;
-          else if (alvo.maxRoiReached >= 2.20) novoLocked = 1.25;
+          else if (alvo.maxRoiReached >= 6.80) novoLocked = 5.90;
+          else if (alvo.maxRoiReached >= 5.60) novoLocked = 4.70;
+          else if (alvo.maxRoiReached >= 4.50) novoLocked = 3.70;
+          else if (alvo.maxRoiReached >= 3.60) novoLocked = 2.85;
+          else if (alvo.maxRoiReached >= 2.90) novoLocked = 2.10;
+          else if (alvo.maxRoiReached >= 2.20) novoLocked = 1.35;
           else novoLocked = 0.65;
 
           alvo.lockedRoi = Math.max(alvo.lockedRoi || 0, novoLocked);
@@ -1613,7 +1631,7 @@ setInterval(async () => {
         if (alvo.jevDecisao) {
           hpBadge = `[🤖 JEV-AI: ${alvo.jevDecisao.acao} | "${alvo.jevDecisao.motivo_curto}" | HP: ${hp2}/100]`;
         } else if (alvo.modoResgateAtivo) {
-          hpBadge = `[🚑 MODO RESGATE ATIVO (HP ${hp1} ➔ ${hp2}/100) | SAÍDA PROGRAMADA NO REPIQUE (+${(alvo.tpResgateRoi || 0.25).toFixed(2)}% ROI)]`;
+          hpBadge = `[🚑 MODO RESGATE ATIVO (HP ${hp1} ➔ ${hp2}/100) | SAÍDA PROGRAMADA NO REPIQUE (+${(alvo.tpResgateRoi || 0.30).toFixed(2)}% ROI)]`;
         } else if (alvo.defesaLucroAtiva || (roiPuro >= 1.50 && hp2 < hp1 && (hp2 <= 65 || (hp1 - hp2) >= 25))) {
           hpBadge = `[🛡️ HP EM QUEDA (${hp1} ➔ ${hp2}/100) | DEFESA DE LUCRO ANTECIPADA ATIVA]`;
         } else if (hp2 >= 60) {
@@ -1629,11 +1647,11 @@ setInterval(async () => {
           const stopFmt = formatarPrecoAtivo(sym, alvo.beStopPrice);
           statusBadge += ` [🛡️ CATRACA +${alvo.lockedRoi.toFixed(2)}%: GARANTIDO ($${stopFmt}) | PICO +${maxRoi.toFixed(2)}%]`;
         } else {
-          statusBadge += ` [🌱 RESPIRO LIVRE ATÉ +1.60% ROI (PICO: +${maxRoi.toFixed(2)}%)]`;
+          statusBadge += ` [🌱 RESPIRO LIVRE ATÉ +1.50% ROI (PICO: +${maxRoi.toFixed(2)}%)]`;
         }
         if (duracaoMin > 40) {
           const stopStr = (alvo.beArmed && alvo.lockedRoi > 0) ? `+${alvo.lockedRoi.toFixed(2)}%` : ((alvo.modoResgateAtivo && alvo.slResgateRoi) ? `${alvo.slResgateRoi.toFixed(2)}%` : `${funil.slRoiDinamico.toFixed(2)}%`);
-          const alvoStr = alvo.modoResgateAtivo ? `+${(alvo.tpResgateRoi || 0.25).toFixed(2)}%` : `+${funil.tpRoiDinamico.toFixed(2)}%`;
+          const alvoStr = alvo.modoResgateAtivo ? `+${(alvo.tpResgateRoi || 0.30).toFixed(2)}%` : `+${funil.tpRoiDinamico.toFixed(2)}%`;
           statusBadge += ` [⏳ FUNIL ${Math.floor(duracaoMin)}m: ALVO ${alvoStr} | STOP ${stopStr}]`;
         }
         if (alvo.parcialExecutada) {
@@ -1645,17 +1663,26 @@ setInterval(async () => {
         let deveFechar = false;
         let motivoFechamento = '';
 
-        // 0. Encerramento Preventivo JEV-AI
+        // 0. Encerramento Preventivo JEV-AI (PROIBIDO FECHAR NO NEGATIVO!)
         if (!deveFechar && alvo.fecharImediatoJev) {
-          deveFechar = true;
-          motivoFechamento = alvo.motivoFechamentoJev || `[JEV_AI_STOP_PREVENTIVO] Quebra estrutural via IA (ROI: ${roi.toFixed(2)}%)`;
+          if (roi < 0) {
+            alvo.fecharImediatoJev = false;
+            alvo.modoResgateAtivo = true;
+            alvo.tpResgateRoi = 0.30;
+            alvo.slResgateRoi = -4.20;
+            salvarAlvos();
+            console.log(`[🛡️ BLINDAGEM JEV] ${sym}: Bloqueado stop preventivo no negativo (ROI: ${roi.toFixed(2)}%). Convertido para MODO_RESGATE (TP +0.30%, SL -4.20%).`);
+          } else {
+            deveFechar = true;
+            motivoFechamento = alvo.motivoFechamentoJev || `[JEV_AI_STOP_PREVENTIVO] Quebra estrutural via IA (ROI: +${roi.toFixed(2)}%)`;
+          }
         }
 
-        // 1. Take Profit pelo Modo Resgate (+0.25% ROI), Funil Dinâmico ou TP Cheio Fixo
+        // 1. Take Profit pelo Modo Resgate (+0.30% ROI), Funil Dinâmico ou TP Cheio Fixo
         if (!deveFechar) {
-          if (alvo.modoResgateAtivo && roi >= (alvo.tpResgateRoi || 0.25)) {
+          if (alvo.modoResgateAtivo && roi >= (alvo.tpResgateRoi || 0.30)) {
             deveFechar = true;
-            motivoFechamento = `[SAIDA_RESGATE_REPIQUE_HP] Alvo de Resgate atingido no repique (+${roi.toFixed(2)}% ROI >= +${(alvo.tpResgateRoi || 0.25).toFixed(2)}% | Taxas cobertas | Duração: ${Math.round(duracaoMin)}m)`;
+            motivoFechamento = `[SAIDA_RESGATE_REPIQUE_HP] Alvo de Resgate atingido no repique (+${roi.toFixed(2)}% ROI >= +${(alvo.tpResgateRoi || 0.30).toFixed(2)}% | Taxas cobertas | Duração: ${Math.round(duracaoMin)}m)`;
           } else if (roi >= funil.tpRoiDinamico || (alvo.tpPrice && (isLong ? curPrice >= alvo.tpPrice : curPrice <= alvo.tpPrice))) {
             deveFechar = true;
             const tpTag = duracaoMin > 40 ? 'TP_FUNIL_TEMPO' : 'TAKE PROFIT';
@@ -1867,8 +1894,8 @@ async function atualizarTopSetups() {
 
       avaliadas.push(itemInfo);
 
-      // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.80% a 2.50%) e RVOL para entradas
-      if (dados.atrPct15m < 0.80 || dados.atrPct15m > 2.50 || dados.rvol15m < 0.85) continue;
+      // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.45% a 2.50%) e RVOL para entradas
+      if (dados.atrPct15m < 0.45 || dados.atrPct15m > 2.50 || dados.rvol15m < 0.85) continue;
 
       // Gatekeeper para setup ativo pronto para entrada
       const gk = await verificarGatekeeper(dados, false);
@@ -2204,7 +2231,7 @@ setInterval(async () => {
         evaluatedAt: now
       };
 
-      if ((dec.action === 'LONG' || dec.action === 'SHORT') && dec.aprovado !== false && dec.confidence >= 75) {
+      if ((dec.action === 'LONG' || dec.action === 'SHORT') && dec.aprovado !== false && dec.confidence >= 65) {
         const ladoTrade = dec.action === 'LONG' ? 'BUY' : 'SELL';
         const alav = Math.min(5, Math.max(1, dec.leverage || dados.leverageSugerida));
         const valorUSDT = 10;
