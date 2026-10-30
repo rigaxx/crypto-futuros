@@ -155,6 +155,12 @@ function calcularFunilTempo(alvo, duracaoMin) {
   };
 }
 
+// Piso de saída do Modo Resgate: taxa taker ida+volta (~0.10% do preço) + folga de slippage (0.08%),
+// escalado pela alavancagem (ROI = variação de preço × alav), com mínimo de 1.20% ROI.
+function calcularPisoResgate(alav) {
+  return Math.max(1.20, Number(((0.10 + 0.08) * (alav || 1)).toFixed(2)));
+}
+
 // Contador persistente de Win / Loss (Placar Institucional)
 let placarStats = { wins: 0, losses: 0, total: 0 };
 try {
@@ -173,7 +179,7 @@ function salvarPlacarStats() {
 
 const closedTradeEvents = new Map(); // symbol -> timestamp para travar duplicidades atômicas
 
-// BLOCO 1: Quarentena Anti-Revanche Pós-Loss de 3 Horas (180m)
+// BLOCO 1: Quarentena Anti-Revanche Pós-Loss de 1 Hora (60m)
 const LOSS_COOLDOWN_FILE = '/var/www/crypto/.symbol_loss_cooldown.json';
 let symbolLossCooldown = {};
 try {
@@ -1127,6 +1133,7 @@ const closingStartedAt = {};
 const beBreachedTicks = {};
 const slBreachedTicks = {};
 const partialTicks = {};
+const resgateTicks = {}; // confirmação anti-pavio (2 ticks) p/ saída MODO_RESGATE — evita fechar num pico que reverte antes do fill
 
 // ── BLOCO 3: MOTOR GAMIFICADO DE SAÚDE DA ORDEM ABERTA (HP 0-100) ──
 function calcularHpOrdemAberta(alvo, analise, roiAtual = 0, duracaoMin = 0) {
@@ -1322,11 +1329,11 @@ Responda APENAS um JSON no formato exato:
         // PROIBIDO FECHAR_AGORA no negativo! Só ativa MODO_RESGATE se duracaoMin >= 35 e hpAtual <= 35
         if (duracaoMin >= 35 && hpAtual <= 35) {
           alvo.modoResgateAtivo = true;
-          alvo.tpResgateRoi = 0.85; // Alvo de saída no repique em no mínimo +0.85% ROI
+          alvo.tpResgateRoi = calcularPisoResgate(alav); // Alvo de saída no repique, piso escalado por alavancagem (cobre taxa+slippage)
           alvo.slResgateRoi = null; // Proibido encurtar Stop Loss pelo Modo Resgate! SL fica com funil temporal
           alvo.fecharImediatoJev = false;
           salvarAlvos();
-          console.log(`[JEV-AI] MODO_RESGATE ${sym} (Duração ${Math.round(duracaoMin)}m >= 35m | HP: ${hpAtual} <= 35): Saída no repique em +0.85% ROI | Stop mantido no Funil/ATR`);
+          console.log(`[JEV-AI] MODO_RESGATE ${sym} (Duração ${Math.round(duracaoMin)}m >= 35m | HP: ${hpAtual} <= 35): Saída no repique em +${alvo.tpResgateRoi.toFixed(2)}% ROI | Stop mantido no Funil/ATR`);
         } else {
           alvo.fecharImediatoJev = false;
           console.log(`[JEV-AI] ${sym}: Sugestão de resgate/fechamento ignorada (Duração ${Math.round(duracaoMin)}m < 35m ou HP ${hpAtual} > 35). Deixando respirar.`);
@@ -1465,15 +1472,16 @@ async function avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracao
         alvo.modoResgateAtivo = false;
         alvo.tpResgateRoi = null;
         alvo.slResgateRoi = null;
+        delete resgateTicks[sym];
       }
-    } 
+    }
     // Cenário 2B: Deterioração Grave Confirmada em 2 Leituras (hpAnt <= 35 E hpAtual < hpAnt E hpAtual <= 35)
     else if (hpAnt <= 35 && hpAtual < hpAnt && hpAtual <= 35) {
       if (!alvo.modoResgateAtivo) {
         alvo.modoResgateAtivo = true;
-        alvo.tpResgateRoi = 0.85; // Alvo de saída no repique (+0.85% ROI para garantir lucro líquido pós-taxas)
+        alvo.tpResgateRoi = calcularPisoResgate(alav); // Alvo de saída no repique, piso escalado por alavancagem (cobre taxa+slippage)
         alvo.slResgateRoi = null; // Proibido encurtar Stop Loss pelo Modo Resgate! SL mantido no Funil/ATR
-        console.log(`[🚑 MODO RESGATE ATIVADO] ${sym}: Confirmada deterioração grave em 2 leituras com duração ${Math.round(duracaoMin)}m >= 35m (T1:${hpAnt} ➔ T2:${hpAtual} <= 35). Alvo de saída no repique em +0.85% ROI. SL mantido no Funil.`);
+        console.log(`[🚑 MODO RESGATE ATIVADO] ${sym}: Confirmada deterioração grave em 2 leituras com duração ${Math.round(duracaoMin)}m >= 35m (T1:${hpAnt} ➔ T2:${hpAtual} <= 35). Alvo de saída no repique em +${alvo.tpResgateRoi.toFixed(2)}% ROI. SL mantido no Funil.`);
       }
     }
   }
@@ -1520,6 +1528,7 @@ setInterval(async () => {
           delete beBreachedTicks[sym];
           delete slBreachedTicks[sym];
           delete partialTicks[sym];
+          delete resgateTicks[sym];
           salvarAlvos();
           continue;
         }
@@ -1611,7 +1620,7 @@ setInterval(async () => {
         if (alvo.jevDecisao) {
           hpBadge = `[🤖 JEV-AI: ${alvo.jevDecisao.acao} | "${alvo.jevDecisao.motivo_curto}" | HP: ${hp2}/100]`;
         } else if (alvo.modoResgateAtivo) {
-          hpBadge = `[🚑 MODO RESGATE ATIVO (HP ${hp1} ➔ ${hp2}/100) | SAÍDA PROGRAMADA NO REPIQUE (+${(alvo.tpResgateRoi || 0.85).toFixed(2)}% ROI)]`;
+          hpBadge = `[🚑 MODO RESGATE ATIVO (HP ${hp1} ➔ ${hp2}/100) | SAÍDA PROGRAMADA NO REPIQUE (+${(alvo.tpResgateRoi || calcularPisoResgate(alav)).toFixed(2)}% ROI)]`;
         } else if (alvo.defesaLucroAtiva || (roiPuro >= 1.50 && hp2 < hp1 && (hp2 <= 65 || (hp1 - hp2) >= 25))) {
           hpBadge = `[🛡️ HP EM QUEDA (${hp1} ➔ ${hp2}/100) | DEFESA DE LUCRO ANTECIPADA ATIVA]`;
         } else if (hp2 >= 60) {
@@ -1631,7 +1640,7 @@ setInterval(async () => {
         }
         if (duracaoMin > 40) {
           const stopStr = (alvo.beArmed && alvo.lockedRoi > 0) ? `+${alvo.lockedRoi.toFixed(2)}%` : `${funil.slRoiDinamico.toFixed(2)}%`;
-          const alvoStr = alvo.modoResgateAtivo ? `+${(alvo.tpResgateRoi || 0.85).toFixed(2)}%` : `+${funil.tpRoiDinamico.toFixed(2)}%`;
+          const alvoStr = alvo.modoResgateAtivo ? `+${(alvo.tpResgateRoi || calcularPisoResgate(alav)).toFixed(2)}%` : `+${funil.tpRoiDinamico.toFixed(2)}%`;
           statusBadge += ` [⏳ FUNIL ${Math.floor(duracaoMin)}m: ALVO ${alvoStr} | STOP ${stopStr}]`;
         }
         if (alvo.parcialExecutada) {
@@ -1649,10 +1658,10 @@ setInterval(async () => {
             alvo.fecharImediatoJev = false;
             if (duracaoMin >= 35 && hp2 <= 35) {
               alvo.modoResgateAtivo = true;
-              alvo.tpResgateRoi = 0.85;
+              alvo.tpResgateRoi = calcularPisoResgate(alav);
               alvo.slResgateRoi = null;
               salvarAlvos();
-              console.log(`[🛡️ BLINDAGEM JEV] ${sym}: Convertido para MODO_RESGATE (TP +0.85%, SL pelo Funil).`);
+              console.log(`[🛡️ BLINDAGEM JEV] ${sym}: Convertido para MODO_RESGATE (TP +${alvo.tpResgateRoi.toFixed(2)}%, SL pelo Funil).`);
             } else {
               salvarAlvos();
               console.log(`[🛡️ BLINDAGEM JEV] ${sym}: Bloqueado fechamento no negativo (ROI: ${roi.toFixed(2)}% | Duração ${Math.round(duracaoMin)}m). Posição mantida.`);
@@ -1663,12 +1672,19 @@ setInterval(async () => {
           }
         }
 
-        // 1. Take Profit pelo Modo Resgate (+0.85% ROI), Funil Dinâmico ou TP Cheio Fixo
+        // 1. Take Profit pelo Modo Resgate (piso por alavancagem, confirmado em 2 ticks ANTI-PAVIO), Funil Dinâmico ou TP Cheio Fixo
         if (!deveFechar) {
-          if (alvo.modoResgateAtivo && roi >= (alvo.tpResgateRoi || 0.85)) {
-            deveFechar = true;
-            motivoFechamento = `[SAIDA_RESGATE_REPIQUE_HP] Alvo de Resgate atingido no repique (+${roi.toFixed(2)}% ROI >= +${(alvo.tpResgateRoi || 0.85).toFixed(2)}% | Taxas cobertas | Duração: ${Math.round(duracaoMin)}m)`;
-          } else if (roi >= funil.tpRoiDinamico || (alvo.tpPrice && (isLong ? curPrice >= alvo.tpPrice : curPrice <= alvo.tpPrice))) {
+          const pisoResgateAtual = Math.max(alvo.tpResgateRoi || calcularPisoResgate(alav), calcularPisoResgate(alav));
+          if (alvo.modoResgateAtivo && roi >= pisoResgateAtual) {
+            resgateTicks[sym] = (resgateTicks[sym] || 0) + 1;
+            if (resgateTicks[sym] >= 2) {
+              deveFechar = true;
+              motivoFechamento = `[SAIDA_RESGATE_REPIQUE_HP] Alvo de Resgate atingido no repique (+${roi.toFixed(2)}% ROI >= +${pisoResgateAtual.toFixed(2)}% | Taxa+slippage cobertos | Duração: ${Math.round(duracaoMin)}m)`;
+            }
+          } else {
+            resgateTicks[sym] = 0;
+          }
+          if (!deveFechar && (roi >= funil.tpRoiDinamico || (alvo.tpPrice && (isLong ? curPrice >= alvo.tpPrice : curPrice <= alvo.tpPrice)))) {
             deveFechar = true;
             const tpTag = duracaoMin > 40 ? 'TP_FUNIL_TEMPO' : 'TAKE PROFIT';
             motivoFechamento = `[${tpTag}] ROI atingiu +${roi.toFixed(2)}% >= Alvo +${funil.tpRoiDinamico.toFixed(2)}% (Preço: $${formatarPrecoAtivo(sym, curPrice)} | Duração: ${Math.round(duracaoMin)}m)`;
@@ -1737,6 +1753,7 @@ setInterval(async () => {
           delete beBreachedTicks[symFechado];
           delete slBreachedTicks[symFechado];
           delete partialTicks[symFechado];
+          delete resgateTicks[symFechado];
           salvarAlvos();
 
           try {
@@ -1973,6 +1990,7 @@ setInterval(async () => {
                   delete beBreachedTicks[symFechado];
                   delete slBreachedTicks[symFechado];
                   delete partialTicks[symFechado];
+                  delete resgateTicks[symFechado];
                   salvarAlvos();
 
                   gatekeeperVetoedUntil[symFechado] = now + 2700000; // Bloqueio 45 minutos (2700000ms)
@@ -2057,6 +2075,7 @@ setInterval(async () => {
                   delete beBreachedTicks[symFechado];
                   delete slBreachedTicks[symFechado];
                   delete partialTicks[symFechado];
+                  delete resgateTicks[symFechado];
                   salvarAlvos();
 
                   gatekeeperVetoedUntil[symFechado] = now + 2700000; // Bloqueio 45 minutos (2700000ms)
@@ -2218,7 +2237,9 @@ setInterval(async () => {
 
       if ((dec.action === 'LONG' || dec.action === 'SHORT') && dec.aprovado !== false && dec.confidence >= 65) {
         const ladoTrade = dec.action === 'LONG' ? 'BUY' : 'SELL';
-        const alav = Math.min(4, Math.max(1, dec.leverage || dados.leverageSugerida));
+        // Assimetria defensiva: SHORT custa mais caro de errar (funding+spread), então opera com teto de alavancagem menor.
+        const alavCap = dec.action === 'SHORT' ? 3 : 4;
+        const alav = Math.min(alavCap, Math.max(1, dec.leverage || dados.leverageSugerida));
         const valorUSDT = 10;
 
         // Declaração segura com escopo prévio para evitar Temporal Dead Zone
@@ -2331,13 +2352,21 @@ setInterval(async () => {
           slDistExec = precoExec * (dados.slPctReal / 100);
           slRoeExec = (slDistExec / precoExec) * alav * 100;
 
-          // Banda Saudável de Stop Loss em ROI: piso -5.20% e teto -5.80% (BLOCO 5)
-          if (slRoeExec < 5.20) {
-            slRoeExec = 5.20;
-            slDistExec = precoExec * ((5.20 / alav) / 100);
-          } else if (slRoeExec > 5.80) {
-            slRoeExec = 5.80;
-            slDistExec = precoExec * ((5.80 / alav) / 100);
+          // Banda Saudável de Stop Loss em ROI (BLOCO 5), teto por modo/lado:
+          // ignição rápida (CONTINUATION/MOMENTUM) falha mais barato -3.80, SHORT -4.20 (assimetria), demais LONG (PULLBACK/EXAUSTAO) -5.40.
+          let slAlvoRoi = 5.40;
+          if ((dados.modoLabel || '').includes('CONTINUATION') || (dados.modoLabel || '').includes('MOMENTUM')) {
+            slAlvoRoi = 3.80;
+          } else if (dec.action === 'SHORT') {
+            slAlvoRoi = 4.20;
+          }
+          const slPisoRoi = slAlvoRoi - 0.60;
+          if (slRoeExec < slPisoRoi) {
+            slRoeExec = slPisoRoi;
+            slDistExec = precoExec * ((slPisoRoi / alav) / 100);
+          } else if (slRoeExec > slAlvoRoi) {
+            slRoeExec = slAlvoRoi;
+            slDistExec = precoExec * ((slAlvoRoi / alav) / 100);
           }
           slPrecoDefinido = dec.action === 'LONG' ? (precoExec - slDistExec) : (precoExec + slDistExec);
 
@@ -2700,7 +2729,8 @@ app.get('/api/ia-advise/:symbol', async (req, res) => {
 app.post('/api/trade', async (req, res) => {
   try {
     const { symbol, lado, valorUSDT, alavancagem } = req.body;
-    const alav = Math.min(4, Math.max(1, parseInt(alavancagem) || 1));
+    const alavCapMan = lado === 'SELL' ? 3 : 4; // mesma assimetria defensiva do autobot: SHORT manual também tetado em 3x
+    const alav = Math.min(alavCapMan, Math.max(1, parseInt(alavancagem) || 1));
     await fut.garantirAlavancagem(symbol, alav, 'ISOLATED');
 
     const book = await fut.livroOfertas(symbol, 5);
@@ -2730,14 +2760,21 @@ app.post('/api/trade', async (req, res) => {
 
     if (fill > 0) {
       const dados = await analisarEstruturaEMercado(symbol);
-      let slDistMan = dados ? (dados.slPctReal / 100 * preco) : (preco * ((5.50 / alav) / 100));
+      let slAlvoRoiMan = 5.40;
+      if ((dados?.modoLabel || '').includes('CONTINUATION') || (dados?.modoLabel || '').includes('MOMENTUM')) {
+        slAlvoRoiMan = 3.80;
+      } else if (lado === 'SELL') {
+        slAlvoRoiMan = 4.20;
+      }
+      const slPisoRoiMan = slAlvoRoiMan - 0.60;
+      let slDistMan = dados ? (dados.slPctReal / 100 * preco) : (preco * ((slAlvoRoiMan / alav) / 100));
       let slRoeMan = (slDistMan / preco) * alav * 100;
-      if (slRoeMan < 5.20) {
-        slRoeMan = 5.20;
-        slDistMan = preco * ((5.20 / alav) / 100);
-      } else if (slRoeMan > 5.80) {
-        slRoeMan = 5.80;
-        slDistMan = preco * ((5.80 / alav) / 100);
+      if (slRoeMan < slPisoRoiMan) {
+        slRoeMan = slPisoRoiMan;
+        slDistMan = preco * ((slPisoRoiMan / alav) / 100);
+      } else if (slRoeMan > slAlvoRoiMan) {
+        slRoeMan = slAlvoRoiMan;
+        slDistMan = preco * ((slAlvoRoiMan / alav) / 100);
       }
       let slCalc = lado === 'BUY' ? (preco - slDistMan) : (preco + slDistMan);
 
