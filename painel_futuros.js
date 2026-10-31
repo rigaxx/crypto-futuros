@@ -1472,6 +1472,7 @@ async function avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracao
         alvo.modoResgateAtivo = false;
         alvo.tpResgateRoi = null;
         alvo.slResgateRoi = null;
+        alvo.jevDecisao = null;
         delete resgateTicks[sym];
       }
     }
@@ -1484,6 +1485,14 @@ async function avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracao
         console.log(`[🚑 MODO RESGATE ATIVADO] ${sym}: Confirmada deterioração grave em 2 leituras com duração ${Math.round(duracaoMin)}m >= 35m (T1:${hpAnt} ➔ T2:${hpAtual} <= 35). Alvo de saída no repique em +${alvo.tpResgateRoi.toFixed(2)}% ROI. SL mantido no Funil.`);
       }
     }
+  }
+
+  // Limpa MODO_RESGATE se trade voltou ao positivo (evita badge preso mesmo com roiPuro >= 0)
+  if (roiPuro >= 0 && alvo.jevDecisao?.acao === 'MODO_RESGATE') {
+    alvo.modoResgateAtivo = false;
+    alvo.tpResgateRoi = null;
+    alvo.jevDecisao = null;
+    salvarAlvos();
   }
 
   salvarAlvos();
@@ -1571,27 +1580,30 @@ setInterval(async () => {
           partialTicks[sym] = 0;
         }
 
-        // ── BLOCO 4.1 e 4.3: CATRACA PROGRESSIVA COM CONFIRMAÇÃO DE 3 TICKS (ANTI-PAVIO) ──
+        // ── BLOCO 4.1 e 4.3: CATRACA PROGRESSIVA COM CONFIRMAÇÃO DE 5 TICKS (ANTI-PAVIO, 7.5s) ──
         const prevArmed = alvo.beArmed || false;
         const prevLockedRoi = alvo.lockedRoi || 0;
 
-        if (alvo.maxRoiReached < 2.10) {
-          // Abaixo de +2.10% de ROI: se Catraca não foi armada por Defesa de Lucro HP/JEV, mantém respiro livre
+        if (alvo.maxRoiReached < 2.60) {
+          // Abaixo de +2.60% de ROI: se Catraca não foi armada por Defesa de Lucro HP/JEV, mantém respiro livre
           if (!alvo.beArmed) {
             alvo.lockedRoi = 0;
             alvo.beStopPrice = null;
           }
         } else {
           alvo.beArmed = true;
-          let novoLocked = 1.15;
+          let novoLocked = 1.50;
           if (alvo.maxRoiReached >= 8.00) novoLocked = 8.00;
-          else if (alvo.maxRoiReached >= 6.80) novoLocked = 5.80;
-          else if (alvo.maxRoiReached >= 5.50) novoLocked = 4.50;
-          else if (alvo.maxRoiReached >= 4.40) novoLocked = 3.50;
-          else if (alvo.maxRoiReached >= 3.50) novoLocked = 2.65;
-          else if (alvo.maxRoiReached >= 2.80) novoLocked = 1.85;
-          else if (alvo.maxRoiReached >= 2.10) novoLocked = 1.15;
-          else novoLocked = 1.15;
+          else if (alvo.maxRoiReached >= 6.20) novoLocked = 5.00;
+          else if (alvo.maxRoiReached >= 5.00) novoLocked = 3.90;
+          else if (alvo.maxRoiReached >= 4.00) novoLocked = 3.00;
+          else if (alvo.maxRoiReached >= 3.30) novoLocked = 2.20;
+          else if (alvo.maxRoiReached >= 2.60) novoLocked = 1.50;
+          else novoLocked = 1.50;
+
+          if (alvo.maxRoiReached >= 4.00 && !alvo.parcialExecutada) {
+            await executarParcial50(sym, alvo, pos, curPrice, 'PARCIAL_CATRACA_400');
+          }
 
           alvo.lockedRoi = Math.max(alvo.lockedRoi || 0, novoLocked);
 
@@ -1636,7 +1648,7 @@ setInterval(async () => {
           const stopFmt = formatarPrecoAtivo(sym, alvo.beStopPrice);
           statusBadge += ` [🛡️ CATRACA +${alvo.lockedRoi.toFixed(2)}%: GARANTIDO ($${stopFmt}) | PICO +${maxRoi.toFixed(2)}%]`;
         } else {
-          statusBadge += ` [🌱 RESPIRO LIVRE ATÉ +2.10% ROI (PICO: +${maxRoi.toFixed(2)}%)]`;
+          statusBadge += ` [🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO: +${maxRoi.toFixed(2)}%)]`;
         }
         if (duracaoMin > 40) {
           const stopStr = (alvo.beArmed && alvo.lockedRoi > 0) ? `+${alvo.lockedRoi.toFixed(2)}%` : `${funil.slRoiDinamico.toFixed(2)}%`;
@@ -1707,12 +1719,12 @@ setInterval(async () => {
           }
         }
 
-        // 3. Catraca / Breakeven (exige 3 ticks consecutivos com roi <= lockedRoi)
+        // 3. Catraca / Breakeven (exige 5 ticks consecutivos com roi <= lockedRoi, ~7.5s)
         if (!deveFechar && alvo.beArmed && (roi <= alvo.lockedRoi || (alvo.beStopPrice && (isLong ? curPrice <= alvo.beStopPrice : curPrice >= alvo.beStopPrice)))) {
           beBreachedTicks[sym] = (beBreachedTicks[sym] || 0) + 1;
-          if (beBreachedTicks[sym] >= 3) {
+          if (beBreachedTicks[sym] >= 5) {
             deveFechar = true;
-            motivoFechamento = `[CATRACA] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(2)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}% | Ticks: 3)`;
+            motivoFechamento = `[CATRACA] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(2)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}% | Ticks: 5)`;
           }
         } else if (!deveFechar) {
           beBreachedTicks[sym] = 0;
@@ -2237,8 +2249,9 @@ setInterval(async () => {
 
       if ((dec.action === 'LONG' || dec.action === 'SHORT') && dec.aprovado !== false && dec.confidence >= 65) {
         const ladoTrade = dec.action === 'LONG' ? 'BUY' : 'SELL';
-        // Assimetria defensiva: SHORT custa mais caro de errar (funding+spread), então opera com teto de alavancagem menor.
-        const alavCap = dec.action === 'SHORT' ? 3 : 4;
+        // Assimetria defensiva: SHORT e modos de ignição rápida (CONTINUATION/MOMENTUM) custam mais caro de errar, teto 3x.
+        const modoIgnicaoRapida = (dados.modoLabel || '').includes('CONTINUATION') || (dados.modoLabel || '').includes('MOMENTUM');
+        const alavCap = (dec.action === 'SHORT' || modoIgnicaoRapida) ? 3 : 4;
         const alav = Math.min(alavCap, Math.max(1, dec.leverage || dados.leverageSugerida));
         const valorUSDT = 10;
 
@@ -2353,13 +2366,8 @@ setInterval(async () => {
           slRoeExec = (slDistExec / precoExec) * alav * 100;
 
           // Banda Saudável de Stop Loss em ROI (BLOCO 5), teto por modo/lado:
-          // ignição rápida (CONTINUATION/MOMENTUM) falha mais barato -3.80, SHORT -4.20 (assimetria), demais LONG (PULLBACK/EXAUSTAO) -5.40.
-          let slAlvoRoi = 5.40;
-          if ((dados.modoLabel || '').includes('CONTINUATION') || (dados.modoLabel || '').includes('MOMENTUM')) {
-            slAlvoRoi = 3.80;
-          } else if (dec.action === 'SHORT') {
-            slAlvoRoi = 4.20;
-          }
+          // SHORT ou ignição rápida (CONTINUATION/MOMENTUM, 3x) falha mais barato -3.80; PULLBACK LONG (4x) -4.60.
+          let slAlvoRoi = (dec.action === 'SHORT' || modoIgnicaoRapida) ? 3.80 : 4.60;
           const slPisoRoi = slAlvoRoi - 0.60;
           if (slRoeExec < slPisoRoi) {
             slRoeExec = slPisoRoi;
@@ -2408,7 +2416,7 @@ setInterval(async () => {
             beArmed: false,
             beStage: 0,
             beStopPrice: null,
-            beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.10% ROI (PICO ATUAL: +0.00%)]',
+            beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO ATUAL: +0.00%)]',
             lockedRoi: 0,
             leverage: alav,
             quantidade: filledQty,
@@ -2760,12 +2768,9 @@ app.post('/api/trade', async (req, res) => {
 
     if (fill > 0) {
       const dados = await analisarEstruturaEMercado(symbol);
-      let slAlvoRoiMan = 5.40;
-      if ((dados?.modoLabel || '').includes('CONTINUATION') || (dados?.modoLabel || '').includes('MOMENTUM')) {
-        slAlvoRoiMan = 3.80;
-      } else if (lado === 'SELL') {
-        slAlvoRoiMan = 4.20;
-      }
+      // SHORT ou ignição rápida (CONTINUATION/MOMENTUM) falha mais barato -3.80; PULLBACK LONG -4.60.
+      const modoIgnicaoRapidaMan = (dados?.modoLabel || '').includes('CONTINUATION') || (dados?.modoLabel || '').includes('MOMENTUM');
+      let slAlvoRoiMan = (lado === 'SELL' || modoIgnicaoRapidaMan) ? 3.80 : 4.60;
       const slPisoRoiMan = slAlvoRoiMan - 0.60;
       let slDistMan = dados ? (dados.slPctReal / 100 * preco) : (preco * ((slAlvoRoiMan / alav) / 100));
       let slRoeMan = (slDistMan / preco) * alav * 100;
@@ -2812,7 +2817,7 @@ app.post('/api/trade', async (req, res) => {
         beArmed: false,
         beStage: 0,
         beStopPrice: null,
-        beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.10% ROI (PICO ATUAL: +0.00%)]',
+        beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO ATUAL: +0.00%)]',
         lockedRoi: 0,
         leverage: alav,
         quantidade: fill,
@@ -3954,7 +3959,7 @@ app.get('/', (req, res) => {
               beEl.style.background = 'rgba(255, 255, 255, 0.06)';
               beEl.style.borderColor = 'rgba(255, 255, 255, 0.2)';
               beEl.style.color = 'var(--gold)';
-              beEl.innerText = data.beLabel || ('[🌱 RESPIRO LIVRE ATÉ +2.10% ROI (PICO ATUAL: +' + maxR + '%)]');
+              beEl.innerText = data.beLabel || ('[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO ATUAL: +' + maxR + '%)]');
             }
           }
         } else {
@@ -4778,7 +4783,7 @@ app.get('/', (req, res) => {
               beArmed: false,
               beStage: 0,
               beStopPrice: null,
-              beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.10% ROI (PICO ATUAL: +0.00%)]',
+              beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO ATUAL: +0.00%)]',
               lockedRoi: 0,
               leverage: p.alavancagem,
               maxRoiReached: 0,
