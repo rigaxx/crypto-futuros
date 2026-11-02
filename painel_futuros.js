@@ -18,6 +18,8 @@ app.use(express.json());
 const PORT = process.env.PORT || 7005;
 const SENHA = process.env.ACESSO_SENHA || '242524###';
 const ROUTER_API_KEY = process.env.ROUTER_API_KEY;
+const JEV_API_KEY    = process.env.JEV_API_KEY;
+const JEV_URL        = 'https://api.typesafe.ai/v1/systemone';
 
 // Inicializa banco de dados RAG local
 rag.initRagDb().catch(e => console.error('[RAG] Erro ao iniciar:', e.message));
@@ -93,73 +95,10 @@ const WHITELIST_VIP = new Set([
 ]);
 
 // ── BLOCO 3.2: CACHE DE ALINHAMENTO COM O BTCUSDT (0 TOKENS) ──
-let btcAlinhamentoCache = { ts: 0, var2Candles: 0, curPrice: 0, ema9: 0, vetaShort: false, vetaLong: false };
-async function checarDirecaoBTC() {
-  const now = Date.now();
-  if (now - btcAlinhamentoCache.ts < 20000 && btcAlinhamentoCache.curPrice > 0) {
-    return btcAlinhamentoCache;
-  }
-  try {
-    const klines = await fut.klines('BTCUSDT', '15m', 20).catch(() => []);
-    if (!klines || klines.length < 10) return btcAlinhamentoCache;
 
-    const closes = klines.map(k => parseFloat(k[4]));
-    const curPrice = closes[closes.length - 1];
-    const open2Ago = parseFloat(klines[klines.length - 2][1]);
-    const var2Candles = ((curPrice - open2Ago) / open2Ago) * 100;
+// Invalidação precoce (audit 44 trades: 9/13 SL nunca passaram de +0.5% MFE): sem tração em 20m e ROI <= -2.0% → sai antes do SL cheio
 
-    const ema9Arr = ti.EMA.calculate({ period: 9, values: closes });
-    const ema9 = ema9Arr.slice(-1)[0] || curPrice;
 
-    btcAlinhamentoCache = {
-      ts: now,
-      curPrice,
-      ema9,
-      var2Candles,
-      vetaShort: (var2Candles >= 0.45 && curPrice > ema9),
-      vetaLong: (var2Candles <= -0.45 && curPrice < ema9)
-    };
-    return btcAlinhamentoCache;
-  } catch(e) {
-    return btcAlinhamentoCache;
-  }
-}
-
-// ── BLOCO 5: FUNÇÃO DE AFUNILAMENTO TEMPORAL (40m até 180m -> +1% / -1%) ──
-function calcularFunilTempo(alvo, duracaoMin) {
-  const slBase = Math.abs(alvo?.slRoiInicial || 5.60);
-  if (duracaoMin <= 40) {
-    return {
-      tpRoiDinamico: 8.00,
-      slRoiDinamico: -slBase,
-      emFunil: false,
-      progresso: 0
-    };
-  }
-  if (duracaoMin > 180) {
-    return {
-      tpRoiDinamico: 1.00,
-      slRoiDinamico: -1.00,
-      emFunil: true,
-      progresso: 1.0
-    };
-  }
-  const progressoFunil = Math.min(1, Math.max(0, (duracaoMin - 40) / 140));
-  const tpRoiDinamico = Number((8.00 - progressoFunil * (8.00 - 1.00)).toFixed(2));
-  const slRoiDinamico = -Number((slBase - progressoFunil * (slBase - 1.00)).toFixed(2));
-  return {
-    tpRoiDinamico,
-    slRoiDinamico,
-    emFunil: true,
-    progresso: progressoFunil
-  };
-}
-
-// Piso de saída do Modo Resgate: taxa taker ida+volta (~0.10% do preço) + folga de slippage (0.08%),
-// escalado pela alavancagem (ROI = variação de preço × alav), com mínimo de 1.20% ROI.
-function calcularPisoResgate(alav) {
-  return Math.max(1.20, Number(((0.10 + 0.08) * (alav || 1)).toFixed(2)));
-}
 
 // Contador persistente de Win / Loss (Placar Institucional)
 let placarStats = { wins: 0, losses: 0, total: 0 };
@@ -286,15 +225,7 @@ function salvarAutoBotConfig() {
   try { fs.writeFileSync(AUTOBOT_FILE, JSON.stringify({ enabled: autoBotState.enabled }, null, 2)); } catch(e){}
 }
 
-let maxPriceTracker = {};
-let minPriceTracker = {};
-let klines5mCache = {};
-let gatekeeperVetoedUntil = {
-  'USELESSUSDT': Date.now() + 7200000,
-  'ZECUSDT': Date.now() + 7200000,
-  'ARCUSDT': Date.now() + 7200000
-};
-let lastEvaluatedCandle = {}; // Cache Anti-Spam por vela de 5m
+let cooldownMoeda = {};
 
 // Cotação USD/BRL
 let brlGlobal = 5.20;
@@ -404,1121 +335,382 @@ async function validarLiquidezMoeda(symbol) {
   }
 }
 
-// ── NOVO MOTOR DE INDICADORES MTF (ETAPAS 3 e 4) ───────────────────────
-async function analisarEstruturaEMercado(symbol) {
-  try {
-    const [k5m, k15m, k1h, k4h, oiHist, takerRatio, premiumData, oiData, bookData, ticker24] = await Promise.all([
-      fut.klines(symbol, '5m', 100).catch(() => []),
-      fut.klines(symbol, '15m', 100).catch(() => []),
-      fut.klines(symbol, '1h', 100).catch(() => []),
-      fut.klines(symbol, '4h', 50).catch(() => []),
-      fut.openInterestHist(symbol, '5m', 5).catch(() => []),
-      fut.takerBuySellRatio(symbol, '5m', 5).catch(() => []),
-      fut.precoMarca(symbol).catch(() => null),
-      fut.openInterest(symbol).catch(() => null),
-      fut.livroOfertas(symbol, 5).catch(() => null),
-      fut.ticker24h(symbol).catch(() => null)
-    ]);
-    const priceChangePercent = parseFloat(ticker24?.priceChangePercent || 0);
 
-    if (!k5m || k5m.length < 30 || !k15m || k15m.length < 50 || !k1h || k1h.length < 50) {
-      return null;
-    }
 
-    const p5 = {
-      opens: k5m.map(v => parseFloat(v[1])),
-      highs: k5m.map(v => parseFloat(v[2])),
-      lows: k5m.map(v => parseFloat(v[3])),
-      closes: k5m.map(v => parseFloat(v[4])),
-      vols: k5m.map(v => parseFloat(v[5]))
-    };
-    const p15 = {
-      opens: k15m.map(v => parseFloat(v[1])),
-      highs: k15m.map(v => parseFloat(v[2])),
-      lows: k15m.map(v => parseFloat(v[3])),
-      closes: k15m.map(v => parseFloat(v[4])),
-      vols: k15m.map(v => parseFloat(v[5]))
-    };
-    const p1h = {
-      closes: k1h.map(v => parseFloat(v[4]))
-    };
-    const p4h = {
-      closes: (k4h && k4h.length > 0) ? k4h.map(v => parseFloat(v[4])) : []
-    };
 
-    const curPrice = p15.closes[p15.closes.length - 1];
 
-    // EMAs 15m
-    const ema9_15 = ti.EMA.calculate({ period: 9, values: p15.closes }).slice(-1)[0] || curPrice;
-    const ema21_15 = ti.EMA.calculate({ period: 21, values: p15.closes }).slice(-1)[0] || curPrice;
-    const ema50_15 = ti.EMA.calculate({ period: 50, values: p15.closes }).slice(-1)[0] || curPrice;
-    const ema200_15 = p15.closes.length >= 100 ? (ti.EMA.calculate({ period: 200, values: p15.closes }).slice(-1)[0] || curPrice) : curPrice;
 
-    // EMAs 5m
-    const ema9_5 = ti.EMA.calculate({ period: 9, values: p5.closes }).slice(-1)[0] || curPrice;
-    const ema21_5 = ti.EMA.calculate({ period: 21, values: p5.closes }).slice(-1)[0] || curPrice;
-    const ema50_5 = ti.EMA.calculate({ period: 50, values: p5.closes }).slice(-1)[0] || curPrice;
 
-    // EMAs 1h
-    const ema9_1h = ti.EMA.calculate({ period: 9, values: p1h.closes }).slice(-1)[0] || curPrice;
-    const ema21_1h = ti.EMA.calculate({ period: 21, values: p1h.closes }).slice(-1)[0] || curPrice;
-    const ema50_1h = ti.EMA.calculate({ period: 50, values: p1h.closes }).slice(-1)[0] || curPrice;
-
-    // EMA 4h (50)
-    const ema50_4h = p4h.closes.length >= 50 ? (ti.EMA.calculate({ period: 50, values: p4h.closes }).slice(-1)[0] || curPrice) : curPrice;
-
-    // ATR 14 (15m e 5m)
-    const atr15m = ti.ATR.calculate({ period: 14, high: p15.highs, low: p15.lows, close: p15.closes }).slice(-1)[0] || (curPrice * 0.01);
-    const atrPct15m = (atr15m / curPrice) * 100;
-    const atr5m = ti.ATR.calculate({ period: 14, high: p5.highs, low: p5.lows, close: p5.closes }).slice(-1)[0] || (curPrice * 0.005);
-    const atrPct5m = (atr5m / curPrice) * 100;
-
-    // Distância da EMA 21 (15m) em ATR
-    const distEma21Atr = Math.abs(curPrice - ema21_15) / (atr15m || 1);
-
-    // Range das últimas 8 velas de 15m e posição percentual do preço (0% = fundo extremo, 100% = topo extremo)
-    const ult8Highs = p15.highs.slice(-8);
-    const ult8Lows = p15.lows.slice(-8);
-    const max8_15m = Math.max(...ult8Highs);
-    const min8_15m = Math.min(...ult8Lows);
-    const range8_15m = max8_15m - min8_15m;
-    const posRange8Pct = range8_15m > 0 ? ((curPrice - min8_15m) / range8_15m) * 100 : 50;
-
-    // Variação percentual das últimas 3 velas de 15m
-    const ult3Closes = p15.closes.slice(-3);
-    const ult3Opens = p15.opens.slice(-3);
-    const var3Velas15m = (ult3Opens.length >= 3 && ult3Opens[0] > 0)
-      ? (((ult3Closes[ult3Closes.length - 1] - ult3Opens[0]) / ult3Opens[0]) * 100).toFixed(2)
-      : '0.00';
-
-    // ADX 14 (15m)
-    const adxArr = ti.ADX.calculate({ period: 14, high: p15.highs, low: p15.lows, close: p15.closes });
-    const adx15m = (adxArr && adxArr.length > 0) ? (adxArr[adxArr.length - 1].adx || 0) : 0;
-
-    // RVOL 15m (última vela fechada vs média 20 fechadas - elimina bug do 0.0x no início da vela)
-    const avgVol20 = p15.vols.slice(-22, -2).reduce((a, b) => a + b, 0) / 20;
-    const rvol15m = (p15.vols[p15.vols.length - 2] / (avgVol20 || 1)) || 1.0;
-
-    // Wilder RSI 14 (15m) calculado com 100 velas (elimina o bug do 0.0)
-    const rsiArr = ti.RSI.calculate({ period: 14, values: p15.closes });
-    const rsi15m = (rsiArr && rsiArr.length > 0) ? parseFloat(rsiArr[rsiArr.length - 1].toFixed(1)) : 50.0;
-
-    // Multi-Timeframe (MTF) vs EMA 50
-    const dir4h = curPrice >= ema50_4h ? 'green' : 'red';
-    const dir1h = curPrice >= ema50_1h ? 'green' : 'red';
-    const dir15m = curPrice >= ema50_15 ? 'green' : 'red';
-    const dir5m = curPrice >= ema50_5 ? 'green' : 'red';
-
-    const aptoLong = (dir1h === 'green' && dir15m === 'green' && dir5m === 'green');
-    const aptoShort = (dir1h === 'red' && dir15m === 'red' && dir5m === 'red');
-    const mtfStatus = aptoLong ? 'APTO_LONG' : (aptoShort ? 'APTO_SHORT' : 'DESALINHADO');
-    const mtfText = aptoLong ? 'APTO PARA OPERAR (ALTA)' : (aptoShort ? 'APTO PARA OPERAR (BAIXA)' : 'DESALINHADO (AGUARDAR)');
-
-    // Alinhamento de EMAs (15m)
-    let emaAlignStatus = 'EMARANHADAS (LATERAL)';
-    if (ema9_15 > ema21_15 && ema21_15 > ema50_15) emaAlignStatus = 'ALINHADAS EM ALTA';
-    else if (ema9_15 < ema21_15 && ema21_15 < ema50_15) emaAlignStatus = 'ALINHADAS EM BAIXA';
-
-    // Status da Distância da EMA 21 (Sweet Spot: 0.80x a 2.15x ATR)
-    let distEmaText = '';
-    let distEmaColor = 'var(--gold)';
-    if (distEma21Atr >= 0.80 && distEma21Atr <= 2.15) {
-      distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Zona de Ignição - OK]`;
-      distEmaColor = 'var(--green)';
-    } else if (distEma21Atr < 0.80) {
-      distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Colado na EMA21 - Sem Ignição]`;
-      distEmaColor = 'var(--gold)';
-    } else {
-      distEmaText = `${distEma21Atr.toFixed(1)}x ATR [Esticado > 2.15x - Exaustão]`;
-      distEmaColor = 'var(--red)';
-    }
-
-    // Qualidade do Setup
-    let qualidadeSetup = 'CONTRA-TENDÊNCIA (BLOQUEADO)';
-    let qualidadeCor = 'var(--red)';
-    if (distEma21Atr > 2.15) {
-      qualidadeSetup = 'ESTICADO (AGUARDAR RECUO)';
-      qualidadeCor = 'var(--red)';
-    } else if (distEma21Atr < 0.80) {
-      qualidadeSetup = 'COLADO NA MÉDIA (SEM IGNIÇÃO)';
-      qualidadeCor = 'var(--gold)';
-    } else if (aptoLong && distEma21Atr >= 0.80 && distEma21Atr <= 2.15) {
-      qualidadeSetup = 'PULLBACK A FAVOR DA TENDÊNCIA';
-      qualidadeCor = 'var(--green)';
-    } else if (aptoShort && distEma21Atr >= 0.80 && distEma21Atr <= 2.15) {
-      qualidadeSetup = 'PULLBACK A FAVOR DA TENDÊNCIA';
-      qualidadeCor = 'var(--green)';
-    } else if (rvol15m >= 1.30 && ((aptoLong && curPrice > ema9_15) || (aptoShort && curPrice < ema9_15))) {
-      qualidadeSetup = 'ROMPIMENTO COM VOLUME';
-      qualidadeCor = 'var(--blue)';
-    }
-
-    // Fluxo: Delta OI & Taker Ratio & Funding
-    let deltaOI = 0;
-    if (oiHist && oiHist.length >= 2) {
-      const lastOI = parseFloat(oiHist[oiHist.length - 1].sumOpenInterest);
-      const prevOI = parseFloat(oiHist[0].sumOpenInterest);
-      if (prevOI > 0) deltaOI = ((lastOI - prevOI) / prevOI) * 100;
-    }
-    const takerRatioVal = (takerRatio && takerRatio.length > 0) ? parseFloat(takerRatio[takerRatio.length - 1].buySellRatio) : 1.0;
-    const fundingRate = parseFloat(premiumData?.lastFundingRate || 0);
-    const oiVal = parseFloat(oiData?.openInterest || 0);
-
-    // Contagem de velas flat (0.0%) nas últimas 10 velas de 5m
-    const ultimas10_5m = k5m.slice(-10);
-    let flatCandles5m = 0;
-    for (const v of ultimas10_5m) {
-      const o = parseFloat(v[1]), h = parseFloat(v[2]), l = parseFloat(v[3]), c = parseFloat(v[4]), vol = parseFloat(v[5]);
-      if (o === c || h === l || vol === 0) flatCandles5m++;
-    }
-
-    // Spread, Tick Ratio e Liquidez Top 5 do Order Book (CORREÇÃO 3)
-    let spreadPct = 0;
-    let tickPct = 0;
-    let volAsksTop5 = 0;
-    let volBidsTop5 = 0;
-    if (bookData && bookData.bids?.[0] && bookData.asks?.[0]) {
-      const bid = parseFloat(bookData.bids[0][0]);
-      const ask = parseFloat(bookData.asks[0][0]);
-      if (bid > 0) {
-        spreadPct = ((ask - bid) / bid) * 100;
-        const f = fut.filtrosDe(symbol);
-        let tickSize = f ? parseFloat(f.tickSize) : 0;
-        if (!(tickSize > 0) && (bookData.bids.length >= 2 || bookData.asks.length >= 2)) {
-          const diffBid = bookData.bids.length >= 2 ? Math.abs(parseFloat(bookData.bids[0][0]) - parseFloat(bookData.bids[1][0])) : 0;
-          const diffAsk = bookData.asks.length >= 2 ? Math.abs(parseFloat(bookData.asks[1][0]) - parseFloat(bookData.asks[0][0])) : 0;
-          tickSize = Math.max(diffBid, diffAsk);
-        }
-        tickPct = (tickSize / bid) * 100;
-
-        const maxAskPrice = ask * 1.0015;
-        for (const item of (bookData.asks || []).slice(0, 5)) {
-          const p = parseFloat(item[0]);
-          const q = parseFloat(item[1]);
-          if (p <= maxAskPrice) volAsksTop5 += (p * q);
-        }
-
-        const minBidPrice = bid * (1 - 0.0015);
-        for (const item of (bookData.bids || []).slice(0, 5)) {
-          const p = parseFloat(item[0]);
-          const q = parseFloat(item[1]);
-          if (p >= minBidPrice) volBidsTop5 += (p * q);
-        }
-      }
-    }
-
-    // ── VELA 5M E IDENTIFICAÇÃO DE PAVIO / DIREÇÃO ──
-    const l5_open = p5.opens.slice(-1)[0] || curPrice;
-    const l5_close = p5.closes.slice(-1)[0] || curPrice;
-    const l5_high = p5.highs.slice(-1)[0] || curPrice;
-    const l5_low = p5.lows.slice(-1)[0] || curPrice;
-    const isGreen5m = l5_close >= l5_open;
-    const isRed5m = l5_close < l5_open;
-    const bodyHigh = Math.max(l5_open, l5_close);
-    const bodyLow = Math.min(l5_open, l5_close);
-    const bodySize = Math.max(0.000001, bodyHigh - bodyLow);
-    const upperWick = l5_high - bodyHigh;
-    const lowerWick = bodyLow - l5_low;
-    const hasUpperRejection = upperWick > bodySize * 1.2;
-    const hasLowerRejection = lowerWick > bodySize * 1.2;
-
-    // Tendência 1h vs 15m (EMA 21 vs EMA 50)
-    const isBull1h = ema21_1h > ema50_1h;
-    const isBear1h = ema21_1h < ema50_1h;
-    const isBull15m = ema21_15 > ema50_15;
-    const isBear15m = ema21_15 < ema50_15;
-
-    // Rompimento EMAs no 5m e 15m
-    const breakUp = curPrice > ema9_5 && curPrice > ema21_5 && curPrice > ema50_5 && curPrice > ema9_15 && curPrice > ema21_15 && curPrice > ema50_15;
-    const breakDown = curPrice < ema9_5 && curPrice < ema21_5 && curPrice < ema50_5 && curPrice < ema9_15 && curPrice < ema21_15 && curPrice < ema50_15;
-
-    // ── SCORE DIRECIONAL AUTOMÁTICO (-100 A +100) ──
-    let directionalScore = 0;
-
-    // 1. Alinhamento MTF (1h, 15m, 5m na EMA 50) + Alinhamento EMAs (9/21/50): peso 50 pontos (+50 para Alta, -50 para Baixa)
-    let mtfScore = 0;
-    if (dir1h === 'green' && dir15m === 'green' && dir5m === 'green') {
-      mtfScore = 30;
-    } else if (dir1h === 'red' && dir15m === 'red' && dir5m === 'red') {
-      mtfScore = -30;
-    } else {
-      const gCount = (dir1h === 'green' ? 1 : 0) + (dir15m === 'green' ? 1 : 0) + (dir5m === 'green' ? 1 : 0);
-      if (gCount === 2) mtfScore = 15;
-      else if (gCount === 1) mtfScore = -15;
-    }
-
-    let emaScore = 0;
-    if (ema9_15 > ema21_15 && ema21_15 > ema50_15) {
-      emaScore = 20;
-    } else if (ema9_15 < ema21_15 && ema21_15 < ema50_15) {
-      emaScore = -20;
-    } else if (ema9_15 > ema21_15) {
-      emaScore = 10;
-    } else if (ema9_15 < ema21_15) {
-      emaScore = -10;
-    }
-    directionalScore += (mtfScore + emaScore);
-
-    // 2. ADX >= 18 + RSI favorável (48 a 72 para Long, 28 a 52 para Short): peso 20 pontos (+20 ou -20)
-    let adxRsiScore = 0;
-    if (adx15m >= 18) {
-      if (rsi15m >= 48 && rsi15m <= 72) {
-        adxRsiScore = 20;
-      } else if (rsi15m >= 28 && rsi15m <= 52) {
-        adxRsiScore = -20;
-      } else if (rsi15m > 72) {
-        adxRsiScore = 10;
-      } else if (rsi15m < 28) {
-        adxRsiScore = -10;
-      }
-    } else if (adx15m >= 15) {
-      if (rsi15m >= 48 && rsi15m <= 72) {
-        adxRsiScore = 10;
-      } else if (rsi15m >= 28 && rsi15m <= 52) {
-        adxRsiScore = -10;
-      }
-    }
-    directionalScore += adxRsiScore;
-
-    // 3. Delta OI e RVOL >= 0.85x: peso 15 pontos
-    let flowScore = 0;
-    const isTrendAlta = (directionalScore > 0) || (curPrice > ema21_15);
-    if (isTrendAlta) {
-      if (deltaOI >= 0.2 && rvol15m >= 0.85) flowScore = 15;
-      else if (deltaOI > 0 || rvol15m >= 0.85) flowScore = 10;
-      else if (deltaOI < -1.0) flowScore = -5;
-    } else {
-      if (deltaOI >= 0.2 && rvol15m >= 0.85) flowScore = -15;
-      else if (deltaOI > 0 || rvol15m >= 0.85) flowScore = -10;
-      else if (deltaOI < -1.0) flowScore = 5;
-    }
-    directionalScore += flowScore;
-
-    // 4. Taker Ratio: peso máximo de 15 pontos (se a favor soma +15; se contra no pullback desconta no máx -10, nunca zerando!)
-    let takerScore = 0;
-    if (isTrendAlta) {
-      if (takerRatioVal >= 1.15) takerScore = 15;
-      else if (takerRatioVal >= 1.02) takerScore = 10;
-      else if (takerRatioVal >= 0.95) takerScore = 0;
-      else if (takerRatioVal >= 0.85) takerScore = -5;
-      else takerScore = -10;
-    } else {
-      if (takerRatioVal <= 0.85) takerScore = -15;
-      else if (takerRatioVal <= 0.98) takerScore = -10;
-      else if (takerRatioVal <= 1.05) takerScore = 0;
-      else if (takerRatioVal <= 1.15) takerScore = 5;
-      else takerScore = 10;
-    }
-    directionalScore += takerScore;
-
-    directionalScore = Math.max(-100, Math.min(100, directionalScore));
-
-    // ── CLASSIFICADOR DE 3 MODOS DINÂMICOS ──
-    let modoDetectado = null;
-    let modoLabel = 'SEM SETUP';
-    let direcaoModo = null;
-    let motivoModo = 'Aguardando confluência quantitativa';
-
-    // 4 luzes alinhadas (4h, 1h, 15m, 5m)
-    const quatroLuzesAlta = (dir4h === 'green' && dir1h === 'green' && dir15m === 'green' && dir5m === 'green');
-    const quatroLuzesBaixa = (dir4h === 'red' && dir1h === 'red' && dir15m === 'red' && dir5m === 'red');
-
-    // Tendência forte / Continuation 5m
-    const forteTendenciaLong = (quatroLuzesAlta || directionalScore >= 75) && isGreen5m;
-    const forteTendenciaShort = (quatroLuzesBaixa || directionalScore <= -75) && isRed5m;
-
-    // Rigor obrigatório para SHORT:
-    // 1. As 3 tendências (1h, 15m e 5m) alinhadas em BAIXA
-    // 2. directionalScore (Bússola) <= -70
-    // 3. takerRatio vendedor <= 0.82
-    // 4. A última vela de 5m deve ser vermelha (close < open / isRed5m)
-    const shortValidoRigor = (dir1h === 'red' && dir15m === 'red' && dir5m === 'red') &&
-                            (directionalScore <= -70) &&
-                            (takerRatioVal <= 0.82) &&
-                            isRed5m;
-
-    // MODO A: PULLBACK E CONTINUATION 5M (A Favor da Tendência)
-    // Faixa estrita de ignição confirmada: 0.80x a 2.15x ATR
-    const mtfAptoPullbackLong = (dir1h === 'green' && dir15m === 'green' && (dir5m === 'green' || isGreen5m));
-    const emasAlinhadasAlta = (ema9_15 > ema21_15 && ema21_15 > ema50_15) || (isBull1h && isBull15m);
-    const emasAlinhadasBaixa = (ema9_15 < ema21_15 && ema21_15 < ema50_15) || (isBear1h && isBear15m);
-
-    if (mtfAptoPullbackLong && emasAlinhadasAlta && distEma21Atr >= 0.80 && distEma21Atr <= 2.15 && adx15m >= 18 && atrPct15m >= 0.45 && atrPct15m <= 2.50 && rvol15m >= 0.85 && rsi15m <= 78) {
-      modoDetectado = 'PULLBACK';
-      modoLabel = forteTendenciaLong ? 'CONTINUATION 5M LONG' : 'PULLBACK LONG';
-      direcaoModo = 'LONG';
-      motivoModo = `Pullback/Continuation na EMA 21 (15m a ${distEma21Atr.toFixed(2)}x ATR) a favor da alta`;
-    } else if (shortValidoRigor && emasAlinhadasBaixa && distEma21Atr >= 0.80 && distEma21Atr <= 2.15 && adx15m >= 18 && atrPct15m >= 0.45 && atrPct15m <= 2.50 && rvol15m >= 0.85 && rsi15m >= 22) {
-      modoDetectado = 'PULLBACK';
-      modoLabel = forteTendenciaShort ? 'CONTINUATION 5M SHORT' : 'PULLBACK SHORT';
-      direcaoModo = 'SHORT';
-      motivoModo = `Pullback/Continuation na EMA 21 (15m a ${distEma21Atr.toFixed(2)}x ATR) com rigor SHORT 3x Baixa, Score <= -70 e Taker <= 0.82`;
-    }
-
-    // MODO B: IGNIÇÃO DE FLUXO / BREAKOUT (Momentum)
-    if (!modoDetectado) {
-      if ((breakUp || (emasAlinhadasAlta && aptoLong)) && distEma21Atr >= 0.80 && distEma21Atr <= 2.15 && rvol15m >= 1.30 && takerRatioVal >= 1.15 && rsi15m <= 78) {
-        modoDetectado = 'MOMENTUM';
-        modoLabel = 'MOMENTUM LONG';
-        direcaoModo = 'LONG';
-        motivoModo = 'Rompimento de alta com RVOL >= 1.30x e agressão compradora no Taker >= 1.15';
-      } else if (shortValidoRigor && (breakDown || (emasAlinhadasBaixa && aptoShort)) && distEma21Atr >= 0.80 && distEma21Atr <= 2.15 && rvol15m >= 1.30 && rsi15m >= 22) {
-        modoDetectado = 'MOMENTUM';
-        modoLabel = 'MOMENTUM SHORT';
-        direcaoModo = 'SHORT';
-        motivoModo = 'Rompimento de baixa com RVOL >= 1.30x e rigor SHORT confirmado';
-      }
-    }
-
-    // Projeções Dinâmicas de Risco (SL / TP / BE / Alavancagem - Teto 4x)
-    let leverageSugerida = 4;
-    if (atrPct15m > 1.5) leverageSugerida = 2;
-    else if (atrPct15m > 1.0) leverageSugerida = 3;
-    else leverageSugerida = 4;
-
-    const ladoOp = direcaoModo || (directionalScore >= 0 ? 'LONG' : 'SHORT');
-    let slDist, tpDist, slPrice, tpPrice;
-
-    // Modos A e B: Risco:Retorno 1:2
-    slDist = 1.8 * atr15m;
-    tpDist = 2.0 * slDist;
-    slPrice = ladoOp === 'LONG' ? (curPrice - slDist) : (curPrice + slDist);
-    tpPrice = ladoOp === 'LONG' ? (curPrice + tpDist) : (curPrice - tpDist);
-
-    let slPctReal = (slDist / curPrice) * 100;
-    let slRoe = slPctReal * leverageSugerida;
-
-    // Banda Saudável de Stop Loss em ROI: Piso Mínimo de 5.20% e Teto Máximo de 5.80% (-5.80% de ROI - BLOCO 5)
-    const minSlRoi = 5.20;
-    const maxSlRoi = 5.80;
-
-    if (slRoe < minSlRoi) {
-      slRoe = minSlRoi;
-      slDist = curPrice * ((minSlRoi / leverageSugerida) / 100);
-      slPctReal = (slDist / curPrice) * 100;
-      slPrice = ladoOp === 'LONG' ? (curPrice - slDist) : (curPrice + slDist);
-      tpDist = 2.0 * slDist;
-      tpPrice = ladoOp === 'LONG' ? (curPrice + tpDist) : (curPrice - tpDist);
-    } else if (slRoe > maxSlRoi) {
-      slRoe = maxSlRoi;
-      slDist = curPrice * ((maxSlRoi / leverageSugerida) / 100);
-      slPctReal = (slDist / curPrice) * 100;
-      slPrice = ladoOp === 'LONG' ? (curPrice - slDist) : (curPrice + slDist);
-      tpDist = 2.0 * slDist;
-      tpPrice = ladoOp === 'LONG' ? (curPrice + tpDist) : (curPrice - tpDist);
-    }
-
-    let tpPctReal = (tpDist / curPrice) * 100;
-    let tpRoe = tpPctReal * leverageSugerida;
-
-    // Teto Dinâmico de Take Profit: se projetar > 8.0% ROI, limita no alvo de 8.0% ROI
-    if (tpRoe > 8.0) {
-      tpDist = curPrice * (0.08 / leverageSugerida);
-      tpPrice = ladoOp === 'LONG' ? (curPrice + tpDist) : (curPrice - tpDist);
-      tpPctReal = (tpDist / curPrice) * 100;
-      tpRoe = 8.0;
-    }
-
-    const beTriggerDist = curPrice * ((2.10 / leverageSugerida) / 100);
-    const beTriggerPctReal = (beTriggerDist / curPrice) * 100;
-    const beTriggerRoe = 2.10;
-    const beTriggerPrice = ladoOp === 'LONG' ? (curPrice + beTriggerDist) : (curPrice - beTriggerDist);
-
-    const last5mOpenTime = (k5m && k5m.length > 0) ? k5m[k5m.length - 1][0] : 0;
-    return {
-      symbol,
-      curPrice,
-      priceChangePercent,
-      last5mOpenTime,
-      rawKlines5m: k5m,
-      rawKlines15m: k15m,
-      p15, p5, p1h, p4h,
-      ema9_15, ema21_15, ema50_15, ema200_15,
-      ema9_5, ema21_5, ema50_5,
-      ema9_1h, ema21_1h, ema50_1h, ema50_4h,
-      atr15m, atrPct15m, atr5m, atrPct5m,
-      distEma21Atr, distEmaText, distEmaColor,
-      posRange8Pct, max8_15m, min8_15m, var3Velas15m,
-      adx15m, rvol15m, rsi15m,
-      dir4h, dir1h, dir15m, dir5m,
-      isGreen5m, isRed5m, quatroLuzesAlta, quatroLuzesBaixa,
-      aptoLong, aptoShort, mtfStatus, mtfText,
-      emaAlignStatus, qualidadeSetup, qualidadeCor,
-      deltaOI, takerRatioVal, fundingRate, oiVal,
-      flatCandles5m, spreadPct, tickPct, volAsksTop5, volBidsTop5,
-      modoDetectado, modoLabel, direcaoModo, motivoModo, directionalScore,
-      leverageSugerida,
-      slDist, slPctReal, slRoe, slPrice,
-      tpDist, tpPctReal, tpRoe, tpPrice,
-      beTriggerDist, beTriggerPctReal, beTriggerRoe, beTriggerPrice
-    };
-  } catch(e) {
-    console.error(`[INDICADORES] Erro em ${symbol}:`, e.message);
-    return null;
-  }
-}
-
-// ── GATEKEEPER DINÂMICO 3 MODOS (ETAPA 5 - 0 TOKENS) ─────────────────
-async function verificarGatekeeper(dados, exigirConfirmacao5m = true) {
-  if (!dados) return { passou: false, motivo: 'Dados indisponíveis' };
-
-  // BLOCO 3.1: Whitelist VIP estrita
-  if (!WHITELIST_VIP.has(dados.symbol)) {
-    return { passou: false, motivo: `Gatekeeper: Moeda ${dados.symbol} fora da WHITELIST_VIP` };
-  }
-
-  // BLOCO 1: Quarentena Anti-Revanche Pós-Loss de 1 Hora (60m)
-  if (symbolLossCooldown && symbolLossCooldown[dados.symbol] && Date.now() < symbolLossCooldown[dados.symbol]) {
-    const restMin = Math.round((symbolLossCooldown[dados.symbol] - Date.now()) / 60000);
-    return { passou: false, motivo: `Gatekeeper [QUARENTENA PÓS-LOSS 1H]: Moeda ${dados.symbol} em quarentena pós-loss por mais ${restMin}m` };
-  }
-
-  // BLOCO 1: Exigência Estrita de Zona de Ignição da EMA 21 (0.80x a 2.15x ATR)
-  if (dados.distEma21Atr < 0.80) {
-    return { passou: false, motivo: `Gatekeeper [ZONA DE IGNIÇÃO]: Preço colado na EMA 21 (${dados.distEma21Atr.toFixed(2)}x < 0.80x ATR - Lateral)` };
-  }
-  if (dados.distEma21Atr > 2.15) {
-    return { passou: false, motivo: `Gatekeeper [ZONA DE IGNIÇÃO]: Preço esticado longe da EMA 21 (${dados.distEma21Atr.toFixed(2)}x > 2.15x ATR - Risco de Exaustão)` };
-  }
-
-  // Rigor Extra para Abertura de SHORT
-  if (dados.direcaoModo === 'SHORT') {
-    const mtfBaixa = (dados.dir1h === 'red' && dados.dir15m === 'red' && dados.dir5m === 'red');
-    if (!mtfBaixa) {
-      return { passou: false, motivo: `Gatekeeper [SHORT RIGOR]: Tendências 1h/15m/5m não alinhadas em baixa (1h=${dados.dir1h}, 15m=${dados.dir15m}, 5m=${dados.dir5m})` };
-    }
-    if ((dados.directionalScore || 0) > -70) {
-      return { passou: false, motivo: `Gatekeeper [SHORT RIGOR]: Score direcional fraco (${dados.directionalScore} > -70)` };
-    }
-    if ((dados.takerRatioVal || 1.0) > 0.82) {
-      return { passou: false, motivo: `Gatekeeper [SHORT RIGOR]: Taker Ratio não vendedor (${(dados.takerRatioVal || 1.0).toFixed(2)} > 0.82)` };
-    }
-    if (!dados.isRed5m) {
-      return { passou: false, motivo: `Gatekeeper [SHORT RIGOR]: Última vela 5m não é vermelha (contra fluxo)` };
-    }
-  }
-
-  // BLOCO 1: Filtro de RSI 15m (Relaxado: piso 22 p/ SHORT e teto 78 p/ LONG; isento p/ EXAUSTAO_REVERSAO)
-  if (dados.modoDetectado !== 'EXAUSTAO_REVERSAO') {
-    if (dados.direcaoModo === 'LONG' && dados.rsi15m > 78) {
-      return { passou: false, motivo: `Gatekeeper [RSI EXAUSTO]: RSI 15m para LONG muito alto (${dados.rsi15m.toFixed(1)} > 78)` };
-    }
-    if (dados.direcaoModo === 'SHORT' && dados.rsi15m < 22) {
-      return { passou: false, motivo: `Gatekeeper [RSI EXAUSTO]: RSI 15m para SHORT muito baixo (${dados.rsi15m.toFixed(1)} < 22)` };
-    }
-  }
-
-  // BLOCO 1: Filtro Anti-Topo / Anti-Fundo (Range 8 Velas 15m: bloqueia apenas extremos absolutos >= 94% p/ LONG e <= 6% p/ SHORT; isento p/ EXAUSTAO_REVERSAO)
-  if (dados.modoDetectado !== 'EXAUSTAO_REVERSAO') {
-    if (dados.direcaoModo === 'LONG' && dados.posRange8Pct !== undefined && dados.posRange8Pct >= 94) {
-      return { passou: false, motivo: `Gatekeeper [TOPO 8 VELAS]: Preço no extremo superior do range das últimas 8 velas 15m (${dados.posRange8Pct.toFixed(1)}% >= 94%)` };
-    }
-    if (dados.direcaoModo === 'SHORT' && dados.posRange8Pct !== undefined && dados.posRange8Pct <= 6) {
-      return { passou: false, motivo: `Gatekeeper [FUNDO 8 VELAS]: Preço no extremo inferior do range das últimas 8 velas 15m (${dados.posRange8Pct.toFixed(1)}% <= 6%)` };
-    }
-  }
-
-  if (dados.flatCandles5m > 2) {
-    return { passou: false, motivo: `Gatekeeper: Moeda zumbi (${dados.flatCandles5m} velas 0% no 5m)` };
-  }
-
-  // ── PRÉ-FILTROS ANTI-SLIPPAGE E ANTI-BOOK RASO (CORREÇÃO 3 / BLOCO 3.1) ──
-  // 1. Veto de Spread Largo (> 0.16%)
-  if (dados.spreadPct > 0.16) {
-    return { passou: false, motivo: `Gatekeeper [VETO-SLIPPAGE: SPREAD LARGO]: Spread (${dados.spreadPct.toFixed(3)}% > 0.16%)` };
-  }
-
-  // BLOCO 3.2: Filtro de Alinhamento com o BTCUSDT (0 Tokens)
-  const btcInfo = await checarDirecaoBTC();
-  if (btcInfo) {
-    if (dados.direcaoModo === 'SHORT' && btcInfo.vetaShort) {
-      return { passou: false, motivo: `Gatekeeper [ALINHAMENTO BTC]: BTC em alta (+0.45% / Acima EMA9 15m) veta SHORT` };
-    }
-    if (dados.direcaoModo === 'LONG' && btcInfo.vetaLong) {
-      return { passou: false, motivo: `Gatekeeper [ALINHAMENTO BTC]: BTC em queda (-0.45% / Abaixo EMA9 15m) veta LONG` };
-    }
-  }
-
-  // 2. Veto de "Moeda de 1 Tick Grosso" (> 0.08% do preço)
-  if (dados.tickPct > 0.08) {
-    return { passou: false, motivo: `Gatekeeper [VETO-TICK-GROSSO]: 1 tick representa ${dados.tickPct.toFixed(3)}% > 0.08% do preço` };
-  }
-
-  // 3. Liquidez Mínima nos Top 5 Níveis do Book (>= $150 USDT no lado da execução em até 0.15%)
-  const ladoExecGk = dados.direcaoModo === 'SHORT' ? 'bids' : 'asks';
-  const volExecGk = ladoExecGk === 'bids' ? (dados.volBidsTop5 || 0) : (dados.volAsksTop5 || 0);
-  if (volExecGk < 150) {
-    return { passou: false, motivo: `Gatekeeper [VETO-LIQUIDEZ-BOOK]: Top 5 níveis (${ladoExecGk}) com apenas $${volExecGk.toFixed(0)} < $150 USDT em 0.15%` };
-  }
-
-  // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.45% a 2.50%)
-  if (dados.atrPct15m < 0.45) {
-    return { passou: false, motivo: `Gatekeeper: Volatilidade insuficiente (ATR 15m ${dados.atrPct15m.toFixed(2)}% < 0.45% - Moeda Lenta)` };
-  }
-  if (dados.atrPct15m > 2.50) {
-    return { passou: false, motivo: `Gatekeeper: Volatilidade excessiva (ATR 15m ${dados.atrPct15m.toFixed(2)}% > 2.50%)` };
-  }
-
-  // 2. Piso de Volume (RVOL >= 0.85x)
-  if (dados.rvol15m < 0.85) {
-    return { passou: false, motivo: `Gatekeeper: Volume insuficiente (RVOL ${dados.rvol15m.toFixed(2)}x < 0.85x - Sem Fluxo)` };
-  }
-
-  // 2.1 Bloqueio de Funding Tóxico (Proíbe SHORT se Funding < -0.15% e LONG se Funding > +0.15%)
-  const frGk = dados.fundingRate || 0;
-  if (dados.direcaoModo === 'SHORT' && frGk < -0.0015) {
-    return { passou: false, motivo: `Gatekeeper: Funding rate tóxico para SHORT (${(frGk * 100).toFixed(3)}% < -0.15% - Risco Short Squeeze e taxas)` };
-  }
-  if (dados.direcaoModo === 'LONG' && frGk > 0.0015) {
-    return { passou: false, motivo: `Gatekeeper: Funding rate tóxico para LONG (${(frGk * 100).toFixed(3)}% > +0.15% - Risco Long Squeeze e taxas)` };
-  }
-
-  // 2.2 Filtro de Exaustão 24h (Não vender fundo derretido nem comprar topo esticado)
-  const p24Gk = dados.priceChangePercent || 0;
-  if (dados.direcaoModo === 'SHORT' && p24Gk < -22.0 && dados.modoDetectado !== 'EXAUSTAO_REVERSAO') {
-    return { passou: false, motivo: `Gatekeeper: Moeda já derretida no dia (${p24Gk.toFixed(1)}% < -22%) - Veto a vender fundo` };
-  }
-  if (dados.direcaoModo === 'LONG' && p24Gk > 35.0 && dados.modoDetectado !== 'EXAUSTAO_REVERSAO') {
-    return { passou: false, motivo: `Gatekeeper: Moeda já esticada no dia (+${p24Gk.toFixed(1)}% > +35%) - Veto a comprar topo` };
-  }
-
-  // 3. Verifica se a moeda se enquadra em algum dos 3 modos dinâmicos
-  if (!dados.modoDetectado) {
-    return { passou: false, motivo: 'Gatekeeper: Nenhum setup ativo (nem Pullback, nem Momentum, nem Exaustão)' };
-  }
-
-  // 4. Validação direcional por modo
-  if (dados.modoDetectado === 'PULLBACK' || dados.modoDetectado === 'MOMENTUM') {
-    if (dados.direcaoModo === 'LONG' && dados.directionalScore < 55) {
-      return { passou: false, motivo: `Gatekeeper: Score direcional insuficiente para LONG (${dados.directionalScore} < +55)` };
-    }
-    if (dados.direcaoModo === 'SHORT' && dados.directionalScore > -55) {
-      return { passou: false, motivo: `Gatekeeper: Score direcional insuficiente para SHORT (${dados.directionalScore} > -55)` };
-    }
-  }
-
-
-
-  return {
-    passou: true,
-    modo: dados.modoDetectado,
-    modoLabel: dados.modoLabel,
-    direcao: dados.direcaoModo,
-    directionalScore: dados.directionalScore,
-    motivo: dados.motivoModo
-  };
-}
-
-// ── DECISÃO QUANTITATIVA VIA GEMINI FLASH (ETAPA 6 / JEV-AI ENTRADA) ──
-async function consultarGeminiQuant(symbol, dados) {
-  if (!ROUTER_API_KEY) {
-    console.error('[GEMINI-QUANT] Sem ROUTER_API_KEY');
-    return { action: 'WAIT', aprovado: false, confidence: 0, reason_short: 'Sem chave 9Router' };
-  }
-
-  // Histórico recente RAG da moeda específica
-  let ragHistTxt = 'Sem histórico recente';
-  try {
-    const parRows = await db.all(
-      `SELECT result, roi_pct, exit_reason FROM trades_rag 
-       WHERE symbol = ? AND result IS NOT NULL 
-       ORDER BY entry_time DESC LIMIT 4`,
-      [symbol]
-    );
-    if (parRows && parRows.length > 0) {
-      ragHistTxt = parRows.map(r => `${r.result} (${r.roi_pct > 0 ? '+' : ''}${Number(r.roi_pct).toFixed(1)}% via ${r.exit_reason})`).join(', ');
-    }
-  } catch(e) {}
-
-  const posRange8 = dados.posRange8Pct !== undefined ? `${dados.posRange8Pct.toFixed(1)}% (0%=fundo extremo, 100%=topo extremo)` : '50%';
-  const var3 = dados.var3Velas15m !== undefined ? `${dados.var3Velas15m}%` : '0.00%';
-
-  const prompt = `Você é o Gestor Quant Futuros Binance - JEV-AI Entrada Anti-Exaustão.
-Avalie este setup de entrada em ${symbol}:
-Modo: ${dados.modoLabel || dados.modoDetectado} | Dir: ${dados.direcaoModo} | Score Direcional: ${dados.directionalScore}
-Preço Atual: ${dados.curPrice} | MTF: 1h=${dados.dir1h === 'green' ? 'ALTA' : 'BAIXA'}, 15m=${dados.dir15m === 'green' ? 'ALTA' : 'BAIXA'}
-Distância EMA 21 (15m): ${dados.distEma21Atr.toFixed(2)}x ATR | ATR% 15m: ${dados.atrPct15m.toFixed(2)}% | RSI 15m: ${dados.rsi15m}
-Posição no Range das Últimas 8 Velas 15m: ${posRange8}
-Variação das Últimas 3 Velas 15m: ${var3}
-ADX 15m: ${dados.adx15m.toFixed(1)} | RVOL 15m: ${dados.rvol15m.toFixed(2)}x | TakerRatio: ${dados.takerRatioVal.toFixed(2)} | DeltaOI: ${dados.deltaOI.toFixed(2)}%
-Alavancagem Sugerida: ${dados.leverageSugerida}x | SL Inicial: ${dados.slPrice.toFixed(4)} | TP Inicial: ${dados.tpPrice.toFixed(4)}
-Histórico RAG recente de ${symbol}: ${ragHistTxt}
-
-DIRETRIZES EXECUTIVAS DE ENTRADA:
-1. APROVE entradas de continuidade de tendência e pullback ("aprovado": true, "confidence" >= 65) quando 1h, 15m e 5m estiverem alinhados com a direção do setup.
-2. APROVE entradas de EXAUSTÃO REVERSÃO ("aprovado": true, "confidence" >= 65) quando RSI 15m <= 22 (Long) ou >= 78 (Short) com vela de reação no 5m.
-3. VETE ("aprovado": false, "action": "WAIT") apenas topos esticados sem tendência (range recente >= 94% sem confluência) ou fundos desabando sem vela de reação.
-4. Toda aprovação exige confluência técnica e confiança >= 65. Em caso de dúvida real, vete.
-
-Responda APENAS JSON no formato exato:
-{
-  "action": "LONG" | "SHORT" | "WAIT",
-  "aprovado": true | false,
-  "confidence": 0-100,
-  "reason_short": "motivo direto em até 10 palavras"
-}`;
-
-  try {
-    const payload = {
-      model: 'ag/gemini-3.8-flash-low',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1,
-      max_tokens: 300
-    };
-
-    const resp = await axios.post('http://127.0.0.1:20128/v1/chat/completions', payload, {
-      headers: {
-        'Authorization': `Bearer ${ROUTER_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 35000
-    });
-
-    if (resp.data?.usage) {
-      registrarUsoTokens(resp.data.usage);
-    }
-
-    const raw = resp.data?.choices?.[0]?.message?.content?.trim() || '';
-    let jsonStr = raw;
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (jsonMatch) jsonStr = jsonMatch[0];
-    else jsonStr = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
-    const parsed = JSON.parse(jsonStr);
-    return parsed;
-  } catch(e) {
-    console.error(`[GEMINI-QUANT] Erro ao consultar IA para ${symbol}:`, e.message);
-    return { action: 'WAIT', aprovado: false, confidence: 0, reason_short: 'Falha na IA' };
-  }
-}
-
-
-// ── REGRA DE GESTÃO TEMPORAL E SOFT STOP (35m, 90m - 0 TOKENS) ──
-async function avaliarPerdao30mMatematico(symbol, pos, duracaoMinutos) {
-  try {
-    const alvo = localAlvos[symbol];
-    if (!alvo) return { fechar: false };
-    const funil = calcularFunilTempo(alvo, duracaoMinutos);
-    const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
-    const roiAtual = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
-
-    // Take Profit pelo Funil
-    if (roiAtual >= funil.tpRoiDinamico) {
-      return {
-        fechar: true,
-        motivo: duracaoMinutos > 40 ? 'TP_FUNIL_TEMPO' : 'TP',
-        desc: `Alvo Dinâmico atingido (+0.toFixed(2) >= +${funil.tpRoiDinamico.toFixed(2)}% | Duração ${Math.round(duracaoMinutos)}m)`
-      };
-    }
-
-    // Stop Loss pelo Funil (só se a Catraca ainda não estiver armada no lucro!)
-    if (!alvo.beArmed || !alvo.lockedRoi || alvo.lockedRoi <= 0) {
-      if (roiAtual <= funil.slRoiDinamico) {
-        return {
-          fechar: true,
-          motivo: duracaoMinutos > 40 ? 'SL_FUNIL_TEMPO' : 'SL',
-          desc: `Stop Dinâmico atingido (${roiAtual.toFixed(2)}% <= ${funil.slRoiDinamico.toFixed(2)}% | Duração ${Math.round(duracaoMinutos)}m)`
-        };
-      }
-    }
-
-    return { fechar: false };
-  } catch(e) {
-    return { fechar: false };
-  }
-}
 // ── MONITORAMENTO DE RISCO EM CÓDIGO (1.5s - 0 Tokens, 0ms Delay) ─────
 let isMonitoringTick = false;
 const closingInProgress = new Set();
 const closingStartedAt = {};
-const beBreachedTicks = {};
-const slBreachedTicks = {};
-const partialTicks = {};
-const resgateTicks = {}; // confirmação anti-pavio (2 ticks) p/ saída MODO_RESGATE — evita fechar num pico que reverte antes do fill
 
-// ── BLOCO 3: MOTOR GAMIFICADO DE SAÚDE DA ORDEM ABERTA (HP 0-100) ──
-function calcularHpOrdemAberta(alvo, analise, roiAtual = 0, duracaoMin = 0) {
-  if (!alvo || !analise) return 70;
-  const isLong = (alvo.side || '').toUpperCase() === 'LONG';
-  let hp = 0;
 
-  // 1. Pilar 1 — Estrutura Maior (1h e EMA 50 de 15m): Até 40 HP
-  const tend1hFavor = isLong 
-    ? (analise.dir1h === 'ALTA' || analise.ema21_1h >= analise.ema50_1h || analise.curPrice >= analise.ema50_1h)
-    : (analise.dir1h === 'BAIXA' || analise.ema21_1h <= analise.ema50_1h || analise.curPrice <= analise.ema50_1h);
-  if (tend1hFavor) hp += 25;
 
-  const precoEma50_15 = isLong 
-    ? (analise.curPrice >= analise.ema50_15) 
-    : (analise.curPrice <= analise.ema50_15);
-  if (precoEma50_15) hp += 15;
+// ══════════════════════════════════════════════════════════════════════
+// MOTOR PARABOLIC SAR 1M + ESQUELETO DA MOEDA (JEV-AI)
+// Slot livre → rank de volatilidade → trava a moeda → espera a VIRADA do SAR (2ª bolinha 1m)
+// → janela de 20s (JEV decide; fallback 0 token) → entrada → surfa o SAR → sai só quando o SAR vira contra.
+// SEM Take Profit fixo. A IA NÃO é consultada com ordem aberta.
+// ══════════════════════════════════════════════════════════════════════
+const sarEngine = require('./lib/sarEngine');
 
-  // 2. Pilar 2 — Defesa da Zona de Valor (EMA 21 de 15m): Até 25 HP
-  // Penalidade 3: Se o preço ao vivo (curPrice/markPrice) estiver abaixo da EMA 21 (15m) no LONG (ou acima no SHORT), o Pilar 2 vale 0 HP imediatamente (sem lag de 30m)
-  const ema21 = analise.ema21_15 || analise.curPrice;
-  const aoVivoContraEma21 = isLong ? (analise.curPrice < ema21) : (analise.curPrice > ema21);
+const ALAV_PADRAO = 3;
+const JANELA_DECISAO_MS = 20000;
+const SLOT_LOCK_TIMEOUT_MS = 30 * 60 * 1000;  // destrava por ausência de virada do SAR
+const COOLDOWN_SAR_VIRADA_MS = 5000;           // recompra imediata da moeda após virada do SAR
+const BE_ATIVA_ROI = 3.00;                     // pico de ROI que arma o breakeven
+const BE_PISO_ROI = 1.50;                      // piso de ROI do breakeven
+const LIMITE_SAIDA_ESPERA_MS = 5000;           // espera da ordem Limite de saída antes do fallback Market
+const slInicialRoi = (alav) => -(5 + (alav || ALAV_PADRAO)); // SL inicial = -(5 + alavancagem)% ROI
+const SAIDA_SAR_TICKS = 2;            // leituras consecutivas com o SAR contra a posição (anti-pavio)
+const RANK_TTL_MS = 60000;
+const KLINES_TTL_MS = 1500;
+const FLIP_PROCESSADO = {};            // symbol -> flipCandleTime já tratado (uma decisão por virada)
+const slotEmDecisao = { 1: false, 2: false }; // mutex da janela de 20s (impede entrada duplicada)
+const esqueletoSlot = { 1: null, 2: null };
+const saidaSarTicks = {};
+const klines1mCache = {};
+let rankCache = { ts: 0, lista: [] };
 
-  if (aoVivoContraEma21) {
-    hp += 0; // Preço ao vivo rompeu contra a EMA 21: zero pontos sem esperar fechar vela!
-  } else {
-    const closes15 = analise.p15?.closes || [];
-    const lastClosed15m = closes15.length >= 2 ? closes15[closes15.length - 2] : (closes15[closes15.length - 1] || analise.curPrice);
-    const atr15 = analise.atr15m || (analise.curPrice * 0.01);
-    const distContraEma21 = isLong ? (ema21 - lastClosed15m) : (lastClosed15m - ema21);
-
-    if (distContraEma21 <= 0) {
-      hp += 25; // Fechou a favor da EMA 21
-    } else if (distContraEma21 <= 0.5 * atr15) {
-      hp += 12; // Violou por < 0.5x ATR (apenas teste de pavio/respiro)
-    } else {
-      hp += 0;  // Rompimento contra por > 0.5x ATR
-    }
-  }
-
-  // 3. Pilar 3 — Fluxo e Agressão (Bússola Quant + Taker Ratio): Até 20 HP
-  const score = analise.directionalScore || 0;
-  if (isLong) {
-    if (score >= 30) hp += 12;
-    else if (score >= -20) hp += 6;
-  } else {
-    if (score <= -30) hp += 12;
-    else if (score <= 20) hp += 6;
-  }
-
-  const tr = analise.takerRatioVal || 1.0;
-  const semAgressaoContra = isLong ? (tr >= 0.85) : (tr <= 1.15);
-  if (semAgressaoContra) hp += 8;
-
-  // 4. Pilar 4 — Reação Recente do Preço (5m e RSI 15m): Até 15 HP
-  const rsi = analise.rsi15m || 50;
-  const mtf5mFavor = isLong 
-    ? (analise.dir5m === 'ALTA' || analise.curPrice >= analise.ema21_5) 
-    : (analise.dir5m === 'BAIXA' || analise.curPrice <= analise.ema21_5);
-  const rsiSaudavel = isLong 
-    ? (rsi >= 45 && rsi <= 72) 
-    : (rsi <= 55 && rsi >= 28);
-
-  if (mtf5mFavor || rsiSaudavel) {
-    hp += 15;
-  } else if ((isLong && rsi >= 38) || (!isLong && rsi <= 62)) {
-    hp += 8;
-  }
-
-  // ── PENALIDADES REAIS DE DESEMPENHO DA ORDEM ABERTA ──
-  // 1. Penalidade de Drawdown Atual: Se roiAtual < 0, subtrai Math.round(Math.abs(roiAtual) * 9)
-  if (roiAtual < 0) {
-    const penDrawdown = Math.round(Math.abs(roiAtual) * 9);
-    hp -= penDrawdown;
-  }
-
-  // 2. Penalidade de "Entrada no Topo/Fundo Sem Tração" (MFE Nulo):
-  // Se duracaoMin >= 15 e alvo.maxRoiReached < 0.35%, subtrai 25 HP
-  const maxRoi = alvo.maxRoiReached || 0;
-  if (duracaoMin >= 15 && maxRoi < 0.35) {
-    hp -= 25;
-  }
-
-  return Math.max(0, Math.min(100, hp));
+async function klines1m(sym, ttl = KLINES_TTL_MS) {
+  const c = klines1mCache[sym];
+  if (c && Date.now() - c.ts < ttl) return c.data;
+  const data = await fut.klines(sym, '1m', sarEngine.KLINES_LIMIT);
+  klines1mCache[sym] = { ts: Date.now(), data };
+  return data;
 }
 
-// ── BLOCO 4: MOTOR JEV-AI GESTOR DE ORDEM ABERTA (VIA 9ROUTER LOCAL - ECONOMIA DE TOKENS) ──
-async function consultarJevOrdemAberta(sym, alvo, pos, analise, curPrice, roiAtual, duracaoMin, hpAnt, hpAtual) {
-  if (!ROUTER_API_KEY) return null;
-  if (duracaoMin < 15) return null;
-  const isLong = pos.lado === 'LONG';
-  const entryPrice = parseFloat(pos.precoEntrada || alvo.entryPrice);
-  const alav = pos.alavancagem || alvo.leverage || 1;
+async function atualizarEsqueleto(slotNum, sym, statusSlot) {
+  const ks = await klines1m(sym).catch(() => null);
+  const esq = sarEngine.construirEsqueleto(slotNum, sym, ks, { statusSlot });
+  if (esq) esqueletoSlot[slotNum] = esq;
+  return esq;
+}
 
+// Ranking de volatilidade real (amplitude 15m recente + movimento recente + volume), cache 60s.
+async function rankearVolateis() {
+  const now = Date.now();
+  if (now - rankCache.ts < RANK_TTL_MS && rankCache.lista.length) return rankCache.lista;
   try {
-    const k5Closes = analise.p5?.closes || [];
-    const k5Opens = analise.p5?.opens || [];
-    const k5Highs = analise.p5?.highs || [];
-    const k5Lows = analise.p5?.lows || [];
-    const ult5Velas = [];
-    const startIdx = Math.max(0, k5Closes.length - 5);
-    for (let i = startIdx; i < k5Closes.length; i++) {
-      ult5Velas.push({
-        o: k5Opens[i],
-        h: k5Highs[i],
-        l: k5Lows[i],
-        c: k5Closes[i]
-      });
+    const tickers = await fut.ticker24h().catch(() => []);
+    const base = tickers
+      .filter(t => WHITELIST_VIP.has(t.symbol) && isSimboloValido(t.symbol))
+      .map(t => ({ symbol: t.symbol, qv: parseFloat(t.quoteVolume || 0), p24: Math.abs(parseFloat(t.priceChangePercent || 0)) }))
+      .filter(t => t.qv > 0)
+      .sort((a, b) => b.p24 - a.p24)
+      .slice(0, 10);
+    const lista = [];
+    for (const t of base) {
+      const ks = await fut.klines(t.symbol, '15m', 16).catch(() => null);
+      if (!ks || ks.length < 8) continue;
+      const amp = ks.map(k => ((parseFloat(k[2]) - parseFloat(k[3])) / parseFloat(k[4])) * 100);
+      const ampMedia = amp.reduce((a, b) => a + b, 0) / amp.length;
+      const c4 = ks.slice(-5);
+      const var4 = Math.abs((parseFloat(c4[4][4]) - parseFloat(c4[0][1])) / parseFloat(c4[0][1])) * 100;
+      const volFator = Math.sqrt(Math.min(1, t.qv / 2e7));
+      lista.push({ symbol: t.symbol, ampMedia15m: ampMedia, var4Velas: var4, score: (ampMedia + 0.5 * var4) * volFator });
     }
+    lista.sort((a, b) => b.score - a.score);
+    rankCache = { ts: now, lista };
+    return lista;
+  } catch (e) {
+    return rankCache.lista;
+  }
+}
 
-    const payloadOrdem = {
-      moeda: sym,
-      lado: pos.lado,
-      alavancagem: alav,
-      duracaoMin: Math.round(duracaoMin),
-      roiAtual: Number(roiAtual.toFixed(2)),
-      maxRoiReached: Number((alvo.maxRoiReached || 0).toFixed(2)),
-      minRoiReached: Number((alvo.minRoiReached || 0).toFixed(2)),
-      hp: `${hpAnt} -> ${hpAtual}/100`,
-      ultimas5Velas5m: ult5Velas,
-      distEma21_15m: Number((analise.distEma21Atr || 0).toFixed(2)),
-      takerRatio: Number((analise.takerRatioVal || 1.0).toFixed(2)),
-      bussolaScore: analise.directionalScore || 0
-    };
+function moedaLivreParaTravar(sym, now, slotNum) {
+  const outro = autoBotState.slots[slotNum === 1 ? 2 : 1];
+  if (outro.symbol === sym || outro.targetSymbol === sym) return false;
+  if (localAlvos[sym]) return false;
+  if (symbolLossCooldown && symbolLossCooldown[sym] && now < symbolLossCooldown[sym]) return false;
+  if (cooldownMoeda[sym] && now < cooldownMoeda[sym]) return false;
+  return true;
+}
 
-    const prompt = `Você é o Motor JEV-AI Gestor de Ordem Aberta de Futuros Binance.
-Avalie esta posição aberta e tome a decisão executiva de gestão de risco:
-${JSON.stringify(payloadOrdem)}
-
-DIRETRIZES EXECUTIVAS:
-1. "MANTER": Posição com estrutura saudável (HP >= 60) ou respirando normalmente na direção do setup.
-2. "TRAVAR_LUCRO": Posição com lucro acumulado (ROI >= +1.50%), mas enfrentando resistência ou exaustão de microestrutura.
-3. "MODO_RESGATE": Posição em drawdown (ROI < 0) com momentum fraco ou estagnada. O robô prepara a saída no repique técnico (+0.30% ROI) e ajusta o Stop Loss dinâmico para -4.20% ROI. PROIBIDO fechar a mercado no fundo.
-4. "FECHAR_AGORA": Desativado para ordens negativas. Nunca sugerir corte a mercado no prejuízo.
-
-Responda APENAS um JSON no formato exato:
-{
-  "acao": "MANTER" | "TRAVAR_LUCRO" | "MODO_RESGATE" | "FECHAR_AGORA",
-  "novo_tp_roi": null,
-  "novo_sl_roi": null,
-  "motivo_curto": "motivo direto em até 10 palavras"
-}`;
-
-    const resp = await axios.post('http://127.0.0.1:20128/v1/chat/completions', {
-      model: 'ag/gemini-3.8-flash-low',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1,
-      max_tokens: 250
-    }, {
-      headers: {
-        'Authorization': `Bearer ${ROUTER_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 25000
-    });
-
-    if (resp.data?.usage) {
-      registrarUsoTokens(resp.data.usage);
-    }
-
-    const raw = resp.data?.choices?.[0]?.message?.content?.trim() || '';
-    let jsonStr = raw;
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (jsonMatch) jsonStr = jsonMatch[0];
-    else jsonStr = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
-    const dec = JSON.parse(jsonStr);
-
-    if (dec && dec.acao) {
-      alvo.jevDecisao = {
-        acao: dec.acao,
-        motivo_curto: dec.motivo_curto || '',
-        hora: Date.now()
-      };
-
-      console.log(`[🤖 JEV-AI GESTOR] ${sym} (${pos.lado} | ROI: ${roiAtual.toFixed(2)}% | HP: ${hpAtual}/100): Decisão: ${dec.acao} - "${dec.motivo_curto}"`);
-
-      // ── Execução Automática da Decisão do JEV-AI ──
-      if (dec.acao === 'TRAVAR_LUCRO') {
-        if (roiAtual >= 1.50) {
-          if (!alvo.parcialExecutada && roiAtual >= 3.60) {
-            console.log(`[JEV-AI] TRAVAR_LUCRO: Executando Parcial 50% em ${sym} (ROI: +${roiAtual.toFixed(2)}%)`);
-            await executarParcial50(sym, alvo, pos, curPrice, 'JEV_AI_TRAVA_LUCRO');
+// Janela de decisão: JEV (tipado) responde LONG/SHORT/WAIT; se falhar/atrasar, vale a confirmação local (0 token).
+async function decidirEntradaSar(esq) {
+  const dirSar = sarEngine.direcaoDoSar(esq);
+  const local = sarEngine.confirmacaoLocal(esq);
+  if (!JEV_API_KEY) return { dir: local.ok ? dirSar : 'WAIT', fonte: 'LOCAL', conf: local.ok ? 60 : 0, motivo: local.motivo };
+  try {
+    const resp = await axios.post(JEV_URL, {
+      model: 'jev-latest',
+      state: esq,
+      questions: {
+        acao: {
+          type: 'choice',
+          instructions: 'Binance Futures scalp on 1-minute Parabolic SAR flip. The SAR just flipped (2nd consecutive dot). Approve only when EMA9, EMA21 and RSI14 slopes confirm the flip direction. Reject exhausted RSI (>80 long / <20 short) or flat lines.',
+          criteria: {
+            LONG: 'SAR below price (ABAIXO) after flip; EMA9 rising, EMA21 not falling, RSI14 rising and < 80.',
+            SHORT: 'SAR above price (ACIMA) after flip; EMA9 falling, EMA21 not rising, RSI14 falling and > 20.',
+            WAIT: 'Lines do not confirm the flip, RSI exhausted, or flip looks like noise.'
           }
-          alvo.beArmed = true;
-          const novoLocked = Math.max(alvo.lockedRoi || 0.65, Number((roiAtual - 0.50).toFixed(2)));
-          alvo.lockedRoi = novoLocked;
-          const beDist = entryPrice * ((alvo.lockedRoi / alav) / 100);
-          const calcStopPrice = isLong ? (entryPrice + beDist) : (entryPrice - beDist);
-          alvo.beStopPrice = alvo.beStopPrice ? (isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice)) : calcStopPrice;
-          salvarAlvos();
-        }
-      } else if (dec.acao === 'MODO_RESGATE' || (dec.acao === 'FECHAR_AGORA' && roiAtual < 0)) {
-        // PROIBIDO FECHAR_AGORA no negativo! Só ativa MODO_RESGATE se duracaoMin >= 35 e hpAtual <= 35
-        if (duracaoMin >= 35 && hpAtual <= 35) {
-          alvo.modoResgateAtivo = true;
-          alvo.tpResgateRoi = calcularPisoResgate(alav); // Alvo de saída no repique, piso escalado por alavancagem (cobre taxa+slippage)
-          alvo.slResgateRoi = null; // Proibido encurtar Stop Loss pelo Modo Resgate! SL fica com funil temporal
-          alvo.fecharImediatoJev = false;
-          salvarAlvos();
-          console.log(`[JEV-AI] MODO_RESGATE ${sym} (Duração ${Math.round(duracaoMin)}m >= 35m | HP: ${hpAtual} <= 35): Saída no repique em +${alvo.tpResgateRoi.toFixed(2)}% ROI | Stop mantido no Funil/ATR`);
-        } else {
-          alvo.fecharImediatoJev = false;
-          console.log(`[JEV-AI] ${sym}: Sugestão de resgate/fechamento ignorada (Duração ${Math.round(duracaoMin)}m < 35m ou HP ${hpAtual} > 35). Deixando respirar.`);
-        }
-      } else if (dec.acao === 'FECHAR_AGORA') {
-        // FECHAR_AGORA permitido EXCLUSIVAMENTE se ordem positiva (roiAtual >= 0)
-        if (roiAtual >= 0 && duracaoMin >= 15 && (alvo.maxRoiReached || 0) < 0.20) {
-          alvo.fecharImediatoJev = true;
-          alvo.motivoFechamentoJev = `[JEV_AI_STOP_PREVENTIVO] ${dec.motivo_curto || 'Quebra estrutural'} (ROI: +${roiAtual.toFixed(2)}% | Duração: ${Math.round(duracaoMin)}m)`;
-          salvarAlvos();
-          console.log(`[JEV-AI] FECHAR_AGORA positivo ativado para ${sym}: ${alvo.motivoFechamentoJev}`);
-        } else {
-          console.log(`[JEV-AI] FECHAR_AGORA ignorado para ${sym}: roiAtual < 0 ou condições não atingidas`);
         }
       }
-      return dec;
+    }, { headers: { 'Authorization': `Bearer ${JEV_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 8000, maxRedirects: 0 });
+    if (resp.data?.usage) registrarUsoTokens({ prompt_tokens: resp.data.usage.input_tokens || 0, completion_tokens: resp.data.usage.output_tokens || 0, total_tokens: (resp.data.usage.input_tokens || 0) + (resp.data.usage.output_tokens || 0) });
+    const ans = resp.data?.answers?.acao;
+    const choice = String(ans?.choice || '').toUpperCase();
+    const conf = Math.round((Number(ans?.confidence) || 0) * 100);
+    if (['LONG', 'SHORT', 'WAIT'].includes(choice)) {
+      const aprovado = choice === dirSar && conf >= 65;
+      return { dir: aprovado ? choice : 'WAIT', fonte: 'JEV', conf, motivo: `JEV ${choice} ${conf}%` };
     }
-  } catch(errJev) {
-    console.error(`[JEV-AI GESTOR] Erro ao consultar IA para ${sym}:`, errJev.message);
+  } catch (e) {
+    console.error(`[JEV-SAR] ${esq.symbol}: ${e.message} — fallback local`);
   }
-  return null;
+  return { dir: local.ok ? dirSar : 'WAIT', fonte: 'LOCAL', conf: local.ok ? 60 : 0, motivo: local.motivo };
 }
 
-// ── BLOCO 2: EXECUÇÃO E CONTABILIDADE DA PARCIAL DE 50% ──
-async function executarParcial50(sym, alvo, pos, curPrice, motivo = 'NORMAL_260') {
-  if (alvo.parcialExecutada) return false;
+// Execução maker/limit-chase com vetos de spread, tick grosso e liquidez do book. Retorna {ok, preco, qty, motivo}.
+async function executarEntradaSar(sym, dir, alav) {
+  const ladoTrade = dir === 'LONG' ? 'BUY' : 'SELL';
+  const posAtual = await fut.posicao(sym).catch(() => null);
+  if (posAtual && posAtual.quantidade > 0) return { ok: false, motivo: 'posição já existe' };
+  await fut.garantirAlavancagem(sym, alav, 'ISOLATED');
+  const book = await fut.livroOfertas(sym, 5);
+  const bestBid = parseFloat((book?.bids?.[0] || [])[0]);
+  const bestAsk = parseFloat((book?.asks?.[0] || [])[0]);
+  if (!bestBid || !bestAsk) return { ok: false, motivo: 'book vazio' };
+
+  const spreadPct = ((bestAsk - bestBid) / bestBid) * 100;
+  if (spreadPct > 0.16) return { ok: false, motivo: `spread ${spreadPct.toFixed(3)}% > 0.16%` };
+
   const f = fut.filtrosDe(sym);
-  const minQty = f ? parseFloat(f.minQty || 0.001) : 0.001;
-  const totalQty = Math.abs(parseFloat(pos.quantidade || alvo.quantidade || 0));
-  let metadeQty = totalQty / 2;
-  if (f && f.stepSize) metadeQty = fut.pisoNoStep(metadeQty, f.stepSize);
+  let tick = f ? parseFloat(f.tickSize) : 0;
+  if (!(tick > 0) && (book?.bids || []).length >= 2) tick = Math.abs(parseFloat(book.bids[0][0]) - parseFloat(book.bids[1][0]));
+  if ((tick / bestBid) * 100 > 0.08) return { ok: false, motivo: 'tick grosso > 0.08%' };
 
-  if (metadeQty >= minQty && (totalQty - metadeQty) >= minQty) {
-    try {
-      console.log(`[💰 PARCIAL 50% REALIZADA (${motivo})] ${sym} (${pos.lado}): Fechando ${metadeQty} de ${totalQty}`);
-      await fut.fecharMercado(sym, pos.lado, metadeQty);
-      alvo.parcialExecutada = true;
-
-      const isLong = pos.lado === 'LONG';
-      const entryPrice = parseFloat(pos.precoEntrada || alvo.entryPrice);
-      const pnlBrutoMetade1 = metadeQty * (isLong ? (curPrice - entryPrice) : (entryPrice - curPrice));
-      const taxaMetade1 = (metadeQty * curPrice) * 0.0005; // ~0.05% taker Binance
-      const pnlLiquidoMetade1 = pnlBrutoMetade1 - taxaMetade1;
-
-      alvo.pnlParcialBruto = (alvo.pnlParcialBruto || 0) + pnlBrutoMetade1;
-      alvo.pnlParcialLiquido = (alvo.pnlParcialLiquido || 0) + pnlLiquidoMetade1;
-      alvo.taxaParcial = (alvo.taxaParcial || 0) + taxaMetade1;
-
-      alvo.quantidade = totalQty - metadeQty;
-      pos.quantidade = totalQty - metadeQty;
-      salvarAlvos();
-      return true;
-    } catch(errParcial) {
-      console.error(`[PARCIAL 50%] Erro ao enviar ordem parcial para ${sym}:`, errParcial.message);
-      alvo.parcialExecutada = true;
-      salvarAlvos();
-      return false;
-    }
-  } else {
-    // Quantidade indivisível abaixo do minQty
-    alvo.parcialExecutada = true;
-    salvarAlvos();
-    return false;
+  let volBook = 0;
+  const lado = ladoTrade === 'BUY' ? (book.asks || []) : (book.bids || []);
+  const limite = ladoTrade === 'BUY' ? bestAsk * 1.0015 : bestBid * 0.9985;
+  for (const [p, q] of lado.slice(0, 5)) {
+    const pp = parseFloat(p);
+    if (ladoTrade === 'BUY' ? pp <= limite : pp >= limite) volBook += pp * parseFloat(q);
   }
+  if (volBook < 150) return { ok: false, motivo: `liquidez book $${volBook.toFixed(0)} < $150` };
+
+  const precoExec = ladoTrade === 'BUY' ? bestAsk : bestBid;
+  const calc = fut.calcularQuantidade(sym, MARGEM_POR_SLOT, precoExec, alav);
+  if (!calc.ok) return { ok: false, motivo: `qty: ${calc.motivo}` };
+
+  let ord = await fut.colocarLimite(sym, ladoTrade, calc.qty, precoExec);
+  await new Promise(r => setTimeout(r, 1200));
+  try { await fut.cancelarOrdem(sym, ord.orderId); } catch (e) {}
+  let st = await fut.consultarOrdem(sym, ord.orderId).catch(() => null);
+  let filled = st ? (parseFloat(st.executedQty) || 0) : -1;
+  let precoFinal = precoExec;
+  if (filled < 0) { // consulta falhou: a Binance é a fonte da verdade
+    const pr = await fut.posicao(sym).catch(() => null);
+    filled = pr && pr.quantidade > 0 ? pr.quantidade : 0;
+  }
+  if (filled === 0) {
+    const book2 = await fut.livroOfertas(sym, 5);
+    const p2 = parseFloat(ladoTrade === 'BUY' ? (book2.asks[0] || [])[0] : (book2.bids[0] || [])[0]);
+    if (p2 && Math.abs(p2 - precoExec) / precoExec <= 0.003) {
+      const ord2 = await fut.colocarLimite(sym, ladoTrade, calc.qty, p2);
+      await new Promise(r => setTimeout(r, 1200));
+      try { await fut.cancelarOrdem(sym, ord2.orderId); } catch (e) {}
+      st = await fut.consultarOrdem(sym, ord2.orderId).catch(() => null);
+      filled = st ? (parseFloat(st.executedQty) || 0) : 0;
+      if (!st) { const pr2 = await fut.posicao(sym).catch(() => null); filled = pr2 && pr2.quantidade > 0 ? pr2.quantidade : 0; }
+      precoFinal = p2;
+    }
+  }
+  if (filled <= 0) return { ok: false, motivo: 'não preencheu' };
+  return { ok: true, preco: precoFinal, qty: filled };
 }
 
-// ── BLOCO 4: COMPARAÇÃO DE 2 VERIFICAÇÕES (T1 vs T2 A CADA 120s) E GESTÃO ASSIMÉTRICA ──
-async function avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracaoMin) {
-  const agora = Date.now();
-  if (duracaoMin < 4) return;
-  if (agora - (alvo.lastHpCheck || 0) < 120000) return; // Checagem a cada 2 minutos (120s)
-
-  const analise = await analisarEstruturaEMercado(sym).catch(() => null);
-  if (!analise) return;
-
-  const hpAtual = calcularHpOrdemAberta(alvo, analise, roiPuro, duracaoMin);
-  const hpAnt = alvo.hpLeitura2 !== undefined ? alvo.hpLeitura2 : (alvo.hpLeitura1 || hpAtual);
-  alvo.hpLeitura1 = hpAnt;
-  alvo.hpLeitura2 = hpAtual;
-  alvo.lastHpCheck = agora;
-
-  const isLong = pos.lado === 'LONG';
-  const entryPrice = parseFloat(pos.precoEntrada);
-  const alav = pos.alavancagem || alvo.leverage || 1;
-
-  console.log(`[HP-AUDITORIA] ${sym} (${pos.lado} ${alav}x | Duração ${Math.round(duracaoMin)}m | ROI: ${roiPuro.toFixed(2)}%): Leitura HP T1:${hpAnt} ➔ T2:${hpAtual}/100`);
-
-  // ── MOTOR JEV-AI GESTOR DE ORDEM ABERTA (ECONOMIA DE TOKENS: >= 15M A CADA 300S / 5 MINUTOS) ──
-  if (duracaoMin >= 15) {
-    const tempoDesdeUltimoJev = agora - (alvo.lastJevAiCheck || 0);
-    const precisaChamarJev = (tempoDesdeUltimoJev >= 300000); // 300s (5 minutos)
-
-    if (precisaChamarJev) {
-      alvo.lastJevAiCheck = agora;
-      await consultarJevOrdemAberta(sym, alvo, pos, analise, curPrice, roiPuro, duracaoMin, hpAnt, hpAtual);
-    }
-  }
-
-  // ── CASO 1: Ordem no POSITIVO (roiPuro >= +1.50%) — Proteção Rápida do Lucro ──
-  if (roiPuro >= 1.50) {
-    const quedaGraveHp = (hpAtual < hpAnt) && (hpAtual <= 65 || (hpAnt - hpAtual) >= 25);
-    // Se ainda não executou parcial de +3.50%, mas pico >= +2.10% e queda de saúde confirmada (T2 <= 65 ou queda >= 25 pts)
-    if (!alvo.parcialExecutada && (alvo.maxRoiReached >= 2.10) && quedaGraveHp) {
-      alvo.beArmed = true;
-      alvo.lockedRoi = Math.max(alvo.lockedRoi || 0, 1.15);
-      const beDist = entryPrice * ((alvo.lockedRoi / alav) / 100);
-      const calcStopPrice = isLong ? (entryPrice + beDist) : (entryPrice - beDist);
-      alvo.beStopPrice = alvo.beStopPrice ? (isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice)) : calcStopPrice;
-      alvo.defesaLucroAtiva = true;
-      console.log(`[🛡️ DEFESA LUCRO ANTECIPADA] ${sym}: Catraca antecipada para +1.15% ROI devido à queda de HP (${hpAnt} ➔ ${hpAtual} | ΔHP: ${hpAnt - hpAtual}) com pico de +${alvo.maxRoiReached.toFixed(2)}%`);
-    }
-
-    // Se já em lucro alto (roiPuro >= +3.20%) e HP cair abaixo de 45 ou RSI 5m em exaustão extrema
-    const rsi5m = analise.p5?.closes ? ti.RSI.calculate({ period: 14, values: analise.p5.closes }).slice(-1)[0] || 50 : 50;
-    const rsiExausto = isLong ? (rsi5m >= 78) : (rsi5m <= 22);
-
-    if (roiPuro >= 3.20 && ((hpAtual < hpAnt && hpAtual <= 45) || rsiExausto)) {
-      const novoLocked = Number((roiPuro - 0.80).toFixed(2));
-      if (novoLocked > (alvo.lockedRoi || 0)) {
-        alvo.beArmed = true;
-        alvo.lockedRoi = novoLocked;
-        const beDist = entryPrice * ((alvo.lockedRoi / alav) / 100);
-        const calcStopPrice = isLong ? (entryPrice + beDist) : (entryPrice - beDist);
-        alvo.beStopPrice = alvo.beStopPrice ? (isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice)) : calcStopPrice;
-        console.log(`[CATRACA-APERTO-HP] ${sym}: Trava apertada para +${alvo.lockedRoi.toFixed(2)}% ROI por fadiga de HP/RSI (${hpAnt} ➔ ${hpAtual} | RSI 5m: ${rsi5m.toFixed(1)})`);
+// Saída: Limite passivo (espera 5s) -> o que sobrar vai a Market reduceOnly.
+async function fecharLimiteComFallback(sym, ladoPos, qty) {
+  const ladoOrd = ladoPos === 'LONG' ? 'SELL' : 'BUY';
+  try {
+    const book = await fut.livroOfertas(sym, 5);
+    const preco = parseFloat(ladoPos === 'LONG' ? (book.asks[0] || [])[0] : (book.bids[0] || [])[0]);
+    if (preco > 0) {
+      const ord = await fut.colocarLimite(sym, ladoOrd, qty, preco, { reduceOnly: true });
+      const fim = Date.now() + LIMITE_SAIDA_ESPERA_MS;
+      while (Date.now() < fim) {
+        await new Promise(r => setTimeout(r, 500));
+        const st = await fut.consultarOrdem(sym, ord.orderId).catch(() => null);
+        if (st && st.status === 'FILLED') return;
       }
+      try { await fut.cancelarOrdem(sym, ord.orderId); } catch (e) {}
     }
+  } catch (e) {
+    console.warn(`[SAIDA-LIMITE] ${sym}: ${e.message} -> fallback Market`);
   }
+  const pr = await fut.posicao(sym).catch(() => null);
+  if (pr && pr.quantidade > 0) await fut.fecharMercado(sym, ladoPos, pr.quantidade);
+}
 
-  // ── CASO 2: Ordem no NEGATIVO (roiPuro < 0.00% e duracaoMin >= 35) — Cuidado Máximo (PROIBIDO Abortar no Fundo!) ──
-  if (roiPuro < 0.00 && duracaoMin >= 35) {
-    // Cenário 2A: Susto normal / Reação (T2 >= T1 OU T2 >= 45)
-    if (hpAtual >= hpAnt || hpAtual >= 45) {
-      if (alvo.modoResgateAtivo && hpAtual >= 60) {
-        console.log(`[RECUPERAÇÃO HP] ${sym}: Estrutura recuperou (HP ${hpAnt} ➔ ${hpAtual} >= 60). Desativando Modo Resgate.`);
-        alvo.modoResgateAtivo = false;
-        alvo.tpResgateRoi = null;
-        alvo.slResgateRoi = null;
-        alvo.jevDecisao = null;
-        delete resgateTicks[sym];
-      }
-    }
-    // Cenário 2B: Deterioração Grave Confirmada em 2 Leituras (hpAnt <= 35 E hpAtual < hpAnt E hpAtual <= 35)
-    else if (hpAnt <= 35 && hpAtual < hpAnt && hpAtual <= 35) {
-      if (!alvo.modoResgateAtivo) {
-        alvo.modoResgateAtivo = true;
-        alvo.tpResgateRoi = calcularPisoResgate(alav); // Alvo de saída no repique, piso escalado por alavancagem (cobre taxa+slippage)
-        alvo.slResgateRoi = null; // Proibido encurtar Stop Loss pelo Modo Resgate! SL mantido no Funil/ATR
-        console.log(`[🚑 MODO RESGATE ATIVADO] ${sym}: Confirmada deterioração grave em 2 leituras com duração ${Math.round(duracaoMin)}m >= 35m (T1:${hpAnt} ➔ T2:${hpAtual} <= 35). Alvo de saída no repique em +${alvo.tpResgateRoi.toFixed(2)}% ROI. SL mantido no Funil.`);
-      }
-    }
-  }
-
-  // Limpa MODO_RESGATE se trade voltou ao positivo (evita badge preso mesmo com roiPuro >= 0)
-  if (roiPuro >= 0 && alvo.jevDecisao?.acao === 'MODO_RESGATE') {
-    alvo.modoResgateAtivo = false;
-    alvo.tpResgateRoi = null;
-    alvo.jevDecisao = null;
-    salvarAlvos();
-  }
-
+function registrarPosicaoSar(sym, dir, alav, exec, esq, slotNum) {
+  const isLong = dir === 'LONG';
+  const slPrice = exec.preco * (1 + (isLong ? 1 : -1) * (slInicialRoi(alav) / alav) / 100);
+  localAlvos[sym] = {
+    side: dir,
+    entryPrice: exec.preco,
+    slPrice,                       // apenas rede de emergência; NÃO existe TP
+    leverage: alav,
+    quantidade: exec.qty,
+    maxRoiReached: 0,
+    minRoiReached: 0,
+    openTime: Date.now(),
+    slot: slotNum,
+    sarEntrada: esq.sar1m,
+    sarLabel: '[🏄 SURFANDO SAR 1m]',
+    parcialExecutada: false,
+    pnlParcialBruto: 0,
+    pnlParcialLiquido: 0,
+    taxaParcial: 0,
+    fechando: false,
+    fechandoDesde: 0
+  };
   salvarAlvos();
+  (async () => {
+    for (let t = 1; t <= 3; t++) {
+      try { await fut.colocarStopLoss(sym, dir, slPrice); localAlvos[sym] && (localAlvos[sym].slNaCorretora = true); return; }
+      catch (e) { console.error(`[SL-EMERGENCIA] ${sym} tentativa ${t}/3: ${e.message}`); await new Promise(r => setTimeout(r, 800)); }
+    }
+    console.error(`[SL-EMERGENCIA] ${sym}: SEM stop na corretora; vale só o monitor de ${slInicialRoi(alav)}% ROI`);
+  })();
 }
 
+let autoBotLoopRunning = false;
+setInterval(async () => {
+  if (!autoBotState.enabled || autoBotLoopRunning) return;
+  autoBotLoopRunning = true;
+  try {
+    const now = Date.now();
+    for (const slotNum of [1, 2]) {
+      const slot = autoBotState.slots[slotNum];
+
+      // Posição aberta: o monitor de 1,5s cuida do SAR; aqui só confere se a posição ainda existe.
+      if (slot.symbol) {
+        const pos = await fut.posicao(slot.symbol).catch(() => undefined);
+        if (pos !== undefined && (!pos || pos.quantidade === 0)) {
+          slot.symbol = null; slot.targetSymbol = null; slot.side = null; slot.status = 'LIVRE';
+          esqueletoSlot[slotNum] = null;
+        } else if (esqueletoSlot[slotNum]) {
+          esqueletoSlot[slotNum].statusSlot = 'POSICAO_ABERTA_SURFANDO_SAR';
+          slot.status = `[POSIÇÃO ATIVA] ${slot.symbol} (${slot.side} ${slot.leverage}x) — SURFANDO SAR`;
+        }
+        continue;
+      }
+      if (slotEmDecisao[slotNum]) continue;
+      if (slot.searchCooldownUntil && now < slot.searchCooldownUntil) {
+        slot.status = `[COOLDOWN PÓS-SAÍDA] Aguardando ${Math.round((slot.searchCooldownUntil - now) / 1000)}s`;
+        continue;
+      }
+
+      // 1. Slot sem moeda: ranking de volatilidade e TRAVA
+      if (!slot.targetSymbol) {
+        const rank = await rankearVolateis();
+        const escolhida = rank.find(r => moedaLivreParaTravar(r.symbol, now, slotNum));
+        if (!escolhida) { slot.status = 'ESCANEANDO_VOLATILIDADE'; esqueletoSlot[slotNum] = null; continue; }
+        const liq = await validarLiquidezMoeda(escolhida.symbol).catch(() => ({ ok: false }));
+        if (!liq.ok) { cooldownMoeda[escolhida.symbol] = now + 10 * 60000; continue; }
+        slot.targetSymbol = escolhida.symbol;
+        slot.lockSince = now;
+        console.log(`[SLOT-LOCK] Slot ${slotNum} travou ${escolhida.symbol} (score ${escolhida.score.toFixed(3)} | amp15m ${escolhida.ampMedia15m.toFixed(2)}%)`);
+      }
+
+      const sym = slot.targetSymbol;
+      if (now - (slot.lockSince || now) > SLOT_LOCK_TIMEOUT_MS) {
+        console.log(`[SLOT-LOCK] Slot ${slotNum} soltou ${sym}: sem virada em ${SLOT_LOCK_TIMEOUT_MS / 60000}min`);
+        cooldownMoeda[sym] = now + 2 * 60000;
+        slot.targetSymbol = null; slot.status = 'ESCANEANDO_VOLATILIDADE'; esqueletoSlot[slotNum] = null;
+        continue;
+      }
+
+      // 2. Monta/atualiza o esqueleto 1m e espera a virada
+      const esq = await atualizarEsqueleto(slotNum, sym, 'AGUARDANDO_VIRADA_SAR');
+      if (!esq) { slot.status = 'ERRO_KLINES_1M'; continue; }
+      slot.status = `[TOCAIA SAR 1m] ${sym} SAR ${esq.sar1m.posicaoAtual} (${esq.sar1m.bolinhasConsecutivas} bolinha(s))`;
+      if (!esq.sar1m.virouAgora || FLIP_PROCESSADO[sym] === esq.sar1m.flipCandleTime) continue;
+
+      // 3. JANELA DE DECISÃO 20s (uma por virada)
+      FLIP_PROCESSADO[sym] = esq.sar1m.flipCandleTime;
+      slotEmDecisao[slotNum] = true;
+      esq.statusSlot = 'JANELA_DECISAO_20S';
+      esqueletoSlot[slotNum] = esq;
+      slot.status = `[JANELA 20s] ${sym} virou SAR ${esq.sar1m.posicaoAtual} — consultando JEV`;
+      try {
+        const limite = new Promise(r => setTimeout(() => r(null), JANELA_DECISAO_MS));
+        let dec = await Promise.race([decidirEntradaSar(esq), limite]);
+        if (!dec) {
+          const loc = sarEngine.confirmacaoLocal(esq);
+          dec = { dir: loc.ok ? sarEngine.direcaoDoSar(esq) : 'WAIT', fonte: 'LOCAL_TIMEOUT', conf: 60, motivo: loc.motivo };
+        }
+        if (dec.dir !== 'LONG' && dec.dir !== 'SHORT') {
+          console.log(`[SAR-RECUSA] ${sym} (${dec.fonte}): ${dec.motivo}`);
+          autoBotState.lastLog = `Slot ${slotNum} (${sym}): virada recusada — ${dec.motivo}`;
+          continue; // mantém a trava, aguarda a próxima virada
+        }
+        // Revalida a virada antes de enviar a ordem (evita repintura do candle em formação)
+        const esq2 = await atualizarEsqueleto(slotNum, sym, 'EXECUTANDO_ENTRADA');
+        if (!esq2 || sarEngine.direcaoDoSar(esq2) !== dec.dir) {
+          console.log(`[SAR-REPINTURA] ${sym}: SAR mudou durante a janela. Entrada abortada.`);
+          continue;
+        }
+        slot.status = `[EXECUTANDO ENTRADA] ${sym} ${dec.dir}`;
+        const alav = ALAV_PADRAO;
+        const exec = await executarEntradaSar(sym, dec.dir, alav);
+        if (!exec.ok) {
+          console.log(`[SAR-ENTRADA-FALHOU] ${sym}: ${exec.motivo}`);
+          slot.status = `[ENTRADA FALHOU: ${exec.motivo}]`;
+          if (exec.motivo.startsWith('spread') || exec.motivo.startsWith('tick') || exec.motivo.startsWith('liquidez') || exec.motivo.startsWith('qty')) {
+            cooldownMoeda[sym] = now + 5 * 60000; slot.targetSymbol = null; esqueletoSlot[slotNum] = null;
+          }
+          continue;
+        }
+        slot.symbol = sym; slot.side = dec.dir; slot.leverage = alav; slot.openTime = Date.now();
+        registrarPosicaoSar(sym, dec.dir, alav, exec, esq2, slotNum);
+        esq2.statusSlot = 'POSICAO_ABERTA_SURFANDO_SAR';
+        esqueletoSlot[slotNum] = esq2;
+        slot.status = `[ATIVO: ${sym} ${dec.dir} ${alav}x] SURFANDO SAR`;
+        console.log(`[ORDEM-EXECUTADA] Slot ${slotNum} (${sym}): ${dec.dir} ${alav}x a ${formatarPrecoAtivo(sym, exec.preco)} | Qty ${exec.qty} | ${dec.fonte} ${dec.conf}% | SEM TP — saída na virada do SAR`);
+        await rag.salvarEntradaRAG({
+          symbol: sym, side: dec.dir, leverage: alav, mode: 'SAR_1M_FLIP', scoreTotal: dec.conf,
+          rsi15m: 50, rsi1m: esq2.linhasConfirmacao1m.rsi14_valor,
+          emaStatus: `EMA9 ${esq2.linhasConfirmacao1m.ema9_inclinacao} / EMA21 ${esq2.linhasConfirmacao1m.ema21_inclinacao}`,
+          sarStatus: `SAR1m ${esq2.sar1m.posicaoAtual}`,
+          volRatio: 0, fundingRate: 0, bookRatio: 0, fiboPos: '--', patterns: ['SAR_FLIP_1M'],
+          aiThesis: dec.motivo, entryPrice: exec.preco,
+          dadosMercado: { rsi: 50, rsi1m: esq2.linhasConfirmacao1m.rsi14_valor, emaStatus: esq2.linhasConfirmacao1m.ema9_inclinacao, sarTendencia: esq2.sar1m.posicaoAtual, volRatio: 0, fundingRate: 0, longPct: 0, fiboPos: '--', padroesDetectados: ['SAR_FLIP_1M'], preco: exec.preco }
+        }).catch(() => {});
+        autoBotState.lastLog = `Slot ${slotNum}: Entrou ${dec.dir} em ${sym} (${alav}x) na virada do SAR 1m. ${dec.motivo}`;
+      } catch (e) {
+        console.error(`[SAR-JANELA] ${sym}: ${e.message}`);
+      } finally {
+        slotEmDecisao[slotNum] = false;
+      }
+    }
+  } catch (e) {
+    console.error('[AUTOBOT-LOOP] Erro:', e.message);
+  } finally {
+    autoBotLoopRunning = false;
+  }
+}, 3000);
+
+// ── MONITOR DE POSIÇÃO ABERTA (1,5s, 0 token): surfa o SAR; sai só na virada contra / emergência / funding ──
 setInterval(async () => {
   if (isMonitoringTick) return;
   isMonitoringTick = true;
   try {
-    const agoraWatchdog = Date.now();
-
-    // BLOCO 1.2: Watchdog de segurança para destravar alvos presos
+    const agoraWd = Date.now();
     for (const sym of Object.keys(localAlvos)) {
-      const alvo = localAlvos[sym];
-      if (alvo && alvo.fechando && (agoraWatchdog - (alvo.fechandoDesde || 0) > 10000)) {
-        console.warn(`[WATCHDOG-FECHANDO] Resetando trava de fechamento presa para ${sym} (>10s)`);
-        alvo.fechando = false;
-        closingInProgress.delete(sym);
-        delete closingStartedAt[sym];
+      const a = localAlvos[sym];
+      if (a && a.fechando && agoraWd - (a.fechandoDesde || 0) > 10000) {
+        console.warn(`[WATCHDOG-FECHANDO] Resetando trava presa em ${sym}`);
+        a.fechando = false; closingInProgress.delete(sym); delete closingStartedAt[sym];
       }
     }
     for (const sym of Array.from(closingInProgress)) {
-      if (agoraWatchdog - (closingStartedAt[sym] || 0) > 12000) {
-        console.warn(`[WATCHDOG-CLOSING] Resetando closingInProgress preso para ${sym} (>12s)`);
-        closingInProgress.delete(sym);
-        delete closingStartedAt[sym];
+      if (agoraWd - (closingStartedAt[sym] || 0) > 12000) {
+        closingInProgress.delete(sym); delete closingStartedAt[sym];
         if (localAlvos[sym]) localAlvos[sym].fechando = false;
       }
     }
@@ -1526,316 +718,117 @@ setInterval(async () => {
     for (const sym of Object.keys(localAlvos)) {
       if (closingInProgress.has(sym)) continue;
       const alvo = localAlvos[sym];
-      if (alvo && alvo.fechando) continue;
-
+      if (!alvo || alvo.fechando) continue;
       try {
         const pos = await fut.posicao(sym);
         if (!pos || pos.quantidade === 0) {
-          delete localAlvos[sym];
-          delete maxPriceTracker[sym];
-          delete minPriceTracker[sym];
-          delete beBreachedTicks[sym];
-          delete slBreachedTicks[sym];
-          delete partialTicks[sym];
-          delete resgateTicks[sym];
-          salvarAlvos();
+          delete localAlvos[sym]; delete saidaSarTicks[sym]; salvarAlvos();
           continue;
         }
-
-        // Preço atual do livro
         const ticker = await fut.tickerPreco(sym).catch(() => null);
         const curPrice = (ticker && ticker.price) ? parseFloat(ticker.price) : (parseFloat(pos.precoMarca) || parseFloat(pos.precoEntrada));
         const entryPrice = parseFloat(pos.precoEntrada);
         const alav = pos.alavancagem || 1;
         const isLong = pos.lado === 'LONG';
-        const varPrecoPct = ((curPrice - entryPrice) / entryPrice) * 100 * (isLong ? 1 : -1);
-        const roiPuro = varPrecoPct * alav;
-        const roi = roiPuro;
+        const roi = ((curPrice - entryPrice) / entryPrice) * 100 * (isLong ? 1 : -1) * alav;
+        const duracaoMs = Date.now() - (alvo.openTime || pos.atualizadoEm || Date.now());
+        if (alvo.maxRoiReached === undefined || roi > alvo.maxRoiReached) alvo.maxRoiReached = roi;
+        if (alvo.minRoiReached === undefined || roi < alvo.minRoiReached) alvo.minRoiReached = roi;
+        alvo.lastRoiPuro = roi;
 
-        // ── MONITORAMENTO DE ROI MÁXIMO E DURAÇÃO ──
-        const duracaoMs = Date.now() - (alvo.openTime || (pos.atualizadoEm || Date.now()));
-        const duracaoMin = duracaoMs / 60000;
-
-        if (alvo.maxRoiReached === undefined || roi > alvo.maxRoiReached) {
-          alvo.maxRoiReached = roi;
-        }
-        if (alvo.minRoiReached === undefined || roi < alvo.minRoiReached) {
-          alvo.minRoiReached = roi;
-        }
-        alvo.lastRoiPuro = roiPuro;
-        const maxRoi = alvo.maxRoiReached || 0;
-
-        // ── BLOCO 3 & 4: AVALIAÇÃO GAMIFICADA DE SAÚDE (HP 0-100 A CADA 120s) ──
-        await avaliarHpPosicaoAberta(sym, alvo, pos, curPrice, roiPuro, duracaoMin).catch(e => console.error(`[HP-ERRO] ${sym}:`, e.message));
-
-        // ── BLOCO 4.2: PARCIAL DE 50% AOS +3.50% ROI (LUCRO NO BOLSO) ──
-        if (roiPuro >= 3.50 || alvo.maxRoiReached >= 3.50) {
-          if (!alvo.parcialExecutada) {
-            partialTicks[sym] = (partialTicks[sym] || 0) + 1;
-            if (partialTicks[sym] >= 2) {
-              await executarParcial50(sym, alvo, pos, curPrice, 'PARCIAL_350');
-            }
-          }
-        } else {
-          partialTicks[sym] = 0;
+        const slotNum = alvo.slot || [1, 2].find(s => autoBotState.slots[s].symbol === sym) || 1;
+        const esq = await atualizarEsqueleto(slotNum, sym, 'POSICAO_ABERTA_SURFANDO_SAR');
+        let sarContra = false;
+        if (esq) {
+          const dirSar = sarEngine.direcaoDoSar(esq);
+          sarContra = dirSar !== pos.lado;
+          alvo.sarLabel = `[🏄 SURFANDO SAR 1m: ${esq.sar1m.posicaoAtual} ${esq.sar1m.valorAtual.toFixed(6)} | PICO +${(alvo.maxRoiReached || 0).toFixed(2)}%${sarContra ? ' | ⚠️ SAR CONTRA' : ''}]`;
         }
 
-        // ── BLOCO 4.1 e 4.3: CATRACA PROGRESSIVA COM CONFIRMAÇÃO DE 5 TICKS (ANTI-PAVIO, 7.5s) ──
-        const prevArmed = alvo.beArmed || false;
-        const prevLockedRoi = alvo.lockedRoi || 0;
-
-        if (alvo.maxRoiReached < 2.60) {
-          // Abaixo de +2.60% de ROI: se Catraca não foi armada por Defesa de Lucro HP/JEV, mantém respiro livre
-          if (!alvo.beArmed) {
-            alvo.lockedRoi = 0;
-            alvo.beStopPrice = null;
-          }
-        } else {
-          alvo.beArmed = true;
-          let novoLocked = 1.50;
-          if (alvo.maxRoiReached >= 8.00) novoLocked = 8.00;
-          else if (alvo.maxRoiReached >= 6.20) novoLocked = 5.00;
-          else if (alvo.maxRoiReached >= 5.00) novoLocked = 3.90;
-          else if (alvo.maxRoiReached >= 4.00) novoLocked = 3.00;
-          else if (alvo.maxRoiReached >= 3.30) novoLocked = 2.20;
-          else if (alvo.maxRoiReached >= 2.60) novoLocked = 1.50;
-          else novoLocked = 1.50;
-
-          if (alvo.maxRoiReached >= 4.00 && !alvo.parcialExecutada) {
-            await executarParcial50(sym, alvo, pos, curPrice, 'PARCIAL_CATRACA_400');
-          }
-
-          alvo.lockedRoi = Math.max(alvo.lockedRoi || 0, novoLocked);
-
-          const calcStopPrice = entryPrice * (1 + (isLong ? 1 : -1) * ((alvo.lockedRoi / alav) / 100));
-          if (!alvo.beStopPrice) {
-            alvo.beStopPrice = calcStopPrice;
-          } else {
-            alvo.beStopPrice = isLong ? Math.max(alvo.beStopPrice, calcStopPrice) : Math.min(alvo.beStopPrice, calcStopPrice);
-          }
-
-          if (!prevArmed || Math.abs(alvo.lockedRoi - prevLockedRoi) >= 0.05) {
-            salvarAlvos();
-            const stopFmt = formatarPrecoAtivo(sym, alvo.beStopPrice);
-            console.log(`[CATRACA] ${sym} (${pos.lado}): Pico +${maxRoi.toFixed(2)}% ROI -> Trava em +${alvo.lockedRoi.toFixed(2)}% ROI ($${stopFmt})`);
-          }
-        }
-
-        // ── BLOCO 5: AFUNILAMENTO DINÂMICO DE TP E SL POR TEMPO ──
-        const funil = calcularFunilTempo(alvo, duracaoMin);
-
-        // ── BLOCO 5: BADGE VISUAL DE HP (T1 -> T2), FUNIL E PARCIAL NO CARD DO PAINEL ──
-        const hp1 = alvo.hpLeitura1 ?? 75;
-        const hp2 = alvo.hpLeitura2 ?? hp1;
-        let hpBadge = '';
-
-        if (alvo.jevDecisao) {
-          hpBadge = `[🤖 JEV-AI: ${alvo.jevDecisao.acao} | "${alvo.jevDecisao.motivo_curto}" | HP: ${hp2}/100]`;
-        } else if (alvo.modoResgateAtivo) {
-          hpBadge = `[🚑 MODO RESGATE ATIVO (HP ${hp1} ➔ ${hp2}/100) | SAÍDA PROGRAMADA NO REPIQUE (+${(alvo.tpResgateRoi || calcularPisoResgate(alav)).toFixed(2)}% ROI)]`;
-        } else if (alvo.defesaLucroAtiva || (roiPuro >= 1.50 && hp2 < hp1 && (hp2 <= 65 || (hp1 - hp2) >= 25))) {
-          hpBadge = `[🛡️ HP EM QUEDA (${hp1} ➔ ${hp2}/100) | DEFESA DE LUCRO ANTECIPADA ATIVA]`;
-        } else if (hp2 >= 60) {
-          hpBadge = `[💚 HP DA ORDEM: ${hp2}/100 (T1:${hp1} ➔ T2:${hp2}) | ESTRUTURA FIRME]`;
-        } else if (hp2 >= 35) {
-          hpBadge = `[⚠️ HP DA ORDEM: ${hp2}/100 (T1:${hp1} ➔ T2:${hp2}) | MONITORANDO]`;
-        } else {
-          hpBadge = `[🚨 HP DA ORDEM: ${hp2}/100 (T1:${hp1} ➔ T2:${hp2}) | CRÍTICO]`;
-        }
-
-        let statusBadge = hpBadge;
-        if (alvo.beArmed && alvo.lockedRoi > 0) {
-          const stopFmt = formatarPrecoAtivo(sym, alvo.beStopPrice);
-          statusBadge += ` [🛡️ CATRACA +${alvo.lockedRoi.toFixed(2)}%: GARANTIDO ($${stopFmt}) | PICO +${maxRoi.toFixed(2)}%]`;
-        } else {
-          statusBadge += ` [🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO: +${maxRoi.toFixed(2)}%)]`;
-        }
-        if (duracaoMin > 40) {
-          const stopStr = (alvo.beArmed && alvo.lockedRoi > 0) ? `+${alvo.lockedRoi.toFixed(2)}%` : `${funil.slRoiDinamico.toFixed(2)}%`;
-          const alvoStr = alvo.modoResgateAtivo ? `+${(alvo.tpResgateRoi || calcularPisoResgate(alav)).toFixed(2)}%` : `+${funil.tpRoiDinamico.toFixed(2)}%`;
-          statusBadge += ` [⏳ FUNIL ${Math.floor(duracaoMin)}m: ALVO ${alvoStr} | STOP ${stopStr}]`;
-        }
-        if (alvo.parcialExecutada) {
-          statusBadge += ' [💰 50% NO BOLSO]';
-        }
-        alvo.beLabel = statusBadge;
-
-        // ── REGRAS DE FECHAMENTO ──
         let deveFechar = false;
-        let motivoFechamento = '';
+        let motivo = '';
 
-        // 0. Encerramento Preventivo JEV-AI (PROIBIDO FECHAR NO NEGATIVO!)
-        if (!deveFechar && alvo.fecharImediatoJev) {
-          if (roi < 0) {
-            alvo.fecharImediatoJev = false;
-            if (duracaoMin >= 35 && hp2 <= 35) {
-              alvo.modoResgateAtivo = true;
-              alvo.tpResgateRoi = calcularPisoResgate(alav);
-              alvo.slResgateRoi = null;
-              salvarAlvos();
-              console.log(`[🛡️ BLINDAGEM JEV] ${sym}: Convertido para MODO_RESGATE (TP +${alvo.tpResgateRoi.toFixed(2)}%, SL pelo Funil).`);
-            } else {
-              salvarAlvos();
-              console.log(`[🛡️ BLINDAGEM JEV] ${sym}: Bloqueado fechamento no negativo (ROI: ${roi.toFixed(2)}% | Duração ${Math.round(duracaoMin)}m). Posição mantida.`);
-            }
-          } else {
+        // 1. Saída principal: SAR virou contra (confirmado em N leituras)
+        if (sarContra) {
+          saidaSarTicks[sym] = (saidaSarTicks[sym] || 0) + 1;
+          if (saidaSarTicks[sym] >= SAIDA_SAR_TICKS) {
             deveFechar = true;
-            motivoFechamento = alvo.motivoFechamentoJev || `[JEV_AI_STOP_PREVENTIVO] Quebra estrutural via IA (ROI: +${roi.toFixed(2)}%)`;
+            motivo = `[SAIDA_SAR_VIRADA] SAR 1m virou contra (${esq.sar1m.posicaoAtual}) | ROI ${roi.toFixed(2)}% | Pico +${(alvo.maxRoiReached || 0).toFixed(2)}% | ${Math.round(duracaoMs / 60000)}m`;
           }
+        } else {
+          saidaSarTicks[sym] = 0;
         }
 
-        // 1. Take Profit pelo Modo Resgate (piso por alavancagem, confirmado em 2 ticks ANTI-PAVIO), Funil Dinâmico ou TP Cheio Fixo
-        if (!deveFechar) {
-          const pisoResgateAtual = Math.max(alvo.tpResgateRoi || calcularPisoResgate(alav), calcularPisoResgate(alav));
-          if (alvo.modoResgateAtivo && roi >= pisoResgateAtual) {
-            resgateTicks[sym] = (resgateTicks[sym] || 0) + 1;
-            if (resgateTicks[sym] >= 2) {
-              deveFechar = true;
-              motivoFechamento = `[SAIDA_RESGATE_REPIQUE_HP] Alvo de Resgate atingido no repique (+${roi.toFixed(2)}% ROI >= +${pisoResgateAtual.toFixed(2)}% | Taxa+slippage cobertos | Duração: ${Math.round(duracaoMin)}m)`;
-            }
-          } else {
-            resgateTicks[sym] = 0;
-          }
-          if (!deveFechar && (roi >= funil.tpRoiDinamico || (alvo.tpPrice && (isLong ? curPrice >= alvo.tpPrice : curPrice <= alvo.tpPrice)))) {
-            deveFechar = true;
-            const tpTag = duracaoMin > 40 ? 'TP_FUNIL_TEMPO' : 'TAKE PROFIT';
-            motivoFechamento = `[${tpTag}] ROI atingiu +${roi.toFixed(2)}% >= Alvo +${funil.tpRoiDinamico.toFixed(2)}% (Preço: $${formatarPrecoAtivo(sym, curPrice)} | Duração: ${Math.round(duracaoMin)}m)`;
-          }
+        // 2. Stop Loss inicial e Breakeven executados pelo monitor (não dependem do algoOrder da corretora)
+        const slIni = slInicialRoi(alav);
+        if (!deveFechar && alvo.maxRoiReached >= BE_ATIVA_ROI && roi <= BE_PISO_ROI) {
+          deveFechar = true;
+          motivo = `[BREAKEVEN] Pico +${alvo.maxRoiReached.toFixed(2)}% >= ${BE_ATIVA_ROI}% e ROI ${roi.toFixed(2)}% <= piso +${BE_PISO_ROI}%`;
+        } else if (!deveFechar && roi <= slIni) {
+          deveFechar = true;
+          motivo = `[SL_INICIAL] ROI ${roi.toFixed(2)}% <= ${slIni}%`;
         }
 
-        // 2. Stop Loss pelo Funil Temporal (só se Catraca ainda não estiver protegendo no lucro!) - Proibido encurtar por Modo Resgate!
-        if (!deveFechar && (!alvo.beArmed || !alvo.lockedRoi || alvo.lockedRoi <= 0)) {
-          const slLimite = funil.slRoiDinamico;
-          const slTag = duracaoMin > 40 ? 'SL_FUNIL_TEMPO' : 'STOP LOSS ATR';
-
-          if (roi <= slLimite || (alvo.slPrice && (isLong ? curPrice <= alvo.slPrice : curPrice >= alvo.slPrice))) {
-            slBreachedTicks[sym] = (slBreachedTicks[sym] || 0) + 1;
-            if (slBreachedTicks[sym] >= 2) {
-              deveFechar = true;
-              motivoFechamento = `[${slTag}] ROI atingiu ${roi.toFixed(2)}% <= Stop ${slLimite.toFixed(2)}% (Preço: $${formatarPrecoAtivo(sym, curPrice)} | Duração: ${Math.round(duracaoMin)}m | Ticks: 2)`;
-            }
-          } else {
-            slBreachedTicks[sym] = 0;
-          }
-        }
-
-        // 3. Catraca / Breakeven (exige 5 ticks consecutivos com roi <= lockedRoi, ~7.5s)
-        if (!deveFechar && alvo.beArmed && (roi <= alvo.lockedRoi || (alvo.beStopPrice && (isLong ? curPrice <= alvo.beStopPrice : curPrice >= alvo.beStopPrice)))) {
-          beBreachedTicks[sym] = (beBreachedTicks[sym] || 0) + 1;
-          if (beBreachedTicks[sym] >= 5) {
-            deveFechar = true;
-            motivoFechamento = `[CATRACA] ROI recuou para ${roi.toFixed(2)}% <= +${alvo.lockedRoi.toFixed(2)}% ROI ($${formatarPrecoAtivo(sym, alvo.beStopPrice)} | Pico: +${maxRoi.toFixed(2)}% | Ticks: 5)`;
-          }
-        } else if (!deveFechar) {
-          beBreachedTicks[sym] = 0;
-        }
-
-        // 4. Proteção de Funding Tóxico (mantida)
+        // 3. Proteção de funding tóxico (mantida)
         if (!deveFechar && roi >= 1.50) {
           const prem = await fut.precoMarca(sym).catch(() => null);
           if (prem) {
             const fr = parseFloat(prem.lastFundingRate || 0);
-            const nextFt = parseInt(prem.nextFundingTime || 0);
-            const msAteFunding = nextFt - Date.now();
-            const pagandoFunding = isLong ? (fr > 0.0005) : (fr < -0.0005);
-            const fundingToxico = isLong ? (fr > 0.0025) : (fr < -0.0025);
-            const pertoDaVirada = pagandoFunding && msAteFunding > 0 && msAteFunding <= 5 * 60 * 1000;
-            const tempoEstagnadoComTaxa = fundingToxico && duracaoMs >= 60 * 60 * 1000;
-            if (pertoDaVirada || tempoEstagnadoComTaxa) {
+            const msAteFunding = parseInt(prem.nextFundingTime || 0) - Date.now();
+            const pagando = isLong ? (fr > 0.0005) : (fr < -0.0005);
+            const toxico = isLong ? (fr > 0.0025) : (fr < -0.0025);
+            if ((pagando && msAteFunding > 0 && msAteFunding <= 5 * 60000) || (toxico && duracaoMs >= 60 * 60000)) {
               deveFechar = true;
-              motivoFechamento = `[SAIDA_PROTECAO_FUNDING] Lucro protegido (+${roi.toFixed(2)}% ROI) p/ evitar taxa funding (${(fr * 100).toFixed(4)}%)`;
+              motivo = `[SAIDA_PROTECAO_FUNDING] Lucro protegido (+${roi.toFixed(2)}% ROI) p/ evitar funding (${(fr * 100).toFixed(4)}%)`;
             }
           }
         }
 
-        // ── BLOCO 1.1: EXECUÇÃO DO FECHAMENTO COM PROTEÇÃO BLINDADA ──
-        if (deveFechar) {
-          const symFechado = sym;
-          if (closingInProgress.has(symFechado) || (localAlvos[symFechado] && localAlvos[symFechado].fechando)) continue;
-          closingInProgress.add(symFechado);
-          closingStartedAt[symFechado] = Date.now();
-          if (localAlvos[symFechado]) {
-            localAlvos[symFechado].fechando = true;
-            localAlvos[symFechado].fechandoDesde = Date.now();
+        if (!deveFechar) continue;
+
+        // ── FECHAMENTO BLINDADO ──
+        if (closingInProgress.has(sym) || alvo.fechando) continue;
+        closingInProgress.add(sym);
+        closingStartedAt[sym] = Date.now();
+        alvo.fechando = true; alvo.fechandoDesde = Date.now();
+        const alvoBackup = { ...alvo };
+        if (esqueletoSlot[slotNum]) esqueletoSlot[slotNum].statusSlot = 'EXECUTANDO_SAIDA';
+        delete localAlvos[sym]; delete saidaSarTicks[sym];
+        salvarAlvos();
+        try {
+          console.log(`[FECHAMENTO SAR] ${sym}: ${motivo}`);
+          await fut.cancelarTodasOrdens(sym);
+          await fecharLimiteComFallback(sym, pos.lado, pos.quantidade);
+          const exitTipo = motivo.includes('SAIDA_SAR_VIRADA') ? 'SAIDA_SAR_VIRADA'
+            : motivo.includes('SL_INICIAL') ? 'SL_INICIAL'
+            : motivo.includes('BREAKEVEN') ? 'BREAKEVEN'
+            : motivo.includes('FUNDING') ? 'SAIDA_PROTECAO_FUNDING' : 'TIMEOUT';
+          await rag.salvarSaidaRAG({ symbol: sym, exitPrice: curPrice, exitReason: exitTipo, roiPct: roi, pnlUsdt: pos.pnlNaoRealizado }).catch(() => {});
+          registrarDesfechoTrade(sym, exitTipo, roi, pos.pnlNaoRealizado, alvoBackup);
+          // Volta ao ranking: o slot libera a moeda e escolhe a mais volátil do momento
+          const viradaSar = exitTipo === 'SAIDA_SAR_VIRADA';
+          cooldownMoeda[sym] = Date.now() + (viradaSar ? COOLDOWN_SAR_VIRADA_MS : 5 * 60000);
+          if (viradaSar) { delete symbolLossCooldown[sym]; salvarLossCooldown(); }
+          const s = autoBotState.slots[slotNum];
+          if (s.symbol === sym) {
+            s.symbol = null; s.side = null; s.targetSymbol = null;
+            s.searchCooldownUntil = Date.now() + (viradaSar ? COOLDOWN_SAR_VIRADA_MS : 15000);
+            s.status = viradaSar ? 'FECHADO_COOLDOWN_5S' : 'FECHADO_COOLDOWN_15S';
           }
-          const alvoBackup = { ...localAlvos[symFechado] };
-          delete localAlvos[symFechado];
-          delete maxPriceTracker[symFechado];
-          delete minPriceTracker[symFechado];
-          delete beBreachedTicks[symFechado];
-          delete slBreachedTicks[symFechado];
-          delete partialTicks[symFechado];
-          delete resgateTicks[symFechado];
-          salvarAlvos();
-
-          try {
-            console.log(`[FECHAMENTO QUANT] ${symFechado}: ${motivoFechamento}`);
-            await fut.cancelarTodasOrdens(symFechado);
-            await fut.fecharMercado(symFechado, pos.lado, pos.quantidade);
-
-            let exitTipo = 'TIMEOUT';
-            if (motivoFechamento.includes('JEV_AI_STOP_PREVENTIVO')) {
-              exitTipo = 'JEV_AI_STOP_PREVENTIVO';
-            } else if (motivoFechamento.includes('TP_FUNIL') || motivoFechamento.includes('TP_FUNIL_TEMPO')) {
-              exitTipo = 'TP_FUNIL_TEMPO';
-            } else if (motivoFechamento.includes('TP') || motivoFechamento.includes('TAKE PROFIT')) {
-              exitTipo = 'TP';
-            } else if (motivoFechamento.includes('RESGATE_REPIQUE') || motivoFechamento.includes('SAIDA_RESGATE_REPIQUE_HP')) {
-              exitTipo = 'SAIDA_RESGATE_REPIQUE_HP';
-            } else if (motivoFechamento.includes('CATRACA')) {
-              const lockVal = alvoBackup?.lockedRoi ? Number(alvoBackup.lockedRoi).toFixed(1) : '1.2';
-              exitTipo = alvoBackup?.parcialExecutada ? `CATRACA_PARCIAL (+${lockVal}%)` : `CATRACA (+${lockVal}%)`;
-            } else if (motivoFechamento.includes('SL_MODO_RESGATE')) {
-              exitTipo = 'SL_MODO_RESGATE_25%';
-            } else if (motivoFechamento.includes('SL_FUNIL')) {
-              exitTipo = 'SL_FUNIL_TEMPO';
-            } else if (motivoFechamento.includes('SL') || motivoFechamento.includes('STOP LOSS')) {
-              exitTipo = 'SL';
-            } else if (motivoFechamento.includes('FUNDING')) {
-              exitTipo = 'SAIDA_PROTECAO_FUNDING';
-            }
-
-            const pnlBrutoTotal = pos.pnlNaoRealizado + (alvoBackup.pnlParcialBruto || 0);
-
-            await rag.salvarSaidaRAG({
-              symbol: symFechado,
-              exitPrice: curPrice,
-              exitReason: exitTipo,
-              roiPct: roi,
-              pnlUsdt: pnlBrutoTotal
-            }).catch(() => {});
-
-            registrarDesfechoTrade(symFechado, exitTipo, roi, pos.pnlNaoRealizado, alvoBackup);
-
-            gatekeeperVetoedUntil[symFechado] = Date.now() + 2700000;
-            console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${symFechado} fechou por ${exitTipo} (ROI: ${roi.toFixed(2)}%). Bloqueado por 45 minutos.`);
-
-            [1, 2].forEach(s => {
-              if (autoBotState.slots[s].symbol === symFechado) {
-                autoBotState.slots[s].symbol = null;
-                autoBotState.slots[s].side = null;
-                autoBotState.slots[s].targetSymbol = null;
-                autoBotState.slots[s].searchCooldownUntil = Date.now() + 45000;
-                autoBotState.slots[s].status = 'FECHADO_COOLDOWN_45S';
-              }
-            });
-          } catch(err) {
-            console.error(`[FECHAMENTO QUANT] Erro ao fechar ${symFechado}:`, err.message);
-            const posRest = await fut.posicao(symFechado).catch(() => null);
-            if (posRest && posRest.quantidade > 0) {
-              localAlvos[symFechado] = alvoBackup;
-              salvarAlvos();
-            }
-          } finally {
-            if (localAlvos[symFechado]) localAlvos[symFechado].fechando = false;
-            closingInProgress.delete(symFechado);
-            delete closingStartedAt[symFechado];
+          esqueletoSlot[slotNum] = null;
+        } catch (err) {
+          console.error(`[FECHAMENTO SAR] Erro ao fechar ${sym}:`, err.message);
+          const posRest = await fut.posicao(sym).catch(() => undefined);
+          if (posRest === undefined || (posRest && posRest.quantidade > 0)) { // consulta falhou: assume aberta e restaura o monitor
+            localAlvos[sym] = alvoBackup; salvarAlvos();
           }
+        } finally {
+          if (localAlvos[sym]) localAlvos[sym].fechando = false;
+          closingInProgress.delete(sym); delete closingStartedAt[sym];
         }
-      } catch(e) {
+      } catch (e) {
         if (localAlvos[sym]) localAlvos[sym].fechando = false;
-        closingInProgress.delete(sym);
-        delete closingStartedAt[sym];
+        closingInProgress.delete(sym); delete closingStartedAt[sym];
       }
     }
   } finally {
@@ -1843,640 +836,11 @@ setInterval(async () => {
   }
 }, 1500);
 
+
 // ── SCANNER INTELIGENTE DE CANDIDATOS DA WHITELIST VIP ───────────────────
-let topCandidatosComSetup = [];
-let todasAvaliadasWhitelist = [];
-let ultimoScanSetups = 0;
 
-async function atualizarTopSetups() {
-  const now = Date.now();
-  if (now - ultimoScanSetups < 20000 && (topCandidatosComSetup.length > 0 || todasAvaliadasWhitelist.length > 0)) {
-    return { setups: topCandidatosComSetup, avaliadas: todasAvaliadasWhitelist };
-  }
-  try {
-    const volData = await fut.ticker24h().catch(() => []);
-    const vetados = await rag.consultarParesVetados(45).catch(() => []);
-    const vetadosSet = new Set(vetados.map(v => v.symbol));
-
-    // Moedas da WHITELIST_VIP ordenadas por volatilidade 24h
-    const candidatos = volData
-      .filter(t => {
-        const sym = t.symbol;
-        if (!isSimboloValido(sym)) return false;
-        if (vetadosSet.has(sym)) return false;
-        if (symbolLossCooldown && symbolLossCooldown[sym] && now < symbolLossCooldown[sym]) return false;
-        if (gatekeeperVetoedUntil[sym] && now < gatekeeperVetoedUntil[sym]) return false;
-        if (parseFloat(t.count || 0) <= 500) return false;
-        const p24 = parseFloat(t.priceChangePercent || 0);
-        if (p24 > 40.0 || p24 < -25.0) return false;
-        return true;
-      })
-      .sort((a, b) => Math.abs(parseFloat(b.priceChangePercent)) - Math.abs(parseFloat(a.priceChangePercent)));
-
-    const setups = [];
-    const avaliadas = [];
-
-    for (const c of candidatos.slice(0, 15)) {
-      const liq = await validarLiquidezMoeda(c.symbol);
-      if (!liq.ok) continue;
-
-      const dados = await analisarEstruturaEMercado(c.symbol);
-      if (!dados) continue;
-
-      // Filtro prévio de exaustão 24h e funding tóxico no scanner (apenas pula o par sem veto duradouro)
-      const p24Cand = parseFloat(c.priceChangePercent || dados.priceChangePercent || 0);
-      if (dados.direcaoModo === 'SHORT' && p24Cand < -22.0 && dados.modoDetectado !== 'EXAUSTAO_REVERSAO') continue;
-      if (dados.direcaoModo === 'LONG' && p24Cand > 35.0 && dados.modoDetectado !== 'EXAUSTAO_REVERSAO') continue;
-      if (dados.direcaoModo === 'SHORT' && dados.fundingRate < -0.0015) continue;
-      if (dados.direcaoModo === 'LONG' && dados.fundingRate > 0.0015) continue;
-
-      const bonusModo = (dados.modoDetectado === 'MOMENTUM') ? 15 : ((dados.modoDetectado === 'EXAUSTAO_REVERSAO') ? 12 : 10);
-      const scoreEfetivo = Math.abs(dados.directionalScore) + bonusModo;
-
-      const itemInfo = {
-        symbol: c.symbol,
-        dados,
-        modoDetectado: dados.modoDetectado,
-        modoLabel: dados.modoLabel,
-        direcaoModo: dados.direcaoModo,
-        directionalScore: dados.directionalScore,
-        scoreEfetivo,
-        atrPct15m: dados.atrPct15m,
-        rvol15m: dados.rvol15m,
-        bonusModo
-      };
-
-      avaliadas.push(itemInfo);
-
-      // 1. Piso Mínimo e Teto de Volatilidade ATR 15m (0.45% a 2.50%) e RVOL para entradas
-      if (dados.atrPct15m < 0.45 || dados.atrPct15m > 2.50 || dados.rvol15m < 0.85) continue;
-
-      // Gatekeeper para setup ativo pronto para entrada
-      const gk = await verificarGatekeeper(dados, false);
-      if (gk.passou) {
-        setups.push(itemInfo);
-      }
-    }
-
-    setups.sort((a, b) => b.scoreEfetivo - a.scoreEfetivo);
-    avaliadas.sort((a, b) => b.scoreEfetivo - a.scoreEfetivo);
-
-    topCandidatosComSetup = setups;
-    todasAvaliadasWhitelist = avaliadas;
-    ultimoScanSetups = now;
-    return { setups, avaliadas };
-  } catch(e) {
-    return { setups: topCandidatosComSetup, avaliadas: todasAvaliadasWhitelist };
-  }
-}
 
 // ── ROBÔ AUTÔNOMO CONTÍNUO (ETAPA 5: GATEKEEPER + CANDLE 5M) ───────────
-let autoBotLoopRunning = false;
-let lastAiCallTimestamp = 0; // Limita consultas de IA para no máximo 1 por ciclo de 90s
-setInterval(async () => {
-  if (!autoBotState.enabled || autoBotLoopRunning) return;
-  autoBotLoopRunning = true;
-
-  try {
-    const now = Date.now();
-
-    // ── OTIMIZAÇÃO 2: PAUSA TOTAL DE CONSULTAS DE ENTRADA COM SLOTS CHEIOS ──
-    const slot1Ocupado = !!autoBotState.slots[1].symbol;
-    const slot2Ocupado = !!autoBotState.slots[2].symbol;
-
-    if (slot1Ocupado && slot2Ocupado) {
-      autoBotState.lastLog = `[SLOTS OCUPADOS - MONITORANDO POSIÇÕES] Slot 1: ${autoBotState.slots[1].symbol} | Slot 2: ${autoBotState.slots[2].symbol}`;
-      for (const slotNum of [1, 2]) {
-        const slot = autoBotState.slots[slotNum];
-        slot.status = `[SLOTS OCUPADOS - MONITORANDO POSIÇÕES] (${slot.symbol})`;
-        try {
-          const pos = await fut.posicao(slot.symbol);
-          if (!pos || pos.quantidade === 0) {
-            slot.symbol = null;
-            slot.targetSymbol = null;
-            slot.side = null;
-            slot.status = 'LIVRE';
-            continue;
-          }
-
-          const duracaoMs = now - (slot.openTime || now);
-          if (duracaoMs >= 25 * 60 * 1000) {
-            if (now - (slot.last30mCheck || 0) >= 60 * 1000) {
-              slot.last30mCheck = now;
-              const duracaoMin = Math.round(duracaoMs / 60000);
-              if (closingInProgress.has(slot.symbol) || (localAlvos[slot.symbol] && localAlvos[slot.symbol].fechando)) {
-                continue;
-              }
-              const decisao30m = await avaliarPerdao30mMatematico(slot.symbol, pos, duracaoMin);
-              if (decisao30m.fechar) {
-                const symFechado = slot?.symbol;
-                if (!symFechado || closingInProgress.has(symFechado) || (localAlvos[symFechado] && localAlvos[symFechado].fechando)) {
-                  continue;
-                }
-                closingInProgress.add(symFechado);
-                closingStartedAt[symFechado] = now;
-                if (localAlvos[symFechado]) localAlvos[symFechado].fechando = true;
-                const alvoBackup = localAlvos[symFechado] ? { ...localAlvos[symFechado] } : null;
-                try {
-                  console.log(`[AUTOBOT-30M] Slot ${slotNum}: ${decisao30m.desc}! Fechando a mercado.`);
-                  await fut.cancelarTodasOrdens(symFechado);
-                  await fut.fecharMercado(symFechado, pos.lado, pos.quantidade);
-
-                  const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
-                  const roiFinal = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
-                  const pnlBrutoTotal = pos.pnlNaoRealizado + (alvoBackup?.pnlParcialBruto || 0);
-
-                  await rag.salvarSaidaRAG({
-                    symbol: symFechado,
-                    exitPrice: pos.precoMarca || pos.precoEntrada,
-                    exitReason: decisao30m.motivo,
-                    roiPct: roiFinal,
-                    pnlUsdt: pnlBrutoTotal
-                  }).catch(() => {});
-
-                  registrarDesfechoTrade(symFechado, decisao30m.motivo, roiFinal, pos.pnlNaoRealizado, alvoBackup);
-
-                  delete localAlvos[symFechado];
-                  delete maxPriceTracker[symFechado];
-                  delete minPriceTracker[symFechado];
-                  delete beBreachedTicks[symFechado];
-                  delete slBreachedTicks[symFechado];
-                  delete partialTicks[symFechado];
-                  delete resgateTicks[symFechado];
-                  salvarAlvos();
-
-                  gatekeeperVetoedUntil[symFechado] = now + 2700000; // Bloqueio 45 minutos (2700000ms)
-                  console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${symFechado} fechado por estagnação 25m (${decisao30m.motivo}). Bloqueado por 45 minutos.`);
-                  slot.symbol = null;
-                  slot.side = null;
-                  slot.targetSymbol = null;
-                  slot.searchCooldownUntil = now + 45000;
-                  slot.status = 'PERDAO_COOLDOWN_45S';
-                  autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 25m em ${symFechado}. Cooldown de 45m na moeda ativado.`;
-                } finally {
-                  if (symFechado) closingInProgress.delete(symFechado);
-                  delete closingStartedAt[symFechado];
-                }
-              }
-            }
-          }
-        } catch(e) {}
-      }
-      return; // ZERO TOKENS GASTOS! NENHUMA CHAMADA DE IA PARA ENTRADA ENQUANTO SLOTS ESTIVEREM OCUPADOS!
-    }
-
-    for (const slotNum of [1, 2]) {
-      const slot = autoBotState.slots[slotNum];
-      const outroSlot = autoBotState.slots[slotNum === 1 ? 2 : 1];
-      const moedaOutroSlot = outroSlot.symbol || outroSlot.targetSymbol;
-
-      // 1. Slot operando: verificar perdão aos 30 minutos
-      if (slot.symbol) {
-        try {
-          const pos = await fut.posicao(slot.symbol);
-          if (!pos || pos.quantidade === 0) {
-            slot.symbol = null;
-            slot.targetSymbol = null;
-            slot.side = null;
-            slot.status = 'LIVRE';
-            continue;
-          }
-
-          slot.status = `[POSIÇÃO ATIVA] ${slot.symbol} (${slot.side || pos.lado} ${slot.leverage || pos.alavancagem}x)`;
-
-          const duracaoMs = now - (slot.openTime || now);
-          if (duracaoMs >= 25 * 60 * 1000) {
-            if (now - (slot.last30mCheck || 0) >= 60 * 1000) {
-              slot.last30mCheck = now;
-              const duracaoMin = Math.round(duracaoMs / 60000);
-              if (closingInProgress.has(slot.symbol) || (localAlvos[slot.symbol] && localAlvos[slot.symbol].fechando)) {
-                continue;
-              }
-              const decisao30m = await avaliarPerdao30mMatematico(slot.symbol, pos, duracaoMin);
-              if (decisao30m.fechar) {
-                const symFechado = slot?.symbol;
-                if (!symFechado || closingInProgress.has(symFechado) || (localAlvos[symFechado] && localAlvos[symFechado].fechando)) {
-                  continue;
-                }
-                closingInProgress.add(symFechado);
-                closingStartedAt[symFechado] = now;
-                if (localAlvos[symFechado]) localAlvos[symFechado].fechando = true;
-                const alvoBackup = localAlvos[symFechado] ? { ...localAlvos[symFechado] } : null;
-                try {
-                  console.log(`[AUTOBOT-30M] Slot ${slotNum}: ${decisao30m.desc}! Fechando a mercado.`);
-                  await fut.cancelarTodasOrdens(symFechado);
-                  await fut.fecharMercado(symFechado, pos.lado, pos.quantidade);
-
-                  const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
-                  const roiFinal = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
-                  const pnlBrutoTotal = pos.pnlNaoRealizado + (alvoBackup?.pnlParcialBruto || 0);
-
-                  await rag.salvarSaidaRAG({
-                    symbol: symFechado,
-                    exitPrice: pos.precoMarca || pos.precoEntrada,
-                    exitReason: decisao30m.motivo,
-                    roiPct: roiFinal,
-                    pnlUsdt: pnlBrutoTotal
-                  }).catch(() => {});
-
-                  registrarDesfechoTrade(symFechado, decisao30m.motivo, roiFinal, pos.pnlNaoRealizado, alvoBackup);
-
-                  delete localAlvos[symFechado];
-                  delete maxPriceTracker[symFechado];
-                  delete minPriceTracker[symFechado];
-                  delete beBreachedTicks[symFechado];
-                  delete slBreachedTicks[symFechado];
-                  delete partialTicks[symFechado];
-                  delete resgateTicks[symFechado];
-                  salvarAlvos();
-
-                  gatekeeperVetoedUntil[symFechado] = now + 2700000; // Bloqueio 45 minutos (2700000ms)
-                  console.log(`[COOLDOWN-POS-FECHAMENTO-45M] ${symFechado} fechado por estagnação 25m (${decisao30m.motivo}). Bloqueado por 45 minutos.`);
-                  slot.symbol = null;
-                  slot.side = null;
-                  slot.targetSymbol = null;
-                  slot.searchCooldownUntil = now + 45000;
-                  slot.status = 'PERDAO_COOLDOWN_45S';
-                  autoBotState.lastLog = `Slot ${slotNum}: Fechado com ${decisao30m.motivo} aos 25m em ${symFechado}. Cooldown de 45m na moeda ativado.`;
-                  continue;
-                } finally {
-                  if (symFechado) closingInProgress.delete(symFechado);
-                  delete closingStartedAt[symFechado];
-                }
-              }
-            }
-          }
-        } catch(e) {}
-        continue;
-      }
-
-      // 2. Slot vago: respeitar cooldown 45s
-      if (slot.searchCooldownUntil && now < slot.searchCooldownUntil) {
-        const restSec = Math.round((slot.searchCooldownUntil - now) / 1000);
-        slot.status = `[COOLDOWN PÓS-SAÍDA] Aguardando ${restSec}s`;
-        continue;
-      }
-
-      // 3. Buscar moeda candidata líquida da WHITELIST_VIP
-      const scanRes = await atualizarTopSetups();
-      const setupsDisponiveis = scanRes.setups || [];
-      const avaliadasDisponiveis = scanRes.avaliadas || [];
-
-      // Conjunto global de símbolos ativos nos slots e posições abertas
-      const openingOrActiveSymbols = new Set();
-      [1, 2].forEach(s => {
-        if (autoBotState.slots[s].symbol) openingOrActiveSymbols.add(autoBotState.slots[s].symbol);
-      });
-      Object.keys(localAlvos).forEach(s => openingOrActiveSymbols.add(s));
-      const outroSlotNum = (slotNum === 1 ? 2 : 1);
-      const outroMoedaAtiva = autoBotState.slots[outroSlotNum].symbol;
-      const outroMoedaAlvo = autoBotState.slots[outroSlotNum].targetSymbol;
-
-      const melhorCandidatoComSetup = setupsDisponiveis.find(s =>
-        !openingOrActiveSymbols.has(s.symbol) &&
-        s.symbol !== outroMoedaAtiva &&
-        s.symbol !== outroMoedaAlvo &&
-        (!symbolLossCooldown || !symbolLossCooldown[s.symbol] || now >= symbolLossCooldown[s.symbol]) &&
-        (!gatekeeperVetoedUntil[s.symbol] || now >= gatekeeperVetoedUntil[s.symbol])
-      );
-
-      const melhorCandidatoWhitelist = avaliadasDisponiveis.find(s =>
-        !openingOrActiveSymbols.has(s.symbol) &&
-        s.symbol !== outroMoedaAtiva &&
-        s.symbol !== outroMoedaAlvo &&
-        (!symbolLossCooldown || !symbolLossCooldown[s.symbol] || now >= symbolLossCooldown[s.symbol]) &&
-        (!gatekeeperVetoedUntil[s.symbol] || now >= gatekeeperVetoedUntil[s.symbol])
-      );
-
-      const melhorCandidata = melhorCandidatoComSetup || melhorCandidatoWhitelist;
-
-      if (!melhorCandidata) {
-        slot.targetSymbol = null;
-        slot.status = 'ESCANEANDO_WHITELIST';
-        autoBotState.lastLog = `[🔍 SLOT ${slotNum} PESQUISANDO WHITELIST: Varrendo 26 pares VIP...]`;
-        continue;
-      }
-
-      // Rotação visual ativa no card vazio e log de varredura
-      slot.targetSymbol = melhorCandidata.symbol;
-      const scoreTxtRot = (melhorCandidata.directionalScore > 0 ? '+' : '') + melhorCandidata.directionalScore;
-      const distTxtRot = melhorCandidata.dados?.distEma21Atr ? melhorCandidata.dados.distEma21Atr.toFixed(1) : '1.0';
-      autoBotState.lastLog = `[🔍 SLOT ${slotNum} PESQUISANDO WHITELIST: Avaliando ${melhorCandidata.symbol} (Score: ${scoreTxtRot} | Dist EMA21: ${distTxtRot}x ATR)]`;
-
-      if (!melhorCandidatoComSetup) {
-        slot.status = `[AVALIANDO: ${melhorCandidata.symbol}] (Score: ${scoreTxtRot} | Dist: ${distTxtRot}x ATR)`;
-        continue; // Continua girando a pesquisa visualmente sem abrir ordem
-      }
-
-      slot.status = `CANDIDATO: ${melhorCandidatoComSetup.symbol} [${melhorCandidatoComSetup.modoLabel} | Score: ${scoreTxtRot}]`;
-
-      // 4. Analisar candidato
-      const cand = melhorCandidatoComSetup.symbol;
-
-      // Trava estrita anti-conflito: Slot 1 e Slot 2 NUNCA operam nem avaliam a mesma moeda
-      if (cand === outroMoedaAtiva || (outroMoedaAlvo && cand === outroMoedaAlvo && slotNum > outroSlotNum) || (localAlvos[cand] && slot.symbol !== cand)) {
-        console.log(`[AUTOBOT-CONFLITO] Slot ${slotNum} abortou ${cand}: já em uso ou ativo em outro slot`);
-        slot.targetSymbol = null;
-        continue;
-      }
-
-      // Ciclo ágil de avaliação a cada 60 segundos
-      if (now - (slot.lastChecked60sTime || 0) < 60000) {
-        const restSec = Math.round((60000 - (now - (slot.lastChecked60sTime || 0))) / 1000);
-        slot.status = `MONITORANDO: ${cand} (REAVALIA EM ${restSec}s)`;
-        continue;
-      }
-
-      slot.lastChecked60sTime = now;
-
-      const dados = await analisarEstruturaEMercado(cand);
-      if (!dados) {
-        slot.status = 'ERRO_INDICADORES';
-        slot.targetSymbol = null;
-        continue;
-      }
-
-      const scoreTxt = (dados.directionalScore > 0 ? '+' : '') + dados.directionalScore;
-      const modoTxt = dados.modoLabel || 'SEM SETUP';
-
-      // ── OTIMIZAÇÃO: GATEKEEPER HARDCODED (0 TOKENS) ──
-      const gk = await verificarGatekeeper(dados);
-      if (!gk.passou) {
-        console.log(`[GATEKEEPER-RECUSA] Slot ${slotNum} (${cand}) [${modoTxt} | Score: ${scoreTxt}]: ${gk.motivo}`);
-        slot.status = `[RECUSADO: ${gk.motivo}]`;
-        autoBotState.lastLog = `Slot ${slotNum} (${cand}): ${gk.motivo}`;
-        gatekeeperVetoedUntil[cand] = now + 45000; // 45s de respiro para testar outros pares
-        slot.targetSymbol = null;
-        continue;
-      }
-
-      // ── OTIMIZAÇÃO 1: CACHE ANTI-SPAM POR VELA DE 5 MINUTOS ──
-      const candle5mTime = dados.last5mOpenTime || (Math.floor(now / 300000) * 300000);
-      const cached = lastEvaluatedCandle[cand];
-      if (cached && cached.candleTime === candle5mTime) {
-        const scoreDiff = Math.abs(dados.directionalScore - cached.score);
-        if (cached.action === 'WAIT' && scoreDiff < 15) {
-          console.log(`[CACHE-5M] Slot ${slotNum} (${cand}) [${modoTxt}]: Vela 5m inalterada (${new Date(candle5mTime).toLocaleTimeString('pt-BR')}), Score: ${scoreTxt} (diff: ${scoreDiff} < 15). Pulando IA (0 tokens). Motivo anterior: ${cached.reason}`);
-          slot.status = `[AGUARDANDO NOVA VELA 5M] ${cand} (Score: ${scoreTxt})`;
-          autoBotState.lastLog = `Slot ${slotNum} (${cand}): [AGUARDANDO NOVA VELA 5M] (Score: ${scoreTxt})`;
-          gatekeeperVetoedUntil[cand] = now + 60000; // 60s antes de testar de novo
-          slot.targetSymbol = null;
-          continue;
-        }
-      }
-
-      // ── LIMITAÇÃO ESTRITA: NO MÁXIMO 1 CONSULTA DE IA A CADA 90 SEGUNDOS ──
-      if (now - lastAiCallTimestamp < 90000) {
-        const restSec = Math.round((90000 - (now - lastAiCallTimestamp)) / 1000);
-        slot.status = `[CICLO IA 90S] Aguardando ${restSec}s para consultar IA (${cand})`;
-        continue;
-      }
-
-      // ── CONSULTA GEMINI FLASH QUANT (CONFLUÊNCIA CONFIRMADA - 1 MOEDA/90S) ──
-      console.log(`[CONSULTANDO-IA] Slot ${slotNum} (${cand}) [${modoTxt} | Score: ${scoreTxt}] -> Chamando Gemini Flash...`);
-      slot.status = `[${modoTxt} - SCORE: ${scoreTxt}] CONSULTANDO IA...`;
-      lastAiCallTimestamp = now;
-      const dec = await consultarGeminiQuant(cand, dados);
-
-      // Salva no Cache Anti-Spam por vela de 5m
-      lastEvaluatedCandle[cand] = {
-        candleTime: candle5mTime,
-        score: dados.directionalScore,
-        action: dec.action,
-        reason: dec.reason_short,
-        evaluatedAt: now
-      };
-
-      if ((dec.action === 'LONG' || dec.action === 'SHORT') && dec.aprovado !== false && dec.confidence >= 65) {
-        const ladoTrade = dec.action === 'LONG' ? 'BUY' : 'SELL';
-        // Assimetria defensiva: SHORT e modos de ignição rápida (CONTINUATION/MOMENTUM) custam mais caro de errar, teto 3x.
-        const modoIgnicaoRapida = (dados.modoLabel || '').includes('CONTINUATION') || (dados.modoLabel || '').includes('MOMENTUM');
-        const alavCap = (dec.action === 'SHORT' || modoIgnicaoRapida) ? 3 : 4;
-        const alav = Math.min(alavCap, Math.max(1, dec.leverage || dados.leverageSugerida));
-        const valorUSDT = 10;
-
-        // Declaração segura com escopo prévio para evitar Temporal Dead Zone
-        let slPrecoDefinido = 0;
-        let tpPrecoDefinido = 0;
-        let slDistExec = 0;
-        let slRoeExec = 6.0;
-
-        // Garantia absoluta: não abre se já houver posição ativa na Binance
-        const posAtual = await fut.posicao(cand).catch(() => null);
-        if (posAtual && posAtual.quantidade > 0) {
-          console.log(`[AUTOBOT-CONFLITO] ${cand} já possui posição aberta. Abortando.`);
-          slot.targetSymbol = null;
-          continue;
-        }
-
-        await fut.garantirAlavancagem(cand, alav, 'ISOLATED');
-        const book = await fut.livroOfertas(cand, 5);
-        const bestBid = parseFloat((book?.bids?.[0] || [])[0]);
-        const bestAsk = parseFloat((book?.asks?.[0] || [])[0]);
-        if (!bestBid || !bestAsk) continue;
-
-        // ── PRÉ-FILTROS ANTI-SLIPPAGE E ANTI-BOOK RASO NA EXECUÇÃO (CORREÇÃO 3) ──
-        // 1. Veto de Spread Largo (> 0.10%)
-        const spreadPct = ((bestAsk - bestBid) / bestBid) * 100;
-        if (spreadPct > 0.16) {
-          console.log(`[AUTOBOT-SPREAD-VETO] Slot ${slotNum} (${cand}): [VETO-SLIPPAGE: SPREAD LARGO] Spread instantâneo de ${spreadPct.toFixed(3)}% > 0.16% max. Cancelando envio para proteger contra slippage.`);
-          gatekeeperVetoedUntil[cand] = now + 60000;
-          slot.targetSymbol = null;
-          continue;
-        }
-
-        // 2. Veto de Moeda de 1 Tick Grosso (> 0.08% do preço)
-        const fCand = fut.filtrosDe(cand);
-        let tickSizeCand = fCand ? parseFloat(fCand.tickSize) : 0;
-        if (!(tickSizeCand > 0) && (book?.bids || []).length >= 2) {
-          tickSizeCand = Math.abs(parseFloat(book.bids[0][0]) - parseFloat(book.bids[1][0]));
-        }
-        const tickPctCand = (tickSizeCand / bestBid) * 100;
-        if (tickPctCand > 0.08) {
-          console.log(`[AUTOBOT-TICK-VETO] Slot ${slotNum} (${cand}): [VETO-TICK-GROSSO] 1 tick = ${tickPctCand.toFixed(3)}% > 0.08% do preço. Cancelando envio.`);
-          gatekeeperVetoedUntil[cand] = now + 60000;
-          slot.targetSymbol = null;
-          continue;
-        }
-
-        // 3. Liquidez Mínima Top 5 Níveis (>= $150 USDT em até 0.15% no lado de execução)
-        let volExecBook = 0;
-        if (ladoTrade === 'BUY') {
-          const maxAsk = bestAsk * 1.0015;
-          for (const item of (book?.asks || []).slice(0, 5)) {
-            const p = parseFloat(item[0]);
-            const q = parseFloat(item[1]);
-            if (p <= maxAsk) volExecBook += (p * q);
-          }
-        } else {
-          const minBid = bestBid * (1 - 0.0015);
-          for (const item of (book?.bids || []).slice(0, 5)) {
-            const p = parseFloat(item[0]);
-            const q = parseFloat(item[1]);
-            if (p >= minBid) volExecBook += (p * q);
-          }
-        }
-        if (volExecBook < 150) {
-          console.log(`[AUTOBOT-LIQUIDEZ-VETO] Slot ${slotNum} (${cand}): [VETO-LIQUIDEZ-BOOK] Top 5 níveis com apenas $${volExecBook.toFixed(0)} < $150 USDT em 0.15%. Cancelando envio.`);
-          gatekeeperVetoedUntil[cand] = now + 60000;
-          slot.targetSymbol = null;
-          continue;
-        }
-
-        const precoExec = parseFloat(ladoTrade === 'BUY' ? bestAsk : bestBid);
-        if (!precoExec) continue;
-
-        const calc = fut.calcularQuantidade(cand, valorUSDT, precoExec, alav);
-        if (!calc.ok) {
-          console.error(`[AUTOBOT] Erro cálculo qty em ${cand}:`, calc.motivo);
-          gatekeeperVetoedUntil[cand] = now + 5 * 60 * 1000;
-          slot.targetSymbol = null;
-          continue;
-        }
-
-        // Execução maker/limit-chase protegida
-        let ord = await fut.colocarLimite(cand, ladoTrade, calc.qty, precoExec);
-        await new Promise(r => setTimeout(r, 1200));
-        try { await fut.cancelarOrdem(cand, ord.orderId); } catch(e){}
-        let st = await fut.consultarOrdem(cand, ord.orderId);
-        let filledQty = parseFloat(st.executedQty) || 0;
-
-        if (filledQty === 0) {
-          const book2 = await fut.livroOfertas(cand, 5);
-          const precoExec2 = parseFloat(ladoTrade === 'BUY' ? (book2.asks[0] || [])[0] : (book2.bids[0] || [])[0]);
-          if (precoExec2 && Math.abs(precoExec2 - precoExec) / precoExec <= 0.003) {
-            let ord2 = await fut.colocarLimite(cand, ladoTrade, calc.qty, precoExec2);
-            await new Promise(r => setTimeout(r, 1200));
-            try { await fut.cancelarOrdem(cand, ord2.orderId); } catch(e){}
-            st = await fut.consultarOrdem(cand, ord2.orderId);
-            filledQty = parseFloat(st.executedQty) || 0;
-          }
-        }
-
-        if (filledQty > 0) {
-          slot.symbol = cand;
-          slot.side = dec.action;
-          slot.leverage = alav;
-          slot.openTime = now;
-          slot.last30mCheck = now;
-          slot.status = `[ATIVO: ${cand} ${dec.action} ${alav}x]`;
-
-          // SL e TP 100% matemáticos pelo código (IA NÃO define preços de SL ou TP)
-          slDistExec = precoExec * (dados.slPctReal / 100);
-          slRoeExec = (slDistExec / precoExec) * alav * 100;
-
-          // Banda Saudável de Stop Loss em ROI (BLOCO 5), teto por modo/lado:
-          // SHORT ou ignição rápida (CONTINUATION/MOMENTUM, 3x) falha mais barato -3.80; PULLBACK LONG (4x) -4.60.
-          let slAlvoRoi = (dec.action === 'SHORT' || modoIgnicaoRapida) ? 3.80 : 4.60;
-          const slPisoRoi = slAlvoRoi - 0.60;
-          if (slRoeExec < slPisoRoi) {
-            slRoeExec = slPisoRoi;
-            slDistExec = precoExec * ((slPisoRoi / alav) / 100);
-          } else if (slRoeExec > slAlvoRoi) {
-            slRoeExec = slAlvoRoi;
-            slDistExec = precoExec * ((slAlvoRoi / alav) / 100);
-          }
-          slPrecoDefinido = dec.action === 'LONG' ? (precoExec - slDistExec) : (precoExec + slDistExec);
-
-          // Take Profit no dobro da distância do SL (R:R 1:2), respeitando teto dinâmico de 8.0% ROI
-          let tpDistExec = (dados.modoDetectado === 'EXAUSTAO_REVERSAO' && dados.tpPrice)
-            ? Math.abs(precoExec - dados.tpPrice)
-            : 2.0 * slDistExec;
-          let tpRoeProj = (tpDistExec / precoExec) * alav * 100;
-          if (tpRoeProj > 8.0) {
-            tpDistExec = precoExec * (0.08 / alav);
-          }
-          tpPrecoDefinido = dec.action === 'LONG' ? (precoExec + tpDistExec) : (precoExec - tpDistExec);
-
-          const beTriggerDist = precoExec * ((2.10 / alav) / 100);
-          const beTriggerPrice = dec.action === 'LONG' ? (precoExec + beTriggerDist) : (precoExec - beTriggerDist);
-
-          console.log(`[ORDEM-EXECUTADA] Slot ${slotNum} (${cand}) [${modoTxt}]: ${dec.action} ${alav}x a ${formatarPrecoAtivo(cand, precoExec)} | Qty: ${filledQty} | SL: ${formatarPrecoAtivo(cand, slPrecoDefinido)} (-${slRoeExec.toFixed(1)}% ROI) | TP: ${formatarPrecoAtivo(cand, tpPrecoDefinido)}`);
-
-          // Armar alvos em código
-          localAlvos[cand] = {
-            side: dec.action,
-            entryPrice: precoExec,
-            slPrice: slPrecoDefinido,
-            tpPrice: tpPrecoDefinido,
-            beTriggerPrice: beTriggerPrice,
-            slDistPct: (slDistExec / precoExec),
-            slRoiInicial: slRoeExec,
-            parcialExecutada: false,
-            pnlParcialBruto: 0,
-            pnlParcialLiquido: 0,
-            taxaParcial: 0,
-            hpLeitura1: 75,
-            hpLeitura2: 75,
-            lastHpCheck: now,
-            modoResgateAtivo: false,
-            defesaLucroAtiva: false,
-            tpResgateRoi: null,
-            slResgateRoi: null,
-            beArmed: false,
-            beStage: 0,
-            beStopPrice: null,
-            beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO ATUAL: +0.00%)]',
-            lockedRoi: 0,
-            leverage: alav,
-            quantidade: filledQty,
-            maxRoiReached: 0,
-            openTime: now,
-            fechando: false,
-            fechandoDesde: 0
-          };
-          salvarAlvos();
-
-          // Salvar entrada no RAG com sincronização completa de dados
-          await rag.salvarEntradaRAG({
-            symbol: cand,
-            side: dec.action,
-            leverage: alav,
-            mode: dados.modoLabel || dados.modoDetectado || 'QUANT_MTF',
-            scoreTotal: dec.confidence,
-            rsi15m: dados.rsi15m,
-            rsi1m: 50.0,
-            emaStatus: dados.emaAlignStatus,
-            sarStatus: dados.mtfStatus,
-            volRatio: dados.rvol15m,
-            fundingRate: dados.fundingRate,
-            bookRatio: dados.takerRatioVal,
-            fiboPos: `${dados.distEma21Atr.toFixed(1)}x ATR`,
-            patterns: dados.qualidadeSetup,
-            aiThesis: dec.reason_short,
-            entryPrice: precoExec,
-            dadosMercado: {
-              rsi: dados.rsi15m,
-              rsi1m: 50.0,
-              emaStatus: dados.emaAlignStatus,
-              sarTendencia: dados.mtfStatus,
-              volRatio: dados.rvol15m,
-              fundingRate: dados.fundingRate,
-              longPct: dados.takerRatioVal,
-              fiboPos: `${dados.distEma21Atr.toFixed(1)}x ATR`,
-              padroesDetectados: Array.isArray(dados.qualidadeSetup) ? dados.qualidadeSetup : [dados.qualidadeSetup || 'Nenhum'],
-              preco: precoExec
-            }
-          }).catch(() => {});
-
-          autoBotState.lastLog = `Slot ${slotNum}: Entrou ${dec.action} em ${cand} (${alav}x). Conf: ${dec.confidence}%. ${dec.reason_short}`;
-        } else {
-          slot.status = `[ESCORREGOU: ${cand} (Não preencheu)]`;
-        }
-      } else {
-        console.log(`[IA-RECUSA] Slot ${slotNum} (${cand}) [${modoTxt} | Score: ${scoreTxt} | Conf: ${dec.confidence}%]: ${dec.reason_short}`);
-        slot.status = `[IA RECUSOU: ${dec.reason_short || 'Sem confluência'}]`;
-        autoBotState.lastLog = `Slot ${slotNum} (${cand}) IA: ${dec.reason_short || 'Aguardar confluência'}`;
-        gatekeeperVetoedUntil[cand] = now + 5 * 60 * 1000;
-        slot.targetSymbol = null;
-      }
-    }
-  } catch(e) {
-    console.error('[AUTOBOT-LOOP] Erro:', e.message);
-  } finally {
-    autoBotLoopRunning = false;
-  }
-}, 3000);
 
 
 // ── ROTAS DE API DO BACKEND ───────────────────────────────────────────
@@ -2607,64 +971,39 @@ app.get('/api/volateis', async (req, res) => {
 app.get('/api/moeda/:symbol', async (req, res) => {
   try {
     const symbol = req.params.symbol.toUpperCase();
-    const dados = await analisarEstruturaEMercado(symbol);
-    if (!dados) return res.json({ success: false, error: 'Dados insuficientes para análise' });
+    const slotNum = [1, 2].find(n => autoBotState.slots[n].symbol === symbol || autoBotState.slots[n].targetSymbol === symbol) || 0;
+    const ks = await klines1m(symbol).catch(() => null);
+    const esq = sarEngine.construirEsqueleto(slotNum, symbol, ks, { statusSlot: slotNum && esqueletoSlot[slotNum] ? esqueletoSlot[slotNum].statusSlot : 'AGUARDANDO_VIRADA_SAR' });
+    if (!esq) return res.json({ success: false, error: 'Dados 1m insuficientes' });
 
     let pos = null;
     try {
       const p = await fut.posicao(symbol);
       if (p && p.quantidade > 0) pos = p;
     } catch(e) {}
+    let p24 = 0;
+    try {
+      const t = await fut.ticker24h(symbol);
+      p24 = parseFloat((Array.isArray(t) ? t[0] : t)?.priceChangePercent || 0);
+    } catch(e) {}
 
+    const alvo = localAlvos[symbol];
+    const l = esq.linhasConfirmacao1m;
+    const cor = v => (v === 'SUBINDO' ? 'green' : (v === 'CAINDO' ? 'red' : ''));
+    const dirSar = sarEngine.direcaoDoSar(esq);
     res.json({
       success: true,
       symbol,
-      preco: dados.curPrice,
-      priceChangePercent: dados.priceChangePercent || 0,
-      intervals: {
-        '4h': dados.dir4h,
-        '1h': dados.dir1h,
-        '15m': dados.dir15m,
-        '5m': dados.dir5m
-      },
-      mtfStatus: dados.mtfStatus,
-      mtfText: dados.mtfText,
-      emaAlignStatus: dados.emaAlignStatus,
-      distEma21Atr: dados.distEma21Atr,
-      distEmaText: dados.distEmaText,
-      distEmaColor: dados.distEmaColor,
-      atr15m: dados.atr15m,
-      atrPct15m: dados.atrPct15m,
-      adx15m: dados.adx15m,
-      rvol15m: dados.rvol15m,
-      rsi: dados.rsi15m,
-      qualidadeSetup: dados.qualidadeSetup,
-      qualidadeCor: dados.qualidadeCor,
-      leverageSugerida: dados.leverageSugerida,
-      slPrice: dados.slPrice,
-      slPctReal: dados.slPctReal,
-      slRoe: dados.slRoe,
-      tpPrice: dados.tpPrice,
-      tpPctReal: dados.tpPctReal,
-      tpRoe: dados.tpRoe,
-      beTriggerPrice: dados.beTriggerPrice,
-      beTriggerPctReal: dados.beTriggerPctReal,
-      modoDetectado: dados.modoDetectado,
-      modoLabel: dados.modoLabel,
-      direcaoModo: dados.direcaoModo,
-      motivoModo: dados.motivoModo,
-      directionalScore: dados.directionalScore,
-      beArmed: !!localAlvos[symbol]?.beArmed,
-      beStage: localAlvos[symbol]?.beStage || 0,
-      beStopPrice: localAlvos[symbol]?.beStopPrice || null,
-      beLabel: localAlvos[symbol]?.beLabel || '',
-      lockedRoi: localAlvos[symbol]?.lockedRoi || 0,
-      maxRoiReached: localAlvos[symbol]?.maxRoiReached || 0,
-      parcialExecutada: !!localAlvos[symbol]?.parcialExecutada,
-      hpLeitura1: localAlvos[symbol]?.hpLeitura1 ?? 75,
-      hpLeitura2: localAlvos[symbol]?.hpLeitura2 ?? 75,
-      modoResgateAtivo: !!localAlvos[symbol]?.modoResgateAtivo,
-      pnlParcialLiquido: localAlvos[symbol]?.pnlParcialLiquido || 0,
+      preco: esq.precoAtual,
+      priceChangePercent: p24,
+      esqueleto: esq,
+      direcaoSar: dirSar,
+      intervals: { sar: dirSar === 'LONG' ? 'green' : 'red', ema9: cor(l.ema9_inclinacao), ema21: cor(l.ema21_inclinacao), rsi: cor(l.rsi14_inclinacao) },
+      leverageSugerida: ALAV_PADRAO,
+      slPrice: alvo?.slPrice || null,
+      slRoe: Math.abs(slInicialRoi(alvo?.leverage)),
+      beLabel: alvo?.sarLabel || '',
+      maxRoiReached: alvo?.maxRoiReached || 0,
       pricePrecision: fut.filtrosDe(symbol)?.pricePrecision ?? 4,
       pos
     });
@@ -2673,6 +1012,15 @@ app.get('/api/moeda/:symbol', async (req, res) => {
   }
 });
 
+// Esqueleto vivo dos slots (compartilhado com a UI e a IA)
+app.get('/api/esqueleto', (req, res) => {
+  res.json({ success: true, esqueletos: { 1: esqueletoSlot[1], 2: esqueletoSlot[2] }, slots: autoBotState.slots });
+});
+app.get('/api/esqueleto/:slot', (req, res) => {
+  const n = parseInt(req.params.slot, 10);
+  if (n !== 1 && n !== 2) return res.json({ success: false, error: 'slot inválido' });
+  res.json({ success: true, esqueleto: esqueletoSlot[n], slot: autoBotState.slots[n] });
+});
 // Métricas de Fluxo do Rodapé: Taker Ratio, Delta OI, Funding (ETAPA 3)
 app.get('/api/gauge/:symbol', async (req, res) => {
   try {
@@ -2712,31 +1060,34 @@ app.get('/api/gauge/:symbol', async (req, res) => {
 app.get('/api/ia-advise/:symbol', async (req, res) => {
   try {
     const symbol = req.params.symbol.toUpperCase();
-    const dados = await analisarEstruturaEMercado(symbol);
-    if (!dados) return res.json({ success: false, error: 'Dados insuficientes' });
-
-    const dec = await consultarGeminiQuant(symbol, dados);
+    const ks = await klines1m(symbol).catch(() => null);
+    const esq = sarEngine.construirEsqueleto(0, symbol, ks);
+    if (!esq) return res.json({ success: false, error: 'Dados insuficientes' });
+    const dec = await decidirEntradaSar(esq);
     res.json({
       success: true,
       symbol,
-      decisao: dec.action,
-      aprovado: dec.aprovado !== false,
-      confianca: dec.confidence,
-      alavancagem: dec.leverage || dados.leverageSugerida,
-      slPrice: dados.slPrice,
-      tpPrice: dados.tpPrice,
-      beTriggerPrice: dados.beTriggerPrice,
-      motivo: dec.reason_short
+      decisao: dec.dir,
+      aprovado: dec.dir !== 'WAIT',
+      confianca: dec.conf,
+      alavancagem: ALAV_PADRAO,
+      slPrice: null,
+      tpPrice: null,
+      beTriggerPrice: null,
+      motivo: dec.motivo + ' | SAR ' + esq.sar1m.posicaoAtual + ' (' + esq.sar1m.bolinhasConsecutivas + ' bolinha(s))'
     });
   } catch(e) {
     res.json({ success: false, error: e.message });
   }
 });
-
 // Execução Manual de Trade
 app.post('/api/trade', async (req, res) => {
   try {
     const { symbol, lado, valorUSDT, alavancagem } = req.body;
+    if (!isSimboloValido(symbol)) throw new Error('Símbolo inválido');
+    if (lado !== 'BUY' && lado !== 'SELL') throw new Error('Lado inválido');
+    if (!(parseFloat(valorUSDT) > 0) || parseFloat(valorUSDT) > 100) throw new Error('Valor inválido (0-100 USDT)');
+    if (localAlvos[symbol] || [1, 2].some(n => slotEmDecisao[n] && autoBotState.slots[n].targetSymbol === symbol)) throw new Error('Moeda já em operação/decisão no robô');
     const alavCapMan = lado === 'SELL' ? 3 : 4; // mesma assimetria defensiva do autobot: SHORT manual também tetado em 3x
     const alav = Math.min(alavCapMan, Math.max(1, parseInt(alavancagem) || 1));
     await fut.garantirAlavancagem(symbol, alav, 'ISOLATED');
@@ -2767,66 +1118,10 @@ app.post('/api/trade', async (req, res) => {
     }
 
     if (fill > 0) {
-      const dados = await analisarEstruturaEMercado(symbol);
-      // SHORT ou ignição rápida (CONTINUATION/MOMENTUM) falha mais barato -3.80; PULLBACK LONG -4.60.
-      const modoIgnicaoRapidaMan = (dados?.modoLabel || '').includes('CONTINUATION') || (dados?.modoLabel || '').includes('MOMENTUM');
-      let slAlvoRoiMan = (lado === 'SELL' || modoIgnicaoRapidaMan) ? 3.80 : 4.60;
-      const slPisoRoiMan = slAlvoRoiMan - 0.60;
-      let slDistMan = dados ? (dados.slPctReal / 100 * preco) : (preco * ((slAlvoRoiMan / alav) / 100));
-      let slRoeMan = (slDistMan / preco) * alav * 100;
-      if (slRoeMan < slPisoRoiMan) {
-        slRoeMan = slPisoRoiMan;
-        slDistMan = preco * ((slPisoRoiMan / alav) / 100);
-      } else if (slRoeMan > slAlvoRoiMan) {
-        slRoeMan = slAlvoRoiMan;
-        slDistMan = preco * ((slAlvoRoiMan / alav) / 100);
-      }
-      let slCalc = lado === 'BUY' ? (preco - slDistMan) : (preco + slDistMan);
-
-      let tpDistMan = (dados && dados.modoDetectado === 'EXAUSTAO_REVERSAO' && dados.tpPrice)
-        ? Math.abs(preco - dados.tpPrice)
-        : 2.0 * slDistMan;
-      let tpRoeMan = (tpDistMan / preco) * alav * 100;
-      if (tpRoeMan > 8.0) {
-        tpDistMan = preco * (0.08 / alav);
-      }
-      let tpCalc = lado === 'BUY' ? (preco + tpDistMan) : (preco - tpDistMan);
-
-      const beTriggerDist = preco * ((2.10 / alav) / 100);
-      const beTriggerPrice = lado === 'BUY' ? (preco + beTriggerDist) : (preco - beTriggerDist);
-
-      localAlvos[symbol] = {
-        side: lado === 'BUY' ? 'LONG' : 'SHORT',
-        entryPrice: preco,
-        slPrice: slCalc,
-        tpPrice: tpCalc,
-        beTriggerPrice: beTriggerPrice,
-        slDistPct: (slDistMan / preco),
-        slRoiInicial: slRoeMan,
-        parcialExecutada: false,
-        pnlParcialBruto: 0,
-        pnlParcialLiquido: 0,
-        taxaParcial: 0,
-        hpLeitura1: 75,
-        hpLeitura2: 75,
-        lastHpCheck: Date.now(),
-        modoResgateAtivo: false,
-        defesaLucroAtiva: false,
-        tpResgateRoi: null,
-        slResgateRoi: null,
-        beArmed: false,
-        beStage: 0,
-        beStopPrice: null,
-        beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO ATUAL: +0.00%)]',
-        lockedRoi: 0,
-        leverage: alav,
-        quantidade: fill,
-        maxRoiReached: 0,
-        openTime: Date.now(),
-        fechando: false,
-        fechandoDesde: 0
-      };
-      salvarAlvos();
+      const dirMan = lado === 'BUY' ? 'LONG' : 'SHORT';
+      const slotMan = [1, 2].find(n => autoBotState.slots[n].symbol === symbol || autoBotState.slots[n].targetSymbol === symbol) || 1;
+      const esqMan = esqueletoSlot[slotMan] || { sar1m: {} };
+      registrarPosicaoSar(symbol, dirMan, alav, { preco, qty: fill }, esqMan, slotMan);
       res.json({ success: true, result: st });
     } else {
       res.json({ success: false, error: 'A ordem limite não pegou (derrapagem > 0.3%).' });
@@ -2839,6 +1134,8 @@ app.post('/api/trade', async (req, res) => {
 app.post('/api/close', async (req, res) => {
   try {
     const { symbol } = req.body;
+    if (closingInProgress.has(symbol)) throw new Error('Fechamento já em andamento.');
+    closingInProgress.add(symbol); closingStartedAt[symbol] = Date.now();
     const pos = await fut.posicao(symbol);
     if (!pos || pos.quantidade === 0) throw new Error('Nenhuma posição aberta.');
     await fut.cancelarTodasOrdens(symbol);
@@ -2850,7 +1147,7 @@ app.post('/api/close', async (req, res) => {
     const pnlBrutoTotal = pos.pnlNaoRealizado + (alvoBackup?.pnlParcialBruto || 0);
 
     registrarDesfechoTrade(symbol, 'MANUAL_CLOSE', roi, pos.pnlNaoRealizado, alvoBackup);
-    gatekeeperVetoedUntil[symbol] = Date.now() + 2700000;
+    cooldownMoeda[symbol] = Date.now() + 2700000;
 
     await rag.salvarSaidaRAG({
       symbol,
@@ -2861,33 +1158,16 @@ app.post('/api/close', async (req, res) => {
     }).catch(() => {});
 
     delete localAlvos[symbol];
-    delete maxPriceTracker[symbol];
-    delete minPriceTracker[symbol];
-    delete beBreachedTicks[symbol];
+    delete saidaSarTicks[symbol];
     salvarAlvos();
+    closingInProgress.delete(symbol); delete closingStartedAt[symbol];
     res.json({ success: true, result: r });
   } catch (err) {
     res.json({ success: false, error: fut.detalheErro(err) });
   }
 });
 
-app.post('/api/tp-sl', async (req, res) => {
-  try {
-    const { symbol, tpPct, slPct } = req.body;
-    const pos = await fut.posicao(symbol);
-    if (!pos || pos.quantidade === 0) throw new Error('Nenhuma posição aberta.');
-    await fut.cancelarTodasOrdens(symbol);
-    localAlvos[symbol] = {
-      tp: parseFloat(tpPct) || null,
-      sl: parseFloat(slPct) || null
-    };
-    salvarAlvos();
-    res.json({ success: true });
-  } catch (err) {
-    res.json({ success: false, error: err.message });
-  }
-});
-
+app.post('/api/tp-sl', (req, res) => res.json({ success: false, error: 'Sem TP/SL manual: a saída é a virada do Parabolic SAR 1m.' }));
 app.post('/api/reverse', async (req, res) => {
   try {
     const { symbol } = req.body;
@@ -2901,6 +1181,13 @@ app.post('/api/reverse', async (req, res) => {
     await fut.fecharMercado(symbol, origSide, qty);
     await new Promise(r => setTimeout(r, 600));
     const r2 = await fut.abrirMercado(symbol, oppSide, qty);
+    // Reversão vira nova posição SAR: registra alvo (monitor + stop de emergência)
+    const novoLado = origSide === 'LONG' ? 'SHORT' : 'LONG';
+    const posNova = await fut.posicao(symbol).catch(() => null);
+    const slotRev = [1, 2].find(n => autoBotState.slots[n].symbol === symbol || autoBotState.slots[n].targetSymbol === symbol) || 1;
+    if (posNova && posNova.quantidade > 0) {
+      registrarPosicaoSar(symbol, novoLado, alav, { preco: parseFloat(posNova.precoEntrada), qty: posNova.quantidade }, esqueletoSlot[slotRev] || { sar1m: {} }, slotRev);
+    }
     res.json({ success: true, result: r2 });
   } catch (err) {
     res.json({ success: false, error: fut.detalheErro(err) });
@@ -2913,14 +1200,15 @@ app.get('/api/auto-status', (req, res) => {
     enabled: autoBotState.enabled,
     slots: autoBotState.slots,
     lastLog: autoBotState.lastLog,
-    topCandidatos: (topCandidatosComSetup.length > 0 ? topCandidatosComSetup : todasAvaliadasWhitelist.slice(0, 10)).map(c => ({
+    esqueletos: { 1: esqueletoSlot[1], 2: esqueletoSlot[2] },
+    topCandidatos: (rankCache.lista || []).slice(0, 10).map(c => ({
       symbol: c.symbol,
-      modoDetectado: c.modoDetectado,
-      modoLabel: c.modoLabel,
-      directionalScore: c.directionalScore,
-      scoreEfetivo: c.scoreEfetivo,
-      atrPct15m: c.atrPct15m,
-      rvol15m: c.rvol15m
+      modoDetectado: 'SAR_1M',
+      modoLabel: 'SAR 1m',
+      directionalScore: 0,
+      scoreEfetivo: Number(c.score.toFixed(3)),
+      atrPct15m: Number(c.ampMedia15m.toFixed(3)),
+      rvol15m: 0
     })),
     tokensGastos: tokensGastos.total_tokens || 0,
     placar: {
@@ -3086,14 +1374,14 @@ app.get('/api/historico', async (req, res) => {
         </div>
       </div>
       
-      <!-- TENDÊNCIA MULTI-TIMEFRAME (EMA 50) -->
+      <!-- PARABOLIC SAR 1m + LINHAS DE CONFIRMAÇÃO -->
       <div class="mtf-box">
         <div class="mtf-header">
-          <span class="mtf-title">TENDÊNCIA MULTI-TIMEFRAME (EMA 50)</span>
+          <span class="mtf-title">PARABOLIC SAR 1m + LINHAS DE CONFIRMAÇÃO</span>
           <span id="mtf-status-${col}" class="badge-mtf">CARREGANDO...</span>
         </div>
         <div class="candles-row" id="candles-${col}">
-          ${['4h','1h','15m','5m'].map(tf => `
+          ${['sar','ema9','ema21','rsi'].map(tf => `
             <div class="candle">
               <span class="candle-label">${tf}</span>
               <div class="dot" id="dot-${col}-${tf}"></div>
@@ -3167,15 +1455,15 @@ app.get('/api/historico', async (req, res) => {
         <!-- TARGETS EM 3 BOXES BEM DISTRIBUÍDAS -->
         <div class="targets-grid">
           <div class="target-box target-sl">
-            <div class="target-title">STOP LOSS (1.8x ATR)</div>
+            <div class="target-title">STOP EMERGÊNCIA</div>
             <div class="target-val" id="proj-sl-${col}">--</div>
           </div>
           <div class="target-box target-be">
-            <div class="target-title">BREAKEVEN (+0.55%)</div>
+            <div class="target-title">SEM CATRACA</div>
             <div class="target-val" id="proj-be-${col}">--</div>
           </div>
           <div class="target-box target-tp">
-            <div class="target-title">TAKE PROFIT (1:2 R:R)</div>
+            <div class="target-title">SEM TP: SAÍDA NA VIRADA SAR</div>
             <div class="target-val" id="proj-tp-${col}">--</div>
           </div>
         </div>
@@ -3253,15 +1541,15 @@ app.get('/', (req, res) => {
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 8px;
+      flex-wrap: wrap;
+      gap: 5px;
       background: rgba(0,0,0,0.45);
       border: 1px solid var(--border);
-      padding: 8px 12px;
+      padding: 8px 10px;
       border-radius: 12px;
-      flex: 0 0 325px;
-      width: 325px;
-      min-width: 325px;
-      max-width: 325px;
+      flex: 0 0 auto;
+      width: auto;
+      min-width: fit-content;
       box-sizing: border-box;
     }
     .placar-box .stat-label { flex-shrink: 0; margin-right: 2px; }
@@ -3818,7 +2106,7 @@ app.get('/', (req, res) => {
         }
 
         // Atualiza Dots MTF (4h, 1h, 15m, 5m)
-        ['4h','1h','15m','5m'].forEach(tf => {
+        ['sar','ema9','ema21','rsi'].forEach(tf => {
           const dot = document.getElementById('dot-' + col + '-' + tf);
           if (dot) dot.className = "dot " + (data.intervals[tf] || "");
         });
@@ -3826,59 +2114,42 @@ app.get('/', (req, res) => {
         // Badge Alinhamento MTF
         const mtfBadge = document.getElementById('mtf-status-' + col);
         if (mtfBadge) {
-          mtfBadge.innerText = data.mtfText || '--';
-          mtfBadge.style.color = data.mtfStatus.startsWith('APTO') ? 'var(--green)' : 'var(--gold)';
+          const e1 = data.esqueleto;
+          mtfBadge.innerText = e1 ? ('SAR ' + e1.sar1m.posicaoAtual + ' · ' + e1.sar1m.bolinhasConsecutivas + ' bolinha(s)' + (e1.sar1m.virouAgora ? ' · VIROU' : '')) : '--';
+          mtfBadge.style.color = (e1 && e1.sar1m.virouAgora) ? 'var(--green)' : 'var(--gold)';
         }
 
-        // Painel Estrutura & Fluxo
-        document.getElementById('ema-align-' + col).innerText = data.emaAlignStatus || '--';
-        const distEl = document.getElementById('dist-ema-' + col);
-        distEl.innerText = data.distEmaText || '--';
-        distEl.style.color = data.distEmaColor || '#FFF';
-
-        document.getElementById('atr-pct-' + col).innerText = (data.atrPct15m ? data.atrPct15m.toFixed(2) + '%' : '--') + (data.atr15m ? ' ($ ' + data.atr15m.toFixed(4) + ')' : '');
-        document.getElementById('adx-rvol-' + col).innerText = 'ADX: ' + (data.adx15m ? data.adx15m.toFixed(1) : '--') + ' | RVOL: ' + (data.rvol15m ? data.rvol15m.toFixed(1) + 'x' : '--');
-
-        // RSI 15m Wilder & Bússola Quant
-        document.getElementById('rsi-' + col).innerText = data.rsi || '--';
-        const trendEl = document.getElementById('trend-' + col);
-        const scoreSign = (data.directionalScore > 0 ? '+' : '');
-        let scoreColor = 'var(--text-muted)';
-        let scoreTag = 'NEUTRO';
-        if (data.directionalScore >= 55) { scoreColor = 'var(--green)'; scoreTag = 'COMPRA FORTE'; }
-        else if (data.directionalScore <= -55) { scoreColor = 'var(--red)'; scoreTag = 'VENDA FORTE'; }
-        else if (data.directionalScore > 20) { scoreColor = 'var(--green)'; scoreTag = 'COMPRA LEVE'; }
-        else if (data.directionalScore < -20) { scoreColor = 'var(--red)'; scoreTag = 'VENDA LEVE'; }
-        trendEl.innerHTML = '<span style="color:' + scoreColor + '; font-weight:800;">' + scoreSign + (data.directionalScore || 0) + ' [' + scoreTag + ']</span>';
-
-        // Badge do Modo Ativo
-        const modoBadge = document.getElementById('modo-badge-' + col);
-        if (modoBadge) {
-          if (data.modoDetectado) {
-            let corModo = 'var(--gold)';
-            if (data.modoDetectado === 'MOMENTUM') corModo = 'var(--blue)';
-            else if (data.modoDetectado === 'PULLBACK') corModo = 'var(--green)';
-            else if (data.modoDetectado === 'EXAUSTAO_REVERSAO') corModo = 'var(--red)';
-            modoBadge.innerText = '[MODO: ' + data.modoLabel + ']';
+        // Painel SAR 1m / linhas de confirmação
+        const eq = data.esqueleto;
+        if (eq) {
+          const lc = eq.linhasConfirmacao1m;
+          document.getElementById('ema-align-' + col).innerText = 'EMA9 ' + lc.ema9_inclinacao + ' | EMA21 ' + lc.ema21_inclinacao;
+          const distEl = document.getElementById('dist-ema-' + col);
+          distEl.innerText = eq.statusSlot;
+          distEl.style.color = eq.sar1m.virouAgora ? 'var(--green)' : '#FFF';
+          document.getElementById('atr-pct-' + col).innerText = 'Vol 1m: ' + eq.volatilidade1mPct.toFixed(2) + '%';
+          document.getElementById('adx-rvol-' + col).innerText = 'SAR: ' + Number(eq.sar1m.valorAtual).toFixed(data.pricePrecision || 4) + ' (ant: ' + eq.sar1m.posicaoAnterior + ')';
+          document.getElementById('rsi-' + col).innerText = lc.rsi14_valor + ' ' + lc.rsi14_inclinacao;
+          const trendEl = document.getElementById('trend-' + col);
+          const ehLong = data.direcaoSar === 'LONG';
+          trendEl.innerHTML = '<span style="color:' + (ehLong ? 'var(--green)' : 'var(--red)') + '; font-weight:800;">SAR ' + (ehLong ? 'ALTA [COMPRA]' : 'BAIXA [VENDA]') + '</span>';
+          const modoBadge = document.getElementById('modo-badge-' + col);
+          if (modoBadge) {
+            modoBadge.innerText = eq.sar1m.virouAgora ? '[SAR VIROU AGORA]' : '[AGUARDANDO VIRADA SAR]';
+            const corModo = eq.sar1m.virouAgora ? 'var(--green)' : 'var(--text-muted)';
             modoBadge.style.color = corModo;
             modoBadge.style.borderColor = corModo;
             modoBadge.style.background = 'rgba(255,255,255,0.06)';
-            cardHasActiveSetup[col] = true;
-          } else {
-            modoBadge.innerText = '[SEM SETUP ATIVO]';
-            modoBadge.style.color = 'var(--text-muted)';
-            modoBadge.style.borderColor = 'var(--border)';
-            modoBadge.style.background = 'transparent';
-            cardHasActiveSetup[col] = false;
+            cardHasActiveSetup[col] = !!eq.sar1m.virouAgora;
           }
         }
 
         // Projeção de Risco Quantitativo
         document.getElementById('proj-alav-' + col).innerText = (data.leverageSugerida || 3) + 'x';
         document.getElementById('proj-entry-' + col).innerText = '$ ' + parseFloat(data.preco).toFixed(4);
-        document.getElementById('proj-sl-' + col).innerText = '$ ' + (data.slPrice ? data.slPrice.toFixed(4) : '--') + ' (-' + (data.slRoe ? data.slRoe.toFixed(1) : '--') + '%)';
-        document.getElementById('proj-be-' + col).innerText = '$ ' + (data.beTriggerPrice ? data.beTriggerPrice.toFixed(4) : '--') + ' (+' + (data.beTriggerPctReal ? data.beTriggerPctReal.toFixed(2) : '--') + '%)';
-        document.getElementById('proj-tp-' + col).innerText = '$ ' + (data.tpPrice ? data.tpPrice.toFixed(4) : '--') + ' (+' + (data.tpRoe ? data.tpRoe.toFixed(1) : '--') + '%)';
+        document.getElementById('proj-sl-' + col).innerText = data.slPrice ? ('$ ' + data.slPrice.toFixed(data.pricePrecision || 4) + ' (-' + data.slRoe + '%)') : ('-' + data.slRoe + '% ROI');
+        document.getElementById('proj-be-' + col).innerText = '--';
+        document.getElementById('proj-tp-' + col).innerText = 'Lucro livre';
 
         // Ajusta slider se vazio
         const alavEl = document.getElementById('alav-' + col);
@@ -3947,20 +2218,11 @@ app.get('/', (req, res) => {
             beEl.style.display = 'block';
             beEl.className = 'pos-be-banner';
             const maxR = (data.maxRoiReached || 0).toFixed(2);
-            const lockR = (data.lockedRoi || 0).toFixed(2);
-            const stopP = data.beStopPrice ? ('$' + Number(data.beStopPrice).toFixed(prec)) : '';
 
-            if (data.maxRoiReached >= 2.10) {
-              beEl.style.background = 'rgba(16, 185, 129, 0.22)';
-              beEl.style.borderColor = 'var(--green)';
-              beEl.style.color = 'var(--green)';
-              beEl.innerText = data.beLabel || ('[🛡️ TRAVA ATIVA: GARANTIDO +' + lockR + '% ROI (' + stopP + ') | PICO +' + maxR + '%]');
-            } else {
-              beEl.style.background = 'rgba(255, 255, 255, 0.06)';
-              beEl.style.borderColor = 'rgba(255, 255, 255, 0.2)';
-              beEl.style.color = 'var(--gold)';
-              beEl.innerText = data.beLabel || ('[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO ATUAL: +' + maxR + '%)]');
-            }
+            beEl.style.background = 'rgba(16, 185, 129, 0.15)';
+            beEl.style.borderColor = 'var(--green)';
+            beEl.style.color = 'var(--green)';
+            beEl.innerText = data.beLabel || ('[🏄 SURFANDO SAR 1m | PICO +' + maxR + '%]');
           }
         } else {
           cardHasPosition[col] = false;
@@ -4028,9 +2290,8 @@ app.get('/', (req, res) => {
             '<div style="font-size:0.85rem; color:var(--text-muted); margin-bottom:15px;">' + data.motivo + '</div>' +
             '<div style="font-size:0.8rem; font-family:monospace; background:rgba(0,0,0,0.3); padding:10px; border-radius:8px; text-align:left;">' +
               '<div>• Alavancagem: ' + data.alavancagem + 'x</div>' +
-              '<div>• Stop Loss: $ ' + (data.slPrice ? data.slPrice.toFixed(4) : '--') + '</div>' +
-              '<div>• Take Profit: $ ' + (data.tpPrice ? data.tpPrice.toFixed(4) : '--') + '</div>' +
-              '<div>• Breakeven: $ ' + (data.beTriggerPrice ? data.beTriggerPrice.toFixed(4) : '--') + '</div>' +
+              '<div>• Saída: virada do Parabolic SAR 1m (sem TP fixo)</div>' +
+
             '</div>';
           askConfirm("⚡ Análise Institucional", html, true);
           st.innerText = "IA: " + data.decisao + " (" + data.motivo + ")";
@@ -4624,8 +2885,8 @@ app.get('/', (req, res) => {
         const dataStr = g.dataBrasil || new Date(g.time || g.entryTime).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
         const tag = isWin ? 'WIN' : 'LOSS';
         let motivoFmt = g.exitReason || '';
-        if (motivoFmt.includes('CATRACA_PARCIAL')) {
-          motivoFmt = '💰 PARCIAL + CATRACA';
+        if (motivoFmt.includes('SAIDA_SAR_VIRADA')) {
+          motivoFmt = '🏄 VIRADA SAR';
         } else if (motivoFmt.includes('CATRACA') || motivoFmt === 'BREAKEVEN') {
           motivoFmt = '🛡️ CATRACA';
         } else if (motivoFmt.includes('RESGATE')) {
@@ -4736,7 +2997,7 @@ app.get('/', (req, res) => {
           }).catch(() => {});
           registrarDesfechoTrade(p.symbol, isZombieQNT ? 'SL_FUNIL_TEMPO' : 'BOOT_CLEANUP', roiFinal, p.pnlNaoRealizado, alvoExistente);
           delete localAlvos[p.symbol];
-          gatekeeperVetoedUntil[p.symbol] = Date.now() + 2700000;
+          cooldownMoeda[p.symbol] = Date.now() + 2700000;
         }
       }
       salvarAlvos();
@@ -4761,34 +3022,8 @@ app.get('/', (req, res) => {
             const pEntrada = parseFloat(p.precoEntrada);
             const isLong = p.lado === 'LONG';
             const alav = p.alavancagem || 1;
-            localAlvos[p.symbol] = {
-              side: p.lado,
-              entryPrice: pEntrada,
-              slPrice: isLong ? pEntrada * (1 - (5.60 / alav) / 100) : pEntrada * (1 + (5.60 / alav) / 100),
-              tpPrice: isLong ? pEntrada * (1 + (8.00 / alav) / 100) : pEntrada * (1 - (8.00 / alav) / 100),
-              beTriggerPrice: isLong ? pEntrada * (1 + (2.10 / alav) / 100) : pEntrada * (1 - (2.10 / alav) / 100),
-              slDistPct: 0.056 / alav,
-              slRoiInicial: 5.60,
-              parcialExecutada: false,
-              pnlParcialBruto: 0,
-              pnlParcialLiquido: 0,
-              taxaParcial: 0,
-              hpLeitura1: 75,
-              hpLeitura2: 75,
-              lastHpCheck: Date.now(),
-              modoResgateAtivo: false,
-              defesaLucroAtiva: false,
-              tpResgateRoi: null,
-              slResgateRoi: null,
-              beArmed: false,
-              beStage: 0,
-              beStopPrice: null,
-              beLabel: '[🌱 RESPIRO LIVRE ATÉ +2.60% ROI (PICO ATUAL: +0.00%)]',
-              lockedRoi: 0,
-              leverage: p.alavancagem,
-              maxRoiReached: 0,
-              openTime: Date.now()
-            };
+            registrarPosicaoSar(p.symbol, p.lado, alav, { preco: pEntrada, qty: Math.abs(parseFloat(p.positionAmt) || p.quantidade || 0) }, { sar1m: {} }, sNum);
+            localAlvos[p.symbol].openTime = Date.now();
             salvarAlvos();
           }
         } else {
@@ -4803,11 +3038,8 @@ app.get('/', (req, res) => {
       console.error('[BOOT] Erro ao sincronizar posições:', e.message);
     }
 
-    // Inicializa scanner inteligente de setups do carrossel
-    atualizarTopSetups().catch(() => {});
-    setInterval(() => {
-      atualizarTopSetups().catch(() => {});
-    }, 30000);
+    // Aquece o ranking de volatilidade (o motor SAR assume daqui)
+    rankearVolateis().catch(() => {});
 
     app.listen(PORT, () => console.log('Painel Quant Institucional rodando na porta ' + PORT));
   } catch (e) {
