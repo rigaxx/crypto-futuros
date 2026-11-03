@@ -1,6 +1,11 @@
 const path = require('path');
 const dotenv = require('dotenv');
 dotenv.config({ path: path.join(__dirname, '.env') });
+// Sem senha padrão no código: ACESSO_SENHA ausente = painel não sobe.
+if (!process.env.ACESSO_SENHA) {
+  console.error('[BOOT] ACESSO_SENHA ausente no .env. Defina ACESSO_SENHA para proteger o painel. Encerrando.');
+  process.exit(1);
+}
 
 const express = require('express');
 const cors = require('cors');
@@ -16,7 +21,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 7005;
-const SENHA = process.env.ACESSO_SENHA || '242524###';
+const SENHA = process.env.ACESSO_SENHA;
 const ROUTER_API_KEY = process.env.ROUTER_API_KEY;
 const JEV_API_KEY    = process.env.JEV_API_KEY;
 const JEV_URL        = 'https://api.typesafe.ai/v1/systemone';
@@ -26,7 +31,6 @@ rag.initRagDb().catch(e => console.error('[RAG] Erro ao iniciar:', e.message));
 
 // Autenticação HTTP Basic
 app.use((req, res, next) => {
-  if (req.path === '/api/auto-status') return next();
   const auth = req.headers['authorization'];
   if (!auth) {
     res.setHeader('WWW-Authenticate', 'Basic realm="Painel Futuros Quant"');
@@ -135,6 +139,7 @@ function salvarLossCooldown() {
 
 function registrarDesfechoTrade(symbol, exitReason, roi, pnlUsdt, alvoContext = null) {
   if (!symbol) return;
+  if (exitReason === 'SCALP_DESCONHECIDO') return; // scalp sem desfecho conhecido: fora do placar
   const agora = Date.now();
   const ultimoReg = closedTradeEvents.get(symbol);
   if (ultimoReg && (agora - ultimoReg) < 15000) {
@@ -153,13 +158,18 @@ function registrarDesfechoTrade(symbol, exitReason, roi, pnlUsdt, alvoContext = 
   const pnlParcialLiq = alvoContext?.pnlParcialLiquido || 0;
   const taxaParcial = alvoContext?.taxaParcial || 0;
   const taxaEstimadaFinal = 0.04;
-  const pnlLiquidoFinal = pnlNum - taxaEstimadaFinal;
+  // scalp_1m informa o líquido REAL do testnet (taxas maker/taker de cada perna); os demais seguem com a taxa estimada fixa
+  const liqReal = alvoContext?.pnlLiquidoReal;
+  const temLiqReal = typeof liqReal === 'number' && Number.isFinite(liqReal);
+  const pnlLiquidoFinal = temLiqReal ? liqReal : pnlNum - taxaEstimadaFinal;
   const pnlLiquidoTotal = pnlLiquidoFinal + pnlParcialLiq;
   const pnlBrutoTotal = pnlNum + (alvoContext?.pnlParcialBruto || 0);
 
-  const isWin = pnlLiquidoTotal > 0 && (roiNum > 0.05 || pnlLiquidoTotal > 0.01);
+  const isWin = temLiqReal ? pnlLiquidoTotal > 0 : (pnlLiquidoTotal > 0 && (roiNum > 0.05 || pnlLiquidoTotal > 0.01)); // scalp: W = líquido real > 0
   if (isWin) {
     placarStats.wins = (placarStats.wins || 0) + 1;
+  } else if (String(exitReason).startsWith('SCALP_')) {
+    placarStats.losses = (placarStats.losses || 0) + 1; // scalp_1m: sem quarentena 1h (não trava o PSAR na mesma moeda)
   } else {
     placarStats.losses = (placarStats.losses || 0) + 1;
     symbolLossCooldown[symbol] = Date.now() + 1 * 60 * 60 * 1000; // 60m (1 hora) de quarentena anti-revanche
@@ -222,7 +232,9 @@ try {
 } catch (e) {}
 
 function salvarAutoBotConfig() {
-  try { fs.writeFileSync(AUTOBOT_FILE, JSON.stringify({ enabled: autoBotState.enabled }, null, 2)); } catch(e){}
+  let atual = {};
+  try { atual = JSON.parse(fs.readFileSync(AUTOBOT_FILE, 'utf8')) || {}; } catch(e){} // preserva SCALP_1M_ENABLED
+  try { fs.writeFileSync(AUTOBOT_FILE, JSON.stringify({ ...atual, enabled: autoBotState.enabled }, null, 2)); } catch(e){}
 }
 
 let cooldownMoeda = {};
@@ -466,6 +478,7 @@ async function decidirEntradaSar(esq) {
 
 // Execução maker/limit-chase com vetos de spread, tick grosso e liquidez do book. Retorna {ok, preco, qty, motivo}.
 async function executarEntradaSar(sym, dir, alav) {
+  if (!autoBotState.enabled) return { ok: false, motivo: 'PSAR desligado (enabled:false): ordem não enviada' }; // guarda: robô desligado durante a janela
   const ladoTrade = dir === 'LONG' ? 'BUY' : 'SELL';
   const posAtual = await fut.posicao(sym).catch(() => null);
   if (posAtual && posAtual.quantidade > 0) return { ok: false, motivo: 'posição já existe' };
@@ -695,6 +708,23 @@ setInterval(async () => {
   }
 }, 3000);
 
+// ── MODO SCALP_1M (slots 3/4, sinal mainnet, execução FAPI) — lib/scalp1m.js ──
+const scalpLib = require('./lib/scalp1m');
+const mainnetFeed = require('./lib/mainnetFeed');
+const scalp1m = scalpLib.criarMotor({
+  fut, rag, localAlvos, salvarAlvos, closingInProgress, registrarDesfechoTrade,
+  feed: mainnetFeed.criarFeed([]), // universo dinâmico: o motor assina/desassina a cada ranking (15 min)
+  rest: mainnetFeed.rest,
+  simboloOcupadoPsar: (sym) => [1, 2].some(n => autoBotState.slots[n].symbol === sym || autoBotState.slots[n].targetSymbol === sym),
+  configFile: AUTOBOT_FILE,
+  logFile: path.join(__dirname, 'logs', 'scalp_1m_decisoes.jsonl'),
+  jevKey: JEV_API_KEY, // decisão de compra/venda das 2 escolhidas, 3 s antes da fronteira (sem chave: vale a direção do código)
+  jevUrl: JEV_URL,
+  marcoZero: () => marcoZero, // ZERAR: contadores do scalp ignoram o que veio antes do marco
+  onUsage: (u) => registrarUsoTokens({ prompt_tokens: u.input_tokens || 0, completion_tokens: u.output_tokens || 0, total_tokens: (u.input_tokens || 0) + (u.output_tokens || 0) }),
+  baseOrdens: fut.FAPI // trava: scalp só opera se a base de ordens for testnet
+});
+
 // ── MONITOR DE POSIÇÃO ABERTA (1,5s, 0 token): surfa o SAR; sai só na virada contra / emergência / funding ──
 setInterval(async () => {
   if (isMonitoringTick) return;
@@ -703,12 +733,14 @@ setInterval(async () => {
     const agoraWd = Date.now();
     for (const sym of Object.keys(localAlvos)) {
       const a = localAlvos[sym];
-      if (a && a.fechando && agoraWd - (a.fechandoDesde || 0) > 10000) {
+      if (a && a.modo !== 'scalp_1m' && a.fechando && agoraWd - (a.fechandoDesde || 0) > 10000) {
         console.warn(`[WATCHDOG-FECHANDO] Resetando trava presa em ${sym}`);
         a.fechando = false; closingInProgress.delete(sym); delete closingStartedAt[sym];
       }
     }
     for (const sym of Array.from(closingInProgress)) {
+      // scalp_1m fora do watchdog: o motor e o /api/close soltam a trava no finally/catch
+      if (localAlvos[sym]?.modo === 'scalp_1m' || Object.values(scalp1m.status().slots).some(s => s.symbol === sym)) continue;
       if (agoraWd - (closingStartedAt[sym] || 0) > 12000) {
         closingInProgress.delete(sym); delete closingStartedAt[sym];
         if (localAlvos[sym]) localAlvos[sym].fechando = false;
@@ -719,6 +751,7 @@ setInterval(async () => {
       if (closingInProgress.has(sym)) continue;
       const alvo = localAlvos[sym];
       if (!alvo || alvo.fechando) continue;
+      if (alvo.modo === 'scalp_1m') continue; // scalp_1m tem monitor próprio (scalp1m.monitorarTodas)
       try {
         const pos = await fut.posicao(sym);
         if (!pos || pos.quantidade === 0) {
@@ -1084,6 +1117,7 @@ app.get('/api/ia-advise/:symbol', async (req, res) => {
 app.post('/api/trade', async (req, res) => {
   try {
     const { symbol, lado, valorUSDT, alavancagem } = req.body;
+    if (!autoBotState.enabled) throw new Error('PSAR desligado (enabled:false): entrada manual PSAR bloqueada'); // guarda PSAR
     if (!isSimboloValido(symbol)) throw new Error('Símbolo inválido');
     if (lado !== 'BUY' && lado !== 'SELL') throw new Error('Lado inválido');
     if (!(parseFloat(valorUSDT) > 0) || parseFloat(valorUSDT) > 100) throw new Error('Valor inválido (0-100 USDT)');
@@ -1132,27 +1166,55 @@ app.post('/api/trade', async (req, res) => {
 });
 
 app.post('/api/close', async (req, res) => {
+  const { symbol } = req.body || {};
+  let ehScalp = false, lockScalp = false;
   try {
-    const { symbol } = req.body;
+    if (scalp1m.emEntrada(symbol)) { // scalp em ENTRANDO (com ou sem alvo): nada é cancelado nem fechado
+      return res.status(409).json({ success: false, error: 'SCALP_1M em fase ENTRANDO neste símbolo: fechamento manual bloqueado até a entrada terminar. Tente de novo em alguns segundos.' });
+    }
     if (closingInProgress.has(symbol)) throw new Error('Fechamento já em andamento.');
-    closingInProgress.add(symbol); closingStartedAt[symbol] = Date.now();
+    ehScalp = localAlvos[symbol]?.modo === 'scalp_1m'; // lido antes dos awaits
+    if (ehScalp && !scalp1m.travaOk(symbol, 'API_CLOSE')) { // trava testnet do motor: nenhuma ordem enviada
+      return res.status(400).json({ success: false, error: 'SCALP_1M: base de ordens não é testnet; fechamento não enviado.' });
+    }
+    closingInProgress.add(symbol); closingStartedAt[symbol] = Date.now(); lockScalp = ehScalp;
     const pos = await fut.posicao(symbol);
     if (!pos || pos.quantidade === 0) throw new Error('Nenhuma posição aberta.');
-    await fut.cancelarTodasOrdens(symbol);
-    const r = await fut.fecharMercado(symbol, pos.lado, pos.quantidade);
+    if (!ehScalp) await fut.cancelarTodasOrdens(symbol);
+    let r;
+    if (ehScalp) { // scalp: fecha primeiro; stop só cai após o fechamento
+      try { r = await fut.fecharMercado(symbol, pos.lado, pos.quantidade); } catch (eF) {
+        if (localAlvos[symbol]) localAlvos[symbol].slNaCorretora = true; // stop não cancelado
+        console.error(`[SCALP-CLOSE] ${symbol}: fechamento a mercado falhou; stop mantido`);
+        throw eF;
+      }
+      if (!(await fut.cancelarTodasOrdens(symbol, { estrito: true }).catch(() => false))) { // alvo mantido; o motor retenta e grava o desfecho
+        console.error(`[SCALP-CLOSE] ${symbol}: cancelamento de ordens falhou após fechar; stop pode seguir na corretora; alvo mantido`);
+        const aP = localAlvos[symbol];
+        if (aP) {
+          if (!(aP.entryPrice > 0)) aP.entryPrice = pos.precoEntrada;
+          aP.side = aP.side || pos.lado; aP.quantidade = pos.quantidade;
+          scalp1m.marcarCancelPendente(symbol, aP, { fin: ['SCALP_MANUAL', parseFloat(r?.avgPrice)] });
+        }
+        closingInProgress.delete(symbol); delete closingStartedAt[symbol];
+        return res.json({ success: true, result: r, aviso: 'Posição fechada; cancelamento de ordens falhou. Alvo mantido; o motor scalp retenta o cancelamento.' });
+      }
+    } else r = await fut.fecharMercado(symbol, pos.lado, pos.quantidade);
 
     const margem = pos.margem || ((pos.quantidade * pos.precoEntrada) / (pos.alavancagem || 1));
     const roi = margem > 0 ? (pos.pnlNaoRealizado / margem) * 100 : 0;
     const alvoBackup = localAlvos[symbol] ? { ...localAlvos[symbol] } : null;
     const pnlBrutoTotal = pos.pnlNaoRealizado + (alvoBackup?.pnlParcialBruto || 0);
+    const motivoClose = ehScalp ? 'SCALP_MANUAL' : 'MANUAL_CLOSE'; // scalp: placar sim, sem quarentena 1h nem cooldown 45 min
 
-    registrarDesfechoTrade(symbol, 'MANUAL_CLOSE', roi, pos.pnlNaoRealizado, alvoBackup);
-    cooldownMoeda[symbol] = Date.now() + 2700000;
+    registrarDesfechoTrade(symbol, motivoClose, roi, pos.pnlNaoRealizado, alvoBackup);
+    if (!ehScalp) cooldownMoeda[symbol] = Date.now() + 2700000;
+    if (ehScalp) scalp1m.registrarTradeExterno(symbol, { side: pos.lado, entryPrice: pos.precoEntrada, ...alvoBackup, quantidade: pos.quantidade }, motivoClose, parseFloat(r?.avgPrice)); // linha TRADE no JSONL
 
     await rag.salvarSaidaRAG({
       symbol,
       exitPrice: pos.precoMarca || pos.precoEntrada,
-      exitReason: 'MANUAL_CLOSE',
+      exitReason: motivoClose,
       roiPct: roi,
       pnlUsdt: pnlBrutoTotal
     }).catch(() => {});
@@ -1163,6 +1225,7 @@ app.post('/api/close', async (req, res) => {
     closingInProgress.delete(symbol); delete closingStartedAt[symbol];
     res.json({ success: true, result: r });
   } catch (err) {
+    if (lockScalp) { closingInProgress.delete(symbol); delete closingStartedAt[symbol]; } // watchdog não solta trava scalp
     res.json({ success: false, error: fut.detalheErro(err) });
   }
 });
@@ -1171,6 +1234,7 @@ app.post('/api/tp-sl', (req, res) => res.json({ success: false, error: 'Sem TP/S
 app.post('/api/reverse', async (req, res) => {
   try {
     const { symbol } = req.body;
+    if (!autoBotState.enabled) throw new Error('PSAR desligado (enabled:false): reversão bloqueada'); // guarda PSAR: nada é fechado nem aberto
     const pos = await fut.posicao(symbol);
     if (!pos || pos.quantidade === 0) throw new Error('Nenhuma posição para reverter.');
     const origSide = pos.lado;
@@ -1194,10 +1258,18 @@ app.post('/api/reverse', async (req, res) => {
   }
 });
 
+// Slots PSAR 1/2 ocultos no painel: robô desligado e nenhuma posição PSAR ativa (slot ou alvo não-scalp).
+function psarSlotsOcultos() {
+  if (autoBotState.enabled) return false;
+  if ([1, 2].some(n => autoBotState.slots[n] && autoBotState.slots[n].symbol)) return false;
+  return !Object.values(localAlvos).some(a => a && a.modo !== 'scalp_1m');
+}
+
 app.get('/api/auto-status', (req, res) => {
   res.json({
     success: true,
     enabled: autoBotState.enabled,
+    psarOcultar: psarSlotsOcultos(),
     slots: autoBotState.slots,
     lastLog: autoBotState.lastLog,
     esqueletos: { 1: esqueletoSlot[1], 2: esqueletoSlot[2] },
@@ -1230,6 +1302,19 @@ app.post('/api/auto-trade', async (req, res) => {
   }
 });
 
+app.get('/api/scalp-1m', (req, res) => {
+  res.json({ success: true, ...scalp1m.status() });
+});
+
+app.post('/api/scalp-1m', (req, res) => {
+  try {
+    const enabled = scalp1m.definirEnabled(!!req.body?.enabled);
+    res.json({ success: true, enabled });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
 app.get('/api/rag-stats', async (req, res) => {
   try {
     const stats = await rag.obterEstatisticasRAG();
@@ -1255,6 +1340,7 @@ app.post('/api/limpar-placar', async (req, res) => {
 
     placarStats = { wins: 0, losses: 0, total: 0, pnlHoje: 0 };
     salvarPlacarStats();
+    try { scalp1m.zerarContadores(); } catch(e) {} // Win Rate, taxas e histórico de turnos do Sniper 2 min recomeçam do zero
 
     // Mantém estritamente 20.00 USDT de Base Capital Operacional e guarda o saldo total da carteira em separado
     const baseCapitalOperacional = MAX_SLOTS * MARGEM_POR_SLOT;
@@ -1615,6 +1701,89 @@ app.get('/', (req, res) => {
     }
     .bot-control-top { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
 
+    /* SCALP 1M: CICLO DE 5 MIN (tela principal com PSAR desligado: body.modo-scalp) */
+    .scalp-turno-bar {
+      background: linear-gradient(180deg, rgba(13,17,28,0.95) 0%, rgba(9,12,20,0.98) 100%);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 10px 14px;
+      display: grid;
+      grid-template-rows: auto auto auto minmax(0, 1fr);
+      gap: 8px;
+      font-size: 0.82rem;
+    }
+    body.modo-scalp { padding: 6px; height: 100vh; min-height: 0; overflow: hidden; }
+    body.modo-scalp .container { max-width: 1366px; height: 100%; gap: 0; }
+    body.modo-scalp .perf-header-bar, body.modo-scalp .volatility-bar, body.modo-scalp .bot-control-bar,
+    body.modo-scalp #psar-off-nota, body.modo-scalp #psar-grid { display: none !important; }
+    body.modo-scalp .scalp-turno-bar { height: calc(100vh - 12px); overflow: hidden; }
+    .sc-topo { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .sc-placar { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+    .sc-placar .badge-win, .sc-placar .badge-loss, .sc-placar .badge-wr { font-size: 0.78rem; padding: 2px 5px; flex: 0 0 auto; width: auto; min-width: 46px; text-align: center; }
+    .sc-kpis { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; overflow: hidden; }
+    .sc-kpi { display: flex; flex-direction: column; gap: 1px; padding: 4px 10px; background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 8px; white-space: nowrap; }
+    .sc-kpi b { font-size: 0.95rem; font-weight: 900; font-variant-numeric: tabular-nums; }
+    .sc-btns { display: flex; gap: 6px; }
+    .sc-btns button { padding: 5px 10px; font-size: 0.72rem; border-radius: 7px; background: rgba(255,255,255,0.06); color: var(--text); border: 1px solid var(--border); cursor: pointer; font-weight: 700; }
+    .scalp-tag { font-size: 0.72rem; font-weight: 900; letter-spacing: 1px; color: var(--purple); background: rgba(167,139,250,0.15); border: 1px solid rgba(167,139,250,0.4); padding: 3px 8px; border-radius: 7px; white-space: nowrap; }
+    .scalp-estado { font-size: 0.75rem; font-weight: 800; color: var(--text-muted); white-space: nowrap; }
+    .sc-centro { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 18px; background: rgba(0,0,0,0.25); border: 1px solid var(--border); border-radius: 10px; padding: 6px 16px; }
+    .sc-relogio { font-size: 3.1rem; line-height: 1; font-weight: 900; color: var(--gold); font-family: monospace; font-variant-numeric: tabular-nums; }
+    .sc-fase-box { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+    .sc-fase { font-size: 1.35rem; font-weight: 900; letter-spacing: 2px; }
+    .sc-fase-ABERTO { color: var(--green); }
+    .sc-fase-ANALISE { color: var(--blue); }
+    .sc-fase-CONFIRMACAO { color: var(--gold); }
+    .sc-fase-sub { font-size: 0.78rem; color: var(--text-muted); font-weight: 700; }
+    .sc-fase-sub b { color: var(--text); font-family: monospace; font-size: 0.95rem; }
+    .sc-barra { position: relative; display: grid; grid-template-columns: 40fr 50fr 10fr; height: 8px; border-radius: 4px; overflow: hidden; }
+    .sc-barra i { display: block; opacity: 0.35; }
+    .sc-b-aberto { background: var(--green); }
+    .sc-b-analise { background: var(--blue); }
+    .sc-b-conf { background: var(--gold); }
+    .sc-barra-pos { position: absolute; top: 0; bottom: 0; width: 3px; background: #FFF; left: 0; }
+    .sc-turno-box { display: grid; grid-template-columns: auto auto; gap: 2px 10px; align-items: baseline; }
+    .scalp-num { font-size: 0.9rem; font-weight: 900; color: var(--text); white-space: nowrap; }
+    .scalp-mini { font-size: 0.7rem; color: var(--text-muted); font-weight: 700; }
+    .scalp-chip { font-size: 0.7rem; font-weight: 800; padding: 2px 7px; border-radius: 6px; white-space: nowrap; display: inline-block; }
+    .scalp-chip-pos { color: var(--green); background: rgba(16,185,129,0.18); border: 1px solid rgba(16,185,129,0.4); }
+    .scalp-chip-neg { color: var(--red); background: rgba(239,68,68,0.18); border: 1px solid rgba(239,68,68,0.4); }
+    .scalp-chip-neutro { color: var(--text-muted); background: rgba(255,255,255,0.05); border: 1px solid var(--border); }
+    .scalp-slots { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .scalp-slot { display: grid; grid-template-columns: auto 1fr auto; grid-template-rows: auto auto; gap: 4px 12px; align-items: center; background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px; font-family: monospace; min-height: 74px; }
+    .scalp-slot-livre { opacity: 0.55; }
+    .scalp-slot-orfa { border-color: rgba(239,68,68,0.55); }
+    .scalp-slot-long { border-color: rgba(16,185,129,0.45); }
+    .scalp-slot-short { border-color: rgba(239,68,68,0.45); }
+    .scalp-slot-n { font-size: 0.68rem; font-weight: 800; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; }
+    .scalp-moeda { font-size: 1.25rem; font-weight: 900; color: var(--text); }
+    .scalp-pnl { font-size: 1.35rem; font-weight: 900; text-align: right; font-variant-numeric: tabular-nums; }
+    .scalp-dir { font-size: 0.72rem; font-weight: 900; padding: 2px 8px; border-radius: 6px; }
+    .scalp-long { color: var(--green); background: rgba(16,185,129,0.18); }
+    .scalp-short { color: var(--red); background: rgba(239,68,68,0.18); }
+    .scalp-campo { white-space: nowrap; font-size: 0.78rem; }
+    .scalp-status { font-size: 0.7rem; font-weight: 800; color: var(--blue); text-align: right; }
+    .sc-baixo { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 8px; min-height: 0; align-items: start; }
+    /* Ranking das 20: 2 colunas de 10 linhas compactas, sem barra de rolagem (cabe em 1366x768 a 100%) */
+    .sc-rank2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+    .sc-rank2 .sc-tab { font-size: 0.7rem; table-layout: fixed; }
+    .sc-rank2 .sc-tab th { padding: 1px 3px; font-size: 0.6rem; }
+    .sc-rank2 .sc-tab td { padding: 1px 3px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; }
+    .sc-rank2 .sc-tab td:nth-child(6), .sc-rank2 .sc-tab td:last-child { overflow: visible; }
+    .sc-rank2 .scalp-chip { font-size: 0.6rem; padding: 0 4px; }
+    .sc-rank2 .scalp-dir { font-size: 0.6rem; padding: 0 5px; }
+    .sc-painel { background: rgba(0,0,0,0.25); border: 1px solid var(--border); border-radius: 10px; padding: 6px 10px; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+    .sc-tit { font-size: 0.7rem; font-weight: 900; color: var(--gold); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+    .sc-tab { width: 100%; border-collapse: collapse; font-family: monospace; font-size: 0.78rem; }
+    .sc-tab th { text-align: left; font-size: 0.66rem; color: var(--text-muted); font-weight: 800; text-transform: uppercase; padding: 2px 6px; border-bottom: 1px solid var(--border); }
+    .sc-tab td { padding: 3px 6px; border-bottom: 1px solid rgba(255,255,255,0.04); white-space: nowrap; }
+    .sc-tab tr.sc-pos td { color: var(--green); }
+    .sc-tab tr.sc-neg td { color: var(--red); }
+    .sc-tab tr.sc-neutro td { color: var(--text-muted); }
+    .sc-tab td.sc-num { text-align: right; font-variant-numeric: tabular-nums; }
+    .sc-rolagem { flex: 1 1 auto; min-height: 0; max-height: 210px; overflow-y: auto; overflow-x: hidden; }
+    .sc-rolagem .sc-tab th { position: sticky; top: 0; background: var(--bg); z-index: 1; }
+
     /* GRELHA DOS CARTÕES (1 E 2) */
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
     .card {
@@ -1779,6 +1948,8 @@ app.get('/', (req, res) => {
 
     @media (max-width: 960px) {
       .grid { grid-template-columns: 1fr; }
+      .scalp-slots { grid-template-columns: 1fr; }
+      .sc-baixo { grid-template-columns: 1fr; }
       .perf-header-bar { flex-direction: column; text-align: center; flex-wrap: wrap; }
       .header-stat-group { justify-content: center; flex-wrap: wrap; }
       .header-btns { justify-content: center; flex-wrap: wrap; }
@@ -1787,7 +1958,7 @@ app.get('/', (req, res) => {
     }
   </style>
 </head>
-<body>
+<body class="${psarSlotsOcultos() ? 'modo-scalp' : ''}">
 
   <!-- MODAL DE CONFIRMAÇÃO ESTÉTICO -->
   <div class="modal-overlay" id="modal-confirm">
@@ -1907,8 +2078,38 @@ app.get('/', (req, res) => {
       </div>
     </div>
 
+    <!-- SCALP 1M: CICLO DE 5 MIN (tela principal com PSAR desligado) -->
+    <div class="scalp-turno-bar" id="scalp-turno-bar">
+      <div class="sc-topo">
+        <span class="scalp-tag">SCALP 1M</span>
+        <span id="scalp-estado" class="scalp-estado">Carregando...</span>
+        <div class="sc-placar" title="Placar de trades (persistente): W / L / win rate"><span class="badge-win" id="scalp-placar-w">0 W</span><span class="scalp-mini">/</span><span class="badge-loss" id="scalp-placar-l">0 L</span><span class="badge-wr" id="scalp-placar-wr">0% WR</span></div>
+        <div class="sc-kpis" id="scalp-hoje"></div>
+        <div class="sc-btns"><button onclick="abrirBaseCapital()" style="color: var(--gold); border-color: var(--gold);">Base 20 USDT</button><button onclick="zerarPlacar()" title="Zerar placar e marco zero">ZERAR</button><button onclick="abrirHistorico()">Histórico</button><button onclick="fazerLogout()">Sair</button></div>
+      </div>
+      <div class="sc-centro">
+        <div class="sc-relogio" id="scalp-relogio">--:--</div>
+        <div class="sc-fase-box">
+          <span id="scalp-fase" class="sc-fase">--</span>
+          <span class="sc-fase-sub">fase termina em <b id="scalp-contagem">--:--</b> · ciclo fecha em <b id="scalp-ciclo-resta">--:--</b></span>
+          <div class="sc-barra"><i class="sc-b-aberto"></i><i class="sc-b-analise"></i><i class="sc-b-conf"></i><span id="scalp-barra-pos" class="sc-barra-pos"></span></div>
+        </div>
+        <div class="sc-turno-box">
+          <span class="scalp-mini">Turno</span><span id="scalp-turno-num" class="scalp-num">--</span>
+          <span class="scalp-mini">Soma do turno</span><span id="scalp-soma-turno" class="scalp-num">--</span>
+          <span class="scalp-mini">Próximas</span><span id="scalp-proximas" class="scalp-num">--</span>
+        </div>
+      </div>
+      <div class="scalp-slots" id="scalp-slots"></div>
+      <div class="sc-baixo">
+        <div class="sc-painel"><div class="sc-tit">Ranking ao vivo · <span id="scalp-ranking-n">20</span> moedas · <span id="scalp-rotacao" class="scalp-mini">lista troca em -- ciclos</span></div><div class="sc-rank2"><table class="sc-tab" id="scalp-ranking"></table><table class="sc-tab" id="scalp-ranking-b"></table></div></div>
+        <div class="sc-painel"><div class="sc-tit">Últimos 10 turnos</div><table class="sc-tab" id="scalp-historico"></table></div>
+      </div>
+    </div>
+
     <!-- GRELHA DOS CARTÕES (1 E 2) -->
-    <div class="grid">
+    <div id="psar-off-nota" style="display:none; margin:6px 0; font-size:12px; color:var(--text-muted);">PSAR desligado</div>
+    <div class="grid" id="psar-grid">
       ${renderColHTML(1)}
       ${renderColHTML(2)}
     </div>
@@ -2065,6 +2266,7 @@ app.get('/', (req, res) => {
     }
 
     async function loadData(col) {
+      if (document.body.classList.contains('modo-scalp')) return; // PSAR fora da tela: cards 1/2 não buscam MTF
       let sym = document.getElementById('sym-' + col).value.trim().toUpperCase();
       if (!sym) return;
       if (!sym.endsWith('USDT')) sym += 'USDT';
@@ -2446,6 +2648,179 @@ app.get('/', (req, res) => {
       } catch(e) {}
     }
 
+    // ── SCALP 1M: CICLO SNIPER DE 2 MIN (GET /api/scalp-1m a cada 1 s; relógio avança no cliente) ──
+    let scalpDados = null, scalpRecebidoEm = 0, scalpBuscando = false;
+    function escHtml(v) {
+      return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+    }
+    function scalpUsd(v) {
+      if (v == null || !isFinite(v)) return '--';
+      return (v >= 0 ? '+$ ' : '-$ ') + Math.abs(v).toFixed(4);
+    }
+    function scalpPct(v) { return v == null || !isFinite(v) ? '--' : Number(v).toFixed(1) + '%'; }
+    function scalpCor(v) { return v == null || !isFinite(v) || v === 0 ? 'var(--text-muted)' : (v > 0 ? 'var(--green)' : 'var(--red)'); }
+    function scalpPreco(v) {
+      if (v == null || !isFinite(v)) return '--';
+      const n = Number(v);
+      return n >= 100 ? n.toFixed(2) : (n >= 1 ? n.toFixed(4) : n.toFixed(5));
+    }
+    function scalpMmss(ms) {
+      const s = Math.max(0, Math.ceil(ms / 1000));
+      return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+    }
+    function scalpRelogio(ms) {
+      const s = Math.max(0, Math.floor(ms / 1000));
+      return String(Math.floor(s / 60)) + ':' + String(s % 60).padStart(2, '0');
+    }
+    function scalpDirHtml(dir) {
+      if (dir !== 'LONG' && dir !== 'SHORT') return '<span class="scalp-mini">' + escHtml(dir || '--') + '</span>';
+      return '<span class="scalp-dir ' + (dir === 'LONG' ? 'scalp-long' : 'scalp-short') + '">' + escHtml(dir) + '</span>';
+    }
+    const SCALP_STATUS_TXT = { ENTRANDO: 'Entrando (GTX)', ATIVO: 'Ativo', SAINDO_LIMITE: 'Saindo (limite)', FECHANDO: 'Fechando', ORFA: 'Órfã' };
+    const SCALP_TURNO_TXT = { AGUARDANDO: 'aguardando', AVALIANDO: 'avaliando', ENTRANDO: 'entrando', ATIVO: 'em curso', FECHADO: 'fechado', VAZIO: 'vazio' };
+    const SCALP_FASE_TXT = { ABERTO: 'ABERTO', ANALISE: 'ANÁLISE', CONFIRMACAO: 'CONFIRMAÇÃO' };
+
+    async function atualizarScalpTurno() {
+      if (scalpBuscando) return;
+      scalpBuscando = true;
+      try {
+        const r = await fetch('/api/scalp-1m');
+        const d = await r.json();
+        if (d && d.success) { scalpDados = d; scalpRecebidoEm = Date.now(); renderScalpTurno(); }
+      } catch (e) {
+        const el = document.getElementById('scalp-estado');
+        if (el) { el.textContent = 'Sem conexão com o painel'; el.style.color = 'var(--red)'; }
+      } finally {
+        scalpBuscando = false;
+      }
+    }
+
+    function renderScalpTurno() {
+      const d = scalpDados;
+      if (!d) return;
+      const decorrido = Date.now() - scalpRecebidoEm;
+      const ta = d.turnoAtual || {};
+      const cfg = d.config || {};
+      const setTxt = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; return el; };
+      // Placar W/L no topo do scalp: espelha os contadores de carregarPlacar() (/api/win-loss), que ficam na barra oculta
+      [['placar-wins', 'scalp-placar-w'], ['placar-losses', 'scalp-placar-l'], ['placar-wr', 'scalp-placar-wr']].forEach(([de, para]) => {
+        const o = document.getElementById(de); if (o) setTxt(para, o.textContent);
+      });
+      const estadoEl = document.getElementById('scalp-estado');
+      if (estadoEl) {
+        if (!d.enabled) { estadoEl.textContent = 'Desligado'; estadoEl.style.color = 'var(--text-muted)'; }
+        else if (!d.testnet) { estadoEl.textContent = 'Bloqueado: base não é testnet'; estadoEl.style.color = 'var(--red)'; }
+        else { estadoEl.textContent = 'Ligado · testnet'; estadoEl.style.color = 'var(--green)'; }
+      }
+      // Relógio do ciclo Sniper: 0:00-0:20 ABERTO, 0:20-1:40 ANÁLISE, 1:40-2:00 CONFIRMAÇÃO
+      const cicloMs = cfg.turnoMs || 120000, iniAnalise = cfg.faseAnaliseIniMs || 20000, iniConf = cfg.faseConfirmacaoIniMs || 100000;
+      const dentro = (((d.ciclo && d.ciclo.dentroMs) || 0) + decorrido) % cicloMs;
+      const fase = dentro < iniAnalise ? 'ABERTO' : (dentro < iniConf ? 'ANALISE' : 'CONFIRMACAO');
+      const fimFase = fase === 'ABERTO' ? iniAnalise : (fase === 'ANALISE' ? iniConf : cicloMs);
+      setTxt('scalp-relogio', scalpRelogio(dentro));
+      const faseEl = setTxt('scalp-fase', SCALP_FASE_TXT[fase]);
+      if (faseEl) faseEl.className = 'sc-fase sc-fase-' + fase;
+      setTxt('scalp-contagem', scalpMmss(fimFase - dentro));
+      setTxt('scalp-ciclo-resta', scalpMmss(cicloMs - dentro));
+      const barra = document.getElementById('scalp-barra-pos');
+      if (barra) barra.style.left = (dentro / cicloMs * 100).toFixed(2) + '%';
+      setTxt('scalp-turno-num', ta.numero ? '#' + ta.numero + ' · ' + (SCALP_TURNO_TXT[ta.status] || ta.status) : '--');
+      const somaEl = document.getElementById('scalp-soma-turno');
+      if (somaEl) {
+        const st = ta.somaTurno || {};
+        somaEl.innerHTML = '<span style="color:' + scalpCor(st.testnet) + ';">' + escHtml(scalpUsd(st.testnet)) + '</span>' +
+          '<span class="scalp-mini"> ' + escHtml(String(st.trades || 0)) + ' op.</span>';
+      }
+      const proxEl = document.getElementById('scalp-proximas');
+      if (proxEl) {
+        const px = d.proximas || [];
+        proxEl.innerHTML = px.length
+          ? px.map(p => escHtml(p.simbolo) + ' ' + scalpDirHtml(p.direcao)).join(' ')
+          : '<span class="scalp-mini">' + (fase === 'CONFIRMACAO' ? 'confirmando...' : '--') + '</span>';
+      }
+      // Topo: saldo, PnL do dia, taxas, win rate, expectativa
+      const hojeEl = document.getElementById('scalp-hoje');
+      if (hojeEl && d.hoje) {
+        const h = d.hoje;
+        const g = d.jev || {};
+        const kpi = (rot, val, cor) => '<div class="sc-kpi"><span class="scalp-mini">' + escHtml(rot) + '</span><b' + (cor ? ' style="color:' + cor + ';"' : '') + '>' + val + '</b></div>';
+        hojeEl.innerHTML =
+          kpi('Saldo', escHtml('$ ' + Number(saldoGlobal || 0).toFixed(2))) +
+          kpi('PnL do dia', escHtml(scalpUsd(h.pnlLiquido)), scalpCor(h.pnlLiquido)) +
+          kpi('Taxas', escHtml('$ ' + Number(h.taxasPagas || 0).toFixed(4))) +
+          kpi('Win rate', escHtml(scalpPct(h.winRatePorOperacao)) + ' <span class="scalp-mini">' + escHtml(h.operacoes) + ' op.</span>') +
+          kpi('Expectativa / op.', escHtml(scalpUsd(h.expectativaLiquidaMediaPorOperacao)), scalpCor(h.expectativaLiquidaMediaPorOperacao)) +
+          kpi('Turnos', escHtml(h.turnos) + ' <span class="scalp-mini">' + escHtml(h.positivos) + '+ ' + escHtml(h.negativos) + '− ' + escHtml(h.turnosVazios) + 'v</span>') +
+          kpi('Jev = código', escHtml(scalpPct(g.taxaConcorda === null || g.taxaConcorda === undefined ? null : g.taxaConcorda * 100)) + ' <span class="scalp-mini">' + escHtml(g.concorda || 0) + '/' + escHtml(g.comOpiniao || 0) + (g.ativo === false ? ' · sem chave' : '') + '</span>') +
+          kpi('Latência Jev', escHtml(g.latenciaMediaMs === null || g.latenciaMediaMs === undefined ? '--' : g.latenciaMediaMs + ' ms') + ' <span class="scalp-mini">' + escHtml(g.timeouts || 0) + ' timeout</span>') +
+          kpi('Maker ent./saí.', escHtml(scalpPct(d.maker_entrada_pct)) + ' <span class="scalp-mini">/</span> ' + escHtml(scalpPct(d.maker_saida_pct)));
+      }
+      // Cards dos slots 3 e 4
+      const slotsEl = document.getElementById('scalp-slots');
+      if (slotsEl) {
+        const porSlot = {};
+        (ta.slots || []).forEach(s => { porSlot[s.slot] = s; });
+        slotsEl.innerHTML = [3, 4].map(n => {
+          const s = porSlot[n];
+          if (!s) return '<div class="scalp-slot scalp-slot-livre"><span class="scalp-slot-n">Slot ' + (n - 2) + '</span><span class="scalp-mini">LIVRE</span><span></span></div>';
+          const seg = s.segundosRestantes == null ? null : Math.max(0, s.segundosRestantes - Math.floor(decorrido / 1000));
+          const cls = s.status === 'ORFA' ? ' scalp-slot-orfa' : (s.direcao === 'LONG' ? ' scalp-slot-long' : ' scalp-slot-short');
+          return '<div class="scalp-slot' + cls + '">' +
+            '<span class="scalp-slot-n">Slot ' + (n - 2) + '</span>' +
+            '<span><span class="scalp-moeda">' + escHtml(s.moeda) + '</span> ' + scalpDirHtml(s.direcao) + '</span>' +
+            '<span class="scalp-pnl" style="color:' + scalpCor(s.pnlAoVivo) + ';">' + escHtml(scalpUsd(s.pnlAoVivo)) + (s.pnlAoVivo == null ? '' : ' <small>(' + escHtml((s.pnlAoVivo / 10 * 100).toFixed(2)) + '% margem)</small>') + '</span>' +
+            '<span class="scalp-status">' + escHtml(SCALP_STATUS_TXT[s.status] || s.status) + '</span>' +
+            '<span class="scalp-campo"><span class="scalp-mini">Entrada</span> ' + escHtml(scalpPreco(s.precoEntrada)) + '</span>' +
+            '<span class="scalp-campo" style="text-align:right;"><span class="scalp-mini">Restam</span> <b>' + (seg == null ? '--' : escHtml(seg + ' s')) + '</b>' + (seg == null ? '' : '<div class="sc-barra" style="margin-top:3px;"><span style="display:block;height:100%;width:' + Math.round(100 * seg / ((cfg.holdMs || 120000) / 1000)) + '%;background:var(--gold);"></span></div>') + '</span>' +
+          '</div>';
+        }).join('');
+      }
+      // Ranking ao vivo: as 20 da lista com rodízio, em 2 colunas de 10 linhas (sem barra de rolagem)
+      const rkEl = document.getElementById('scalp-ranking');
+      const rkB = document.getElementById('scalp-ranking-b');
+      if (rkEl && rkB) {
+        const uni = d.universo || [];
+        const origem = {}; uni.forEach(u => { origem[u.simbolo] = u.origem; });
+        const analisado = (d.ranking || []).length > 0;
+        // Antes da 1ª análise do processo: mostra a lista montada (volume/ATR) sem score/direção
+        const rk = analisado ? d.ranking : uni.map(u => ({ simbolo: u.simbolo, volume_24h: u.volume_24h, atr: u.atr_pct, score: null, direcao: null, condicoes_ok: null }));
+        const nEl = document.getElementById('scalp-ranking-n');
+        if (nEl) nEl.textContent = String(rk.length || (d.simbolos || []).length || 20);
+        const rotEl = document.getElementById('scalp-rotacao');
+        const rot = d.rotacao || {};
+        if (rotEl) rotEl.textContent = rot.ciclosRestantes == null ? 'lista troca em -- ciclos' : (rot.ciclosRestantes === 0 ? 'lista troca agora' : 'lista troca em ' + rot.ciclosRestantes + (rot.ciclosRestantes === 1 ? ' ciclo' : ' ciclos'));
+        const fmtVol = (v) => { const n = Number(v); return !Number.isFinite(n) || v == null ? '--' : (n >= 1e9 ? (n / 1e9).toFixed(1) + 'B' : (n / 1e6).toFixed(0) + 'M'); };
+        const cab = '<tr><th style="width:6%">#</th><th style="width:19%">Moeda</th><th style="width:11%">Vol 24h</th><th style="width:11%">ATR%</th><th style="width:10%">Score</th><th style="width:14%">Dir.</th><th style="width:8%">C</th><th style="width:21%">Selo</th></tr>';
+        const linha = (c, i) => {
+          const selos = (c.fora1Ciclo ? '<span class="scalp-chip scalp-chip-neg" title="Prejuízo, zero ou erro: fora só do próximo ciclo">fora 1 ciclo</span>' : '') +
+            (!c.fora1Ciclo && origem[c.simbolo] === 'REPETIDA' ? '<span class="scalp-mini" title="Repetiu da lista anterior">repetiu</span>' : '') +
+            (!c.fora1Ciclo && (origem[c.simbolo] === 'NOVA' || origem[c.simbolo] === 'ATR_PROXIMO') ? '<span class="scalp-mini" style="color:var(--green);" title="Entrou na lista agora">nova</span>' : '');
+          const nome = String(c.simbolo).replace(/USDT$/, '');
+          return '<tr title="' + escHtml(c.simbolo) + (c.bloqueio ? ' · ' + escHtml(c.bloqueio) + ' ' + escHtml(c.bloqueio_detalhe || '') : '') + '"><td>' + escHtml(i + 1) + '</td><td>' + escHtml(nome) +
+            (c.bloqueio ? ' <span class="scalp-chip scalp-chip-neg">!</span>' : '') + '</td><td class="sc-num">' + escHtml(fmtVol(c.volume_24h)) + '</td><td class="sc-num">' +
+            escHtml(Number.isFinite(Number(c.atr)) && c.atr != null ? Number(c.atr).toFixed(3) : '--') + '</td><td class="sc-num">' + escHtml(c.score == null ? '--' : Number(c.score).toFixed(2)) + '</td><td>' +
+            (c.direcao ? scalpDirHtml(c.direcao) : '<span class="scalp-mini">--</span>') + '</td><td class="sc-num">' + escHtml(c.condicoes_ok == null ? '-' : c.condicoes_ok + '/5') + '</td><td>' + (selos || '<span class="scalp-mini">--</span>') + '</td></tr>';
+        };
+        const metade = Math.ceil(Math.max(rk.length, 20) / 2);
+        const vazio = '<tr><td colspan="8" class="scalp-mini">aguardando a lista de 20 moedas...</td></tr>';
+        rkEl.innerHTML = cab + (rk.length ? rk.slice(0, metade).map((c, i) => linha(c, i)).join('') : vazio);
+        rkB.innerHTML = cab + rk.slice(metade).map((c, i) => linha(c, i + metade)).join('');
+      }
+      // Histórico dos últimos 10 turnos
+      const hiEl = document.getElementById('scalp-historico');
+      if (hiEl) {
+        const hs = (d.historico || []).slice(0, 10);
+        hiEl.innerHTML = '<tr><th>Turno</th><th>Moedas</th><th>Direção</th><th>Soma líq.</th></tr>' + (hs.length
+          ? hs.map(u => {
+              const cls = u.vazio || u.positivo == null ? 'sc-neutro' : (u.positivo ? 'sc-pos' : 'sc-neg');
+              const moedas = (u.moedas || []).length ? (u.moedas || []).map(escHtml).join(' / ') : 'VAZIO';
+              const dirs = u.vazio ? escHtml(u.motivo || '') : (u.direcoes || []).map(escHtml).join(' / ');
+              return '<tr class="' + cls + '"><td>#' + escHtml(u.numero) + '</td><td>' + moedas + '</td><td>' + dirs + '</td><td class="sc-num">' + escHtml(u.vazio ? '--' : scalpUsd(u.somaLiquida)) + '</td></tr>';
+            }).join('')
+          : '<tr><td colspan="4" class="scalp-mini">sem turnos hoje</td></tr>');
+      }
+    }
+
     // ── ROBÔ AUTÔNOMO ──
     let autoBotActive = false;
 
@@ -2460,6 +2835,12 @@ app.get('/', (req, res) => {
           const logEl = document.getElementById('auto-log-text');
           window.dAutoBotSlots = d.slots;
           window.dTopCandidatos = d.topCandidatos || [];
+          // PSAR desligado e sem posição PSAR (o servidor só conta slots 1/2 e alvos não-scalp): a tela vira só o scalp.
+          // Sem checar a posição dos cards 1/2: eles carregam ETH/SOL do localStorage e a posição SCALP nessas moedas mantinha o PSAR na tela.
+          const psarOcultar = d.psarOcultar === true;
+          document.body.classList.toggle('modo-scalp', psarOcultar);
+          const psarGrid = document.getElementById('psar-grid');
+          if (psarGrid) psarGrid.style.display = psarOcultar ? 'none' : '';
 
           if (d.enabled) {
             btn.innerText = 'DESLIGAR ROBÔ';
@@ -2694,7 +3075,7 @@ app.get('/', (req, res) => {
           baseCapitalCache = data;
           renderizarBaseCapital();
         } else {
-          container.innerHTML = '<div style="padding:30px; color:var(--red); font-weight:700;">Erro: ' + (data.error || 'Falha ao carregar') + '</div>';
+          container.innerHTML = '<div style="padding:30px; color:var(--red); font-weight:700;">Erro: ' + escHtml(data.error || 'Falha ao carregar') + '</div>';
         }
       } catch(e) {
         container.innerHTML = '<div style="padding:30px; color:var(--red); font-weight:700;">Falha de comunicação</div>';
@@ -2954,6 +3335,9 @@ app.get('/', (req, res) => {
       setInterval(carregarVolateis, 60000);
       setInterval(carregarPlacar, 5000);
       setInterval(atualizarStatusAutoBot, 3000);
+      atualizarScalpTurno();
+      setInterval(atualizarScalpTurno, 1000); // /api/scalp-1m a cada 1 s
+      setInterval(renderScalpTurno, 250);     // contagem regressiva no cliente
     });
   </script>
 </body>
@@ -2974,13 +3358,32 @@ app.get('/', (req, res) => {
       const posAtivas = await fut.todasPosicoes();
       const posComQtd = (Array.isArray(posAtivas) ? posAtivas : []).filter(p => parseFloat(p.positionAmt) !== 0);
 
-      // BLOCO 1.3: Limpeza imediata de posições antigas travadas (MUSDT, BEAMXUSDT, fora da WHITELIST_VIP ou zumbi antigo de QNTUSDT)
+      // BLOCO 1.3: Limpeza imediata de posições antigas travadas (MUSDT, fora da WHITELIST_VIP ou zumbi antigo de QNTUSDT)
+      const scalpBoot = new Set(); // posições scalp_1m: nunca entram nos slots PSAR
       for (const p of posComQtd) {
         const alvoExistente = localAlvos[p.symbol];
         const duracaoBootMs = Date.now() - (alvoExistente?.openTime || p.atualizadoEm || Date.now());
         const isZombieQNT = (p.symbol === 'QNTUSDT' && duracaoBootMs > 2 * 3600 * 1000);
 
-        if (p.symbol === 'MUSDT' || p.symbol === 'BEAMXUSDT' || !WHITELIST_VIP.has(p.symbol) || isZombieQNT) {
+        if (alvoExistente?.modo === 'scalp_1m') {
+          // Turno scalp em andamento: NÃO fecha a Market. Alvo mantido; o motor scalp retoma o monitoramento
+          // (scalp1m.iniciar): limite aos 1:40, Market aos 2:00; openTime + HOLD_MS vencido = fecha no 1º ciclo.
+          scalpBoot.add(p.symbol);
+          if (!scalpLib.ehTestnet(fut.FAPI)) { // trava testnet: nenhuma ordem (nem o rearme do stop)
+            console.error(`[SCALP-BOOT] ${p.symbol}: base de ordens não é testnet (${fut.FAPI}); stop scalp não rearmado`);
+            continue;
+          }
+          if (!(alvoExistente.entryPrice > 0)) alvoExistente.entryPrice = p.precoEntrada;
+          alvoExistente.slNaCorretora = false; // confere na corretora: stop ausente = rearma (stop_pct do alvo)
+          const slOk = await scalp1m.garantirStopOrfa(p.symbol, alvoExistente, p).catch(() => false);
+          console.warn(`[SCALP-BOOT] ${p.symbol}: turno scalp_1m em andamento (${p.lado} ${p.quantidade}); alvo mantido, monitor scalp retoma; stop ${slOk ? 'na corretora' : 'pendente: rearme no 1º ciclo do monitor'}`);
+          continue;
+        }
+        if (p.symbol === 'MUSDT' || !WHITELIST_VIP.has(p.symbol) || isZombieQNT) {
+          if (!scalpLib.ehTestnet(fut.FAPI)) { // trava testnet no ramo genérico: nenhuma ordem fora do testnet
+            console.error(`[BOOT-LIMPEZA-ZUMBI] ${p.symbol}: base de ordens não é testnet (${fut.FAPI}); fechamento/cancelamento não enviado`);
+            continue;
+          }
           console.warn(`[BOOT-LIMPEZA-ZUMBI] Encerrando posição travada/fora da whitelist no boot: ${p.symbol} (${p.lado} ${p.quantidade})`);
           await fut.cancelarTodasOrdens(p.symbol).catch(() => {});
           await fut.fecharMercado(p.symbol, p.lado, p.quantidade).catch(e => {
@@ -2988,23 +3391,35 @@ app.get('/', (req, res) => {
           });
           const margem = p.margem || ((p.quantidade * p.precoEntrada) / (p.alavancagem || 1));
           const roiFinal = margem > 0 ? (p.pnlNaoRealizado / margem) * 100 : 0;
+          const limpeza = scalpLib.limpezaBoot(alvoExistente, isZombieQNT);
           await rag.salvarSaidaRAG({
             symbol: p.symbol,
             exitPrice: p.precoMarca || p.precoEntrada,
-            exitReason: isZombieQNT ? 'SL_FUNIL_TEMPO' : 'BOOT_CLEANUP',
+            exitReason: limpeza.exitReason,
             roiPct: roiFinal,
             pnlUsdt: p.pnlNaoRealizado + (alvoExistente?.pnlParcialBruto || 0)
           }).catch(() => {});
-          registrarDesfechoTrade(p.symbol, isZombieQNT ? 'SL_FUNIL_TEMPO' : 'BOOT_CLEANUP', roiFinal, p.pnlNaoRealizado, alvoExistente);
+          registrarDesfechoTrade(p.symbol, limpeza.exitReason, roiFinal, p.pnlNaoRealizado, alvoExistente);
           delete localAlvos[p.symbol];
-          cooldownMoeda[p.symbol] = Date.now() + 2700000;
+          if (limpeza.cooldownMs > 0) cooldownMoeda[p.symbol] = Date.now() + limpeza.cooldownMs;
         }
       }
       salvarAlvos();
 
       // Posições remanescentes válidas
       const posValidas = (await fut.todasPosicoes().catch(() => []))
-        .filter(p => parseFloat(p.positionAmt) !== 0 && WHITELIST_VIP.has(p.symbol));
+        .filter(p => parseFloat(p.positionAmt) !== 0 && WHITELIST_VIP.has(p.symbol))
+        .filter(p => {
+          // Scalp sem alvo (qualquer moeda, sem alvo algum, alavancagem 5x ou ilegível): fora dos slots PSAR, cai no ALERTA abaixo.
+          const scalpSemAlvo = scalpLib.posicaoScalpSemAlvo(p, localAlvos[p.symbol]);
+          if (!scalpSemAlvo && !scalpBoot.has(p.symbol) && localAlvos[p.symbol]?.modo !== 'scalp_1m') return true;
+          if (localAlvos[p.symbol]?.modo === 'scalp_1m') { // alvo mantido: o monitor scalp assume (scalp1m.iniciar)
+            console.log(`[SCALP-BOOT] ${p.symbol}: posição scalp_1m (${p.lado} ${p.quantidade}) mantida e monitorada pelo motor scalp; fora dos slots PSAR.`);
+          } else {
+            console.error(`[SCALP-BOOT] ALERTA ${p.symbol}: posição scalp_1m aberta SEM GESTÃO (${p.lado} ${p.quantidade}); fora dos slots PSAR. Fechar manualmente.`);
+          }
+          return false;
+        });
 
       for (let idx = 0; idx < posValidas.length; idx++) {
         const p = posValidas[idx];
@@ -3026,6 +3441,8 @@ app.get('/', (req, res) => {
             localAlvos[p.symbol].openTime = Date.now();
             salvarAlvos();
           }
+        } else if (!scalpLib.ehTestnet(fut.FAPI)) { // trava testnet: nenhuma ordem fora do testnet
+          console.error(`[BOOT-ORFÃ] ${p.symbol}: base de ordens não é testnet (${fut.FAPI}); fechamento não enviado`);
         } else {
           console.warn(`[BOOT-ORFÃ] Posição órfã detectada na Binance além dos 2 slots: ${p.symbol} (${p.lado} ${p.quantidade}). Encerrando imediatamente a mercado...`);
           await fut.cancelarTodasOrdens(p.symbol);
@@ -3040,6 +3457,7 @@ app.get('/', (req, res) => {
 
     // Aquece o ranking de volatilidade (o motor SAR assume daqui)
     rankearVolateis().catch(() => {});
+    scalp1m.iniciar(); // flag SCALP_1M_ENABLED OFF = só o timer ocioso
 
     app.listen(PORT, () => console.log('Painel Quant Institucional rodando na porta ' + PORT));
   } catch (e) {
