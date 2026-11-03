@@ -21,8 +21,8 @@ test('constantes Sniper: 120 s, 2 slots de 10 USDT a 5x, TP +1,60% ROI, SL curto
   assert.strictEqual(s.ALAV, 5); assert.strictEqual(s.MARGEM, 10); assert.deepStrictEqual(s.SLOTS, [3, 4]);
   assert.strictEqual(s.TP_PRICE_PCT * s.ALAV, 1.6); assert.ok(Math.abs(s.SL_CURTO_PCT - 0.44) < 1e-12);
   assert.strictEqual(s.BE_GATILHO_ROI, 0.85); assert.strictEqual(s.BE_PISO_ROI, 0.45);
-  assert.strictEqual(s.ENTRADA_LIMITE_MS, 8000); assert.strictEqual(s.ATR_MIN_PCT, 0.18); assert.strictEqual(s.VOLUME_MIN_USDT, 50_000_000);
-  assert.strictEqual(s.SNIPER_SCORE_MIN, 50); assert.strictEqual(s.ENTRADA_FUGA_ABORTA_PCT, 0.15);
+  assert.strictEqual(s.ENTRADA_LIMITE_MS, 8000); assert.strictEqual(s.ATR_MIN_PCT, 0.12); assert.strictEqual(s.VOLUME_MIN_USDT, 50_000_000);
+  assert.strictEqual(s.SNIPER_SCORE_MIN, 45); assert.strictEqual(s.ENTRADA_FUGA_ABORTA_PCT, 0.15);
   const f = s.faseCiclo(T0 + 5000); assert.strictEqual(f.fase, 'ABERTO'); assert.strictEqual(f.cicloRestanteMs, 115000);
   assert.strictEqual(s.faseCiclo(T0 + 50000).fase, 'ANALISE'); assert.strictEqual(s.faseCiclo(T0 + 110000).fase, 'CONFIRMACAO');
 });
@@ -62,9 +62,9 @@ test('avaliarSniper: filtro de direção obrigatório (qualquer divergência = S
   assert.strictEqual(s.avaliarSniper(dados({ st1m_dir: null })).bloqueio, 'SEM_DADOS_SNIPER');
 });
 
-test('avaliarSniper: ATR 1m < 0,18% bloqueia; trava anti-topo (> 1,2 x ATR da EMA 9 1m) bloqueia', () => {
-  assert.strictEqual(s.avaliarSniper(dados({ atr_1m_pct: 0.179 })).bloqueio, 'ATR_BAIXO');
-  assert.strictEqual(s.avaliarSniper(dados({ atr_1m_pct: 0.18 })).ok, true);
+test('avaliarSniper: ATR 1m < 0,12% bloqueia; trava anti-topo (> 1,2 x ATR da EMA 9 1m) bloqueia', () => {
+  assert.strictEqual(s.avaliarSniper(dados({ atr_1m_pct: 0.119 })).bloqueio, 'ATR_BAIXO');
+  assert.strictEqual(s.avaliarSniper(dados({ atr_1m_pct: 0.12 })).ok, true);
   // ATR 0,20% de 101 = 0,202; 1,2 x = 0,2424 -> EMA9 em 100,75 (distância 0,25) bloqueia; 100,77 (0,23) passa
   assert.strictEqual(s.avaliarSniper(dados({ ema9_1m: 100.75 })).bloqueio, 'TOPO_ESTICADO');
   assert.strictEqual(s.avaliarSniper(dados({ ema9_1m: 100.77 })).ok, true);

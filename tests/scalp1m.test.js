@@ -55,8 +55,8 @@ test('bloqueio: campo NaN', () => {
 test('bloqueio: campo incoerente (taker > 1)', () => {
   assert.strictEqual(s.avaliarGate(base({ taker_buy_ratio_60s: 1.2 })).bloqueio, 'CAMPO_INVALIDO');
 });
-test('bloqueio: atr_1m_pct < 0.15', () => {
-  assert.strictEqual(s.avaliarGate(base({ atr_1m_pct: 0.149 })).bloqueio, 'ATR_BAIXO');
+test('bloqueio: atr_1m_pct < 0.12', () => {
+  assert.strictEqual(s.avaliarGate(base({ atr_1m_pct: 0.119 })).bloqueio, 'ATR_BAIXO');
 });
 test('bloqueio: spread_pct > 0.05', () => {
   assert.strictEqual(s.avaliarGate(base({ spread_pct: 0.051 })).bloqueio, 'SPREAD_ALTO');
