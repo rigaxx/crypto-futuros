@@ -21,7 +21,7 @@ test('constantes Sniper: 120 s, 2 slots de 10 USDT a 5x, TP +1,60% ROI, SL curto
   assert.strictEqual(s.ALAV, 5); assert.strictEqual(s.MARGEM, 10); assert.deepStrictEqual(s.SLOTS, [3, 4]);
   assert.strictEqual(s.TP_PRICE_PCT * s.ALAV, 1.6); assert.ok(Math.abs(s.SL_CURTO_PCT - 0.44) < 1e-12);
   assert.strictEqual(s.BE_GATILHO_ROI, 0.85); assert.strictEqual(s.BE_PISO_ROI, 0.45);
-  assert.strictEqual(s.ENTRADA_LIMITE_MS, 8000); assert.strictEqual(s.ATR_MIN_PCT, 0.12); assert.strictEqual(s.VOLUME_MIN_USDT, 50_000_000);
+  assert.strictEqual(s.ENTRADA_LIMITE_MS, 8000); assert.strictEqual(s.ATR_MIN_PCT, 0.05); assert.strictEqual(s.VOLUME_MIN_USDT, 20_000_000); assert.strictEqual(s.SPREAD_TESTNET_MAX_PCT, 0.6); assert.strictEqual(s.TAKER_RATIO_LONG ?? 1.05, 1.05);
   assert.strictEqual(s.SNIPER_SCORE_MIN, 45); assert.strictEqual(s.ENTRADA_FUGA_ABORTA_PCT, 0.15);
   const f = s.faseCiclo(T0 + 5000); assert.strictEqual(f.fase, 'ABERTO'); assert.strictEqual(f.cicloRestanteMs, 115000);
   assert.strictEqual(s.faseCiclo(T0 + 50000).fase, 'ANALISE'); assert.strictEqual(s.faseCiclo(T0 + 110000).fase, 'CONFIRMACAO');
@@ -41,30 +41,31 @@ test('avaliarSniper LONG: direção (ST verde + EMA 5m + VWAP) e score = 20 + 30
   assert.strictEqual(r.direcao, 'LONG'); assert.strictEqual(r.score, 100); assert.strictEqual(r.ok, true);
   assert.strictEqual(s.avaliarSniper(dados({ rvol: 1.5 })).score, 75);               // sem RVol: ainda aprova
   assert.strictEqual(s.avaliarSniper(dados({ book_imbalance_10: 0.05 })).score, 75); // book 1.1 < 1.15: sem o peso 2
-  const fraco = s.avaliarSniper(dados({ taker_buy_ratio_60s: 0.52 }));               // ratio 1.08 < 1.18: sem fluxo a favor = não entra
+  const fraco = s.avaliarSniper(dados({ taker_buy_ratio_60s: 0.50 }));               // ratio 1.0 < 1.05: sem fluxo a favor = não entra
   assert.strictEqual(fraco.score, 70); assert.strictEqual(fraco.ok, false); assert.strictEqual(fraco.bloqueio, 'SEM_FLUXO');
   const minimo = s.avaliarSniper(dados({ book_imbalance_10: 0.05, rvol: 1 }));        // só direção + fluxo = 50: já aprova
   assert.strictEqual(minimo.score, 50); assert.strictEqual(minimo.ok, true);
 });
 
-test('avaliarSniper SHORT: ST vermelho + EMA 5m caindo + preço <= VWAP; limiares 0,84 e 0,85', () => {
+test('avaliarSniper SHORT: maioria baixista; limiar de fluxo 0,95', () => {
   const r = s.avaliarSniper(curto());
   assert.strictEqual(r.direcao, 'SHORT'); assert.strictEqual(r.ok, true);
-  assert.strictEqual(s.avaliarSniper(curto({ taker_buy_ratio_60s: 0.46 })).comp.fluxo, false); // 0.46/0.54 = 0.85 > 0.84
-  assert.strictEqual(s.avaliarSniper(curto({ taker_buy_ratio_60s: 0.45 })).comp.fluxo, true);  // 0.818
+  assert.strictEqual(s.avaliarSniper(curto({ taker_buy_ratio_60s: 0.49 })).comp.fluxo, false); // 0.49/0.51 = 0.96 > 0.95
+  assert.strictEqual(s.avaliarSniper(curto({ taker_buy_ratio_60s: 0.48 })).comp.fluxo, true);  // 0.923
 });
 
-test('avaliarSniper: filtro de direção obrigatório (qualquer divergência = SEM_DIRECAO, sem forçar)', () => {
-  for (const o of [{ st1m_dir: -1 }, { ema9_5m: 99 }, { preco: 99.9 }]) {
-    const r = s.avaliarSniper(dados(o)); assert.strictEqual(r.ok, false); assert.strictEqual(r.direcao, 'NONE'); assert.strictEqual(r.bloqueio, 'SEM_DIRECAO');
-  }
-  assert.strictEqual(s.avaliarSniper(curto({ preco: 100.5 })).bloqueio, 'SEM_DIRECAO'); // SHORT com preço acima do VWAP
+test('avaliarSniper: direção por maioria simples (2 de 3: Supertrend 1m, EMA 5m, VWAP); empate = SEM_DIRECAO', () => {
+  assert.strictEqual(s.avaliarSniper(dados({ st1m_dir: -1 })).direcao, 'LONG');                 // EMA + VWAP a favor
+  assert.strictEqual(s.avaliarSniper(dados({ ema9_5m: 99 })).direcao, 'LONG');                  // ST + VWAP a favor
+  assert.strictEqual(s.avaliarSniper(dados({ st1m_dir: -1, ema9_5m: 99, taker_buy_ratio_60s: 0.40, book_imbalance_10: -0.3 })).direcao, 'SHORT'); // ST + EMA caindo
+  const empate = s.avaliarSniper(dados({ st1m_dir: -1, preco: 100 }));                          // preço = VWAP: 2 x 2
+  assert.strictEqual(empate.ok, false); assert.strictEqual(empate.direcao, 'NONE'); assert.strictEqual(empate.bloqueio, 'SEM_DIRECAO');
   assert.strictEqual(s.avaliarSniper(dados({ st1m_dir: null })).bloqueio, 'SEM_DADOS_SNIPER');
 });
 
-test('avaliarSniper: ATR 1m < 0,12% bloqueia; trava anti-topo (> 1,2 x ATR da EMA 9 1m) bloqueia', () => {
-  assert.strictEqual(s.avaliarSniper(dados({ atr_1m_pct: 0.119 })).bloqueio, 'ATR_BAIXO');
-  assert.strictEqual(s.avaliarSniper(dados({ atr_1m_pct: 0.12 })).ok, true);
+test('avaliarSniper: ATR 1m < 0,05% bloqueia; trava anti-topo (> 1,2 x ATR da EMA 9 1m) bloqueia', () => {
+  assert.strictEqual(s.avaliarSniper(dados({ atr_1m_pct: 0.049 })).bloqueio, 'ATR_BAIXO');
+  assert.strictEqual(s.avaliarSniper(dados({ atr_1m_pct: 0.05 })).ok, true);
   // ATR 0,20% de 101 = 0,202; 1,2 x = 0,2424 -> EMA9 em 100,75 (distância 0,25) bloqueia; 100,77 (0,23) passa
   assert.strictEqual(s.avaliarSniper(dados({ ema9_1m: 100.75 })).bloqueio, 'TOPO_ESTICADO');
   assert.strictEqual(s.avaliarSniper(dados({ ema9_1m: 100.77 })).ok, true);
@@ -76,8 +77,8 @@ test('avaliarCandidata: direção vem do Sniper; sem fluxo ou sem direção = bl
   const full = (o) => ({ ...dados(o), timestamp_dados_ms: agora - 500, timestamp_agora_ms: agora, ema9_15m: 101, ema21_15m: 99, cvd_delta_60s: 5, spread_pct: 0.01 });
   const ok = s.avaliarCandidata('SOLUSDT', full({}));
   assert.strictEqual(ok.direcao, 'LONG'); assert.strictEqual(ok.bloqueio, null); assert.strictEqual(ok.sniper.score, 100);
-  assert.strictEqual(s.avaliarCandidata('SOLUSDT', full({ taker_buy_ratio_60s: 0.52 })).bloqueio, 'SEM_FLUXO');
-  assert.strictEqual(s.avaliarCandidata('SOLUSDT', full({ st1m_dir: -1 })).bloqueio, 'SEM_DIRECAO');
+  assert.strictEqual(s.avaliarCandidata('SOLUSDT', full({ taker_buy_ratio_60s: 0.50 })).bloqueio, 'SEM_FLUXO');
+  assert.strictEqual(s.avaliarCandidata('SOLUSDT', full({ st1m_dir: -1, preco: 100 })).bloqueio, 'SEM_DIRECAO');
   // ranking pelo score Sniper
   const r = s.rankearCandidatas([ok, s.avaliarCandidata('A', full({ rvol: 1 }))]);
   assert.deepStrictEqual(r.map(x => x.score), [100, 75]);
@@ -109,7 +110,7 @@ function montar(over = {}) {
   });
   const lado = over.lado || 'LONG';
   const alvo = localAlvos.SOLUSDT = { modo: 'scalp_1m', side: lado, entryPrice: 100, slPrice: lado === 'LONG' ? 99.4 : 100.6, slCurtoPrice: lado === 'LONG' ? 99.56 : 100.44,
-    quantidade: 0.5, openTime: T0 + 2000, candle: T0, entradaTipo: 'LIMITE', taxaEntradaPct: 0.02, slNaCorretora: true, entrada: { precoMainnet: 100, slipMainnetPct: 0 }, maxRoiReached: 0, minRoiReached: 0 };
+    quantidade: 0.5, openTime: T0 + 2000, candle: T0, entradaTipo: 'LIMITE', taxaEntradaPct: 0.02, slNaCorretora: true, stDirEntrada: lado === 'LONG' ? 1 : -1, entrada: { precoMainnet: 100, slipMainnetPct: 0 }, maxRoiReached: 0, minRoiReached: 0 };
   m._estado.slots[3] = { symbol: 'SOLUSDT', side: lado, status: 'x', openTime: T0 + 2000 };
   return { m, chamadas, alvo, localAlvos, desfechos, ordens, dir, set: (p) => { preco = p; }, avancar: (ms) => { relogio += ms; }, agora: () => relogio, zerar: () => { posQty = 0; } };
 }
@@ -264,9 +265,9 @@ test('whitelist: filtrarUniverso só aceita as 20 moedas líquidas; WHITELIST te
   assert.deepStrictEqual(r.lista.map(x => x.simbolo), ['SOLUSDT']);
 });
 
-test('spread testnet > 0,08%: entrada proibida antes de qualquer ordem', async () => {
+test('spread testnet > 0,60%: entrada proibida antes de qualquer ordem', async () => {
   const t = turnoSniper();
-  t.setAsk(100.2); // 0,2% de spread no book da testnet
+  t.setAsk(100.7); // 0,7% de spread no book da testnet (> 0,60%)
   const w = console.warn; console.warn = () => {};
   try { await t.m.tick(); } finally { console.warn = w; }
   assert.ok(!t.chamadas.some(c => c.startsWith('limite') || c.startsWith('market')));
