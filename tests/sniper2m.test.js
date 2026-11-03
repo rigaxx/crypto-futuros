@@ -22,7 +22,7 @@ test('constantes Sniper: 120 s, 2 slots de 10 USDT a 5x, TP +1,60% ROI, SL curto
   assert.strictEqual(s.TP_PRICE_PCT * s.ALAV, 1.6); assert.ok(Math.abs(s.SL_CURTO_PCT - 0.44) < 1e-12);
   assert.strictEqual(s.BE_GATILHO_ROI, 0.85); assert.strictEqual(s.BE_PISO_ROI, 0.45);
   assert.strictEqual(s.ENTRADA_LIMITE_MS, 8000); assert.strictEqual(s.ATR_MIN_PCT, 0.18); assert.strictEqual(s.VOLUME_MIN_USDT, 50_000_000);
-  assert.strictEqual(s.SNIPER_SCORE_MIN, 75); assert.strictEqual(s.ENTRADA_FUGA_ABORTA_PCT, 0.15);
+  assert.strictEqual(s.SNIPER_SCORE_MIN, 50); assert.strictEqual(s.ENTRADA_FUGA_ABORTA_PCT, 0.15);
   const f = s.faseCiclo(T0 + 5000); assert.strictEqual(f.fase, 'ABERTO'); assert.strictEqual(f.cicloRestanteMs, 115000);
   assert.strictEqual(s.faseCiclo(T0 + 50000).fase, 'ANALISE'); assert.strictEqual(s.faseCiclo(T0 + 110000).fase, 'CONFIRMACAO');
 });
@@ -41,8 +41,10 @@ test('avaliarSniper LONG: direção (ST verde + EMA 5m + VWAP) e score = 20 + 30
   assert.strictEqual(r.direcao, 'LONG'); assert.strictEqual(r.score, 100); assert.strictEqual(r.ok, true);
   assert.strictEqual(s.avaliarSniper(dados({ rvol: 1.5 })).score, 75);               // sem RVol: ainda aprova
   assert.strictEqual(s.avaliarSniper(dados({ book_imbalance_10: 0.05 })).score, 75); // book 1.1 < 1.15: sem o peso 2
-  const fraco = s.avaliarSniper(dados({ taker_buy_ratio_60s: 0.52 }));               // ratio 1.08 < 1.18: sem fluxo = 70
-  assert.strictEqual(fraco.score, 70); assert.strictEqual(fraco.ok, false); assert.strictEqual(fraco.bloqueio, 'SCORE_BAIXO');
+  const fraco = s.avaliarSniper(dados({ taker_buy_ratio_60s: 0.52 }));               // ratio 1.08 < 1.18: sem fluxo a favor = não entra
+  assert.strictEqual(fraco.score, 70); assert.strictEqual(fraco.ok, false); assert.strictEqual(fraco.bloqueio, 'SEM_FLUXO');
+  const minimo = s.avaliarSniper(dados({ book_imbalance_10: 0.05, rvol: 1 }));        // só direção + fluxo = 50: já aprova
+  assert.strictEqual(minimo.score, 50); assert.strictEqual(minimo.ok, true);
 });
 
 test('avaliarSniper SHORT: ST vermelho + EMA 5m caindo + preço <= VWAP; limiares 0,84 e 0,85', () => {
@@ -69,12 +71,12 @@ test('avaliarSniper: ATR 1m < 0,18% bloqueia; trava anti-topo (> 1,2 x ATR da EM
   assert.strictEqual(s.avaliarSniper(curto({ ema9_1m: 99.25 })).bloqueio, 'TOPO_ESTICADO'); // fundo esticado no SHORT
 });
 
-test('avaliarCandidata: direção vem do Sniper; score < 75 ou sem direção = bloqueio (não entra)', () => {
+test('avaliarCandidata: direção vem do Sniper; sem fluxo ou sem direção = bloqueio (não entra)', () => {
   const agora = 1_800_000_000_000;
   const full = (o) => ({ ...dados(o), timestamp_dados_ms: agora - 500, timestamp_agora_ms: agora, ema9_15m: 101, ema21_15m: 99, cvd_delta_60s: 5, spread_pct: 0.01 });
   const ok = s.avaliarCandidata('SOLUSDT', full({}));
   assert.strictEqual(ok.direcao, 'LONG'); assert.strictEqual(ok.bloqueio, null); assert.strictEqual(ok.sniper.score, 100);
-  assert.strictEqual(s.avaliarCandidata('SOLUSDT', full({ taker_buy_ratio_60s: 0.52 })).bloqueio, 'SCORE_BAIXO');
+  assert.strictEqual(s.avaliarCandidata('SOLUSDT', full({ taker_buy_ratio_60s: 0.52 })).bloqueio, 'SEM_FLUXO');
   assert.strictEqual(s.avaliarCandidata('SOLUSDT', full({ st1m_dir: -1 })).bloqueio, 'SEM_DIRECAO');
   // ranking pelo score Sniper
   const r = s.rankearCandidatas([ok, s.avaliarCandidata('A', full({ rvol: 1 }))]);
@@ -191,7 +193,7 @@ test('zerarContadores: placar do dia, taxas e histórico recomeçam do zero', ()
 // ── entrada maker-first: 8 s, sem perseguir preço ──
 function turnoSniper(over = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniper2m-ent-'));
-  const t0 = T0 + 2000; let relogio = t0, nOrd = 0, ask = 100.1;
+  const t0 = T0 + 2000; let relogio = t0, nOrd = 0, ask = 100.05;
   const chamadas = [], localAlvos = {}, ordens = {};
   const ks1 = Array.from({ length: 60 }, (_, i) => { const c = 100 + i * 0.01; return k(t0 - (60 - i) * 60000 - 2000, c, c + 0.2, c - 0.2, c, i === 59 ? 50 : 10); });
   const ks5 = Array.from({ length: 30 }, (_, i) => k(t0 - (30 - i) * 300000 - 2000, 100, 100, 100, 90 + i, 1));
@@ -211,7 +213,7 @@ function turnoSniper(over = {}) {
     fut, feed, rest: { klines: async (sym, tf) => (tf === '1m' ? ks1 : ks5) }, localAlvos, salvarAlvos() {}, closingInProgress: new Set(),
     simboloOcupadoPsar: () => false, registrarDesfechoTrade() {}, rag: null,
     configFile: path.join(dir, 'cfg.json'), logFile: path.join(dir, 'log.jsonl'), agora: () => relogio, dormir: async (ms) => { relogio += ms; },
-    baseOrdens: 'https://testnet.binancefuture.com', universoInicial: ['SOLUSDT'], controlePeso: null
+    baseOrdens: 'https://testnet.binancefuture.com', universoInicial: ['SOLUSDT'], controlePeso: null, whitelist: null
   });
   m._estado.enabled = true;
   return { m, chamadas, localAlvos, dir, setAsk: (v) => { ask = v; }, agora: () => relogio, t0 };
@@ -239,14 +241,56 @@ test('entrada: sem fill em 8 s e preço fugiu (> 0,03%) = ABORTA, nenhuma ordem 
   assert.ok(ab && ab.fuga_pct > s.ENTRADA_FUGA_ABORTA_PCT && ab.motivo === 'SEM_FILL_8S');
 });
 
-test('sem confluência (score 70 < 75): turno VAZIO, nenhuma ordem, sem queimar taxa', async () => {
+test('sem fluxo a favor: turno VAZIO, nenhuma ordem, sem queimar taxa', async () => {
   const t0 = T0 + 2000;
   const t = turnoSniper({ trades: [{ T: t0 - 200, p: 100.5, q: 3, m: false }, { T: t0 - 100, p: 100.5, q: 3, m: true }] }); // fluxo 1,0
   await t.m.tick();
   assert.deepStrictEqual(t.chamadas, []);
   const l = linhasDe(t);
   assert.ok(l.some(x => x.tipo === 'TURNO' && x.status === 'VAZIO'));
-  assert.ok(l.filter(x => x.tipo === 'DECISAO').every(x => x.acao === 'BLOQUEADA' && x.bloqueio_duro === 'SCORE_BAIXO'));
+  assert.ok(l.filter(x => x.tipo === 'DECISAO').every(x => x.acao === 'BLOQUEADA' && x.bloqueio_duro === 'SEM_FLUXO'));
 });
 
 function linhasDe(t) { return fs.readFileSync(path.join(t.dir, 'log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse); }
+
+// ── whitelist, spread testnet, órfãs ──
+test('whitelist: filtrarUniverso só aceita as 20 moedas líquidas; WHITELIST tem 20 pares sem as sem-liquidez', () => {
+  assert.strictEqual(s.WHITELIST.length, 20);
+  for (const ruim of ['IDOLUSDT', 'JCTUSDT', 'AINUSDT', 'ESPORTSUSDT', 'AKEUSDT', 'ICNTUSDT', 'XPLUSDT', 'BMTUSDT']) assert.ok(!s.WHITELIST.includes(ruim), ruim);
+  const sym = (symbol) => ({ symbol, status: 'TRADING', contractType: 'PERPETUAL', quoteAsset: 'USDT', onboardDate: 1 });
+  const r = s.filtrarUniverso({ info: { symbols: [sym('SOLUSDT'), sym('IDOLUSDT')] }, tickers: [{ symbol: 'SOLUSDT', quoteVolume: '9e9' }, { symbol: 'IDOLUSDT', quoteVolume: '9e9' }],
+    books: [{ symbol: 'SOLUSDT', bidPrice: '100', askPrice: '100.01' }, { symbol: 'IDOLUSDT', bidPrice: '1', askPrice: '1.0001' }],
+    filtroTestnet: () => ({ minQty: 0.001, stepSize: 0.001, minNotional: 5 }), agora: 1e12, whitelist: s.WHITELIST });
+  assert.deepStrictEqual(r.lista.map(x => x.simbolo), ['SOLUSDT']);
+});
+
+test('spread testnet > 0,08%: entrada proibida antes de qualquer ordem', async () => {
+  const t = turnoSniper();
+  t.setAsk(100.2); // 0,2% de spread no book da testnet
+  const w = console.warn; console.warn = () => {};
+  try { await t.m.tick(); } finally { console.warn = w; }
+  assert.ok(!t.chamadas.some(c => c.startsWith('limite') || c.startsWith('market')));
+  assert.strictEqual(t.localAlvos.SOLUSDT, undefined);
+});
+
+test('órfã sem posição na corretora: alvo e slot limpos; com posição: Market reduceOnly e slot livre', async () => {
+  for (const comPosicao of [false, true]) {
+    const t = montar();
+    t.alvo.orfa = true; t.alvo.abandonada = true; t.alvo.tentativasSaida = 20;
+    t.avancar(200000); // muito além do fim do turno
+    if (!comPosicao) t.zerar();
+    const w = console.warn; console.warn = () => {};
+    try { await t.m.monitorarTodas(); } finally { console.warn = w; }
+    assert.strictEqual(t.localAlvos.SOLUSDT, undefined, `comPosicao=${comPosicao}`);
+    assert.strictEqual(t.m._estado.slots[3].symbol, null);
+    assert.strictEqual(t.chamadas.includes('fechar LONG'), comPosicao);
+  }
+});
+
+test('frescor: com WS vivo, moeda quieta não é DADOS_ATRASADOS (silêncio do socket, não da moeda)', () => {
+  const agora = 1_800_000_000_000;
+  const d = s.montarDados('SOLUSDT', { k1m: [], k5m: [], k15m: [], agora, snap: { trades: [], book: { bids: [['100', '1']], asks: [['100.01', '1']] }, tsTrade: agora - 40000, tsBook: agora - 30000, bufferCompleto: true, wsVivo: true, wsMudoMs: 80 } }).dados;
+  assert.ok(agora - d.timestamp_dados_ms < 1000);
+  const velho = s.montarDados('SOLUSDT', { k1m: [], k5m: [], k15m: [], agora, snap: { trades: [], book: { bids: [['100', '1']], asks: [['100.01', '1']] }, tsTrade: agora - 40000, tsBook: agora - 30000, bufferCompleto: true, wsVivo: false, wsMudoMs: 80 } }).dados;
+  assert.ok(agora - velho.timestamp_dados_ms >= 40000);
+});

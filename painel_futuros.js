@@ -1717,14 +1717,14 @@ app.get('/', (req, res) => {
     body.modo-scalp .perf-header-bar, body.modo-scalp .volatility-bar, body.modo-scalp .bot-control-bar,
     body.modo-scalp #psar-off-nota, body.modo-scalp #psar-grid { display: none !important; }
     body.modo-scalp .scalp-turno-bar { height: calc(100vh - 12px); overflow: hidden; }
-    .sc-topo { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .sc-topo { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; row-gap: 4px; }
     .sc-placar { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
     .sc-placar .badge-win, .sc-placar .badge-loss, .sc-placar .badge-wr { font-size: 0.78rem; padding: 2px 5px; flex: 0 0 auto; width: auto; min-width: 46px; text-align: center; }
-    .sc-kpis { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; overflow: hidden; }
-    .sc-kpi { display: flex; flex-direction: column; gap: 1px; padding: 4px 10px; background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 8px; white-space: nowrap; }
-    .sc-kpi b { font-size: 0.95rem; font-weight: 900; font-variant-numeric: tabular-nums; }
-    .sc-btns { display: flex; gap: 6px; }
-    .sc-btns button { padding: 5px 10px; font-size: 0.72rem; border-radius: 7px; background: rgba(255,255,255,0.06); color: var(--text); border: 1px solid var(--border); cursor: pointer; font-weight: 700; }
+    .sc-kpis { display: flex; align-items: center; gap: 4px; flex: 1 1 auto; min-width: 0; flex-wrap: wrap; row-gap: 4px; overflow: visible; }
+    .sc-kpi { display: flex; flex-direction: column; gap: 1px; flex: 0 0 auto; padding: 3px 7px; background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 8px; white-space: nowrap; }
+    .sc-kpi b { font-size: 0.88rem; white-space: nowrap; font-weight: 900; font-variant-numeric: tabular-nums; }
+    .sc-btns { display: flex; gap: 4px; flex: 0 0 auto; white-space: nowrap; }
+    .sc-btns button { padding: 5px 8px; font-size: 0.7rem; white-space: nowrap; border-radius: 7px; background: rgba(255,255,255,0.06); color: var(--text); border: 1px solid var(--border); cursor: pointer; font-weight: 700; }
     .scalp-tag { font-size: 0.72rem; font-weight: 900; letter-spacing: 1px; color: var(--purple); background: rgba(167,139,250,0.15); border: 1px solid rgba(167,139,250,0.4); padding: 3px 8px; border-radius: 7px; white-space: nowrap; }
     .scalp-estado { font-size: 0.75rem; font-weight: 800; color: var(--text-muted); white-space: nowrap; }
     .sc-centro { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 18px; background: rgba(0,0,0,0.25); border: 1px solid var(--border); border-radius: 10px; padding: 6px 16px; }
