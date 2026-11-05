@@ -16,11 +16,11 @@ function dados(over = {}) {
 }
 const curto = (o = {}) => dados({ preco: 99, ema9_5m: 98, ema21_5m: 100, ema9_1m: 99.05, st1m_dir: -1, taker_buy_ratio_60s: 0.40, book_imbalance_10: -0.30, ...o });
 
-test('constantes Sniper: 120 s, 2 slots de 10 USDT a 5x, TP +1,60% ROI, SL curto -2,20% ROI', () => {
+test('constantes Sniper: 120 s, 2 slots de 10 USDT a 5x, TP +2,40% ROI, SL curto -2,20% ROI', () => {
   assert.strictEqual(s.TURNO_MS, 120000); assert.strictEqual(s.SCALP_DURACAO_MS, 120000);
   assert.strictEqual(s.ALAV, 5); assert.strictEqual(s.MARGEM, 10); assert.deepStrictEqual(s.SLOTS, [3, 4]);
-  assert.strictEqual(s.TP_PRICE_PCT * s.ALAV, 1.6); assert.ok(Math.abs(s.SL_CURTO_PCT - 0.44) < 1e-12);
-  assert.strictEqual(s.BE_GATILHO_ROI, 0.85); assert.strictEqual(s.BE_PISO_ROI, 0.45);
+  assert.strictEqual(s.TP_PRICE_PCT * s.ALAV, 2.4); assert.ok(Math.abs(s.SL_CURTO_PCT - 0.44) < 1e-12);
+  assert.strictEqual(s.BE_GATILHO_ROI, 1.30); assert.strictEqual(s.BE_PISO_ROI, 0.70);
   assert.strictEqual(s.ENTRADA_LIMITE_MS, 8000); assert.strictEqual(s.ATR_MIN_PCT, 0.05); assert.strictEqual(s.VOLUME_MIN_USDT, 20_000_000); assert.strictEqual(s.SPREAD_TESTNET_MAX_PCT, 0.6); assert.strictEqual(s.TAKER_RATIO_LONG ?? 1.05, 1.05);
   assert.strictEqual(s.SNIPER_SCORE_MIN, 45); assert.strictEqual(s.ENTRADA_FUGA_ABORTA_PCT, 0.15);
   const f = s.faseCiclo(T0 + 5000); assert.strictEqual(f.fase, 'ABERTO'); assert.strictEqual(f.cicloRestanteMs, 115000);
@@ -116,12 +116,12 @@ function montar(over = {}) {
 }
 const linhas = (t) => fs.readFileSync(path.join(t.dir, 'log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
 
-test('TP_SNIPER_2M: 1º tick coloca limite reduceOnly GTC em +0,32% (+1,60% ROI); fill = saída maker', async () => {
+test('TP_SNIPER_2M: 1º tick coloca limite reduceOnly GTC em +0,48% (+2,40% ROI); fill = saída maker', async () => {
   const t = montar();
   await t.m.monitorarPosicao('SOLUSDT', t.alvo);
-  assert.deepStrictEqual(t.chamadas, ['limite SELL 0.5 100.3200 RO GTC']);
+  assert.deepStrictEqual(t.chamadas, ['limite SELL 0.5 100.4800 RO GTC']);
   assert.strictEqual(t.alvo.tp.orderId, 1);
-  t.ordens[1].status = 'FILLED'; t.zerar(); t.set(100.32);
+  t.ordens[1].status = 'FILLED'; t.zerar(); t.set(100.48);
   await t.m.monitorarPosicao('SOLUSDT', t.alvo);
   assert.strictEqual(t.localAlvos.SOLUSDT, undefined);
   const tr = linhas(t).find(l => l.tipo === 'TRADE');
@@ -130,18 +130,19 @@ test('TP_SNIPER_2M: 1º tick coloca limite reduceOnly GTC em +0,32% (+1,60% ROI)
   assert.ok(tr.pnl_testnet.liquido > 0);
 });
 
-test('TP no SHORT fica em -0,32% de preço', async () => {
+test('TP no SHORT fica em -0,48% de preço', async () => {
   const t = montar({ lado: 'SHORT', klines: serie(60, i => 130 - i * 0.5) });
   await t.m.monitorarPosicao('SOLUSDT', t.alvo);
-  assert.deepStrictEqual(t.chamadas, ['limite BUY 0.5 99.6800 RO GTC']);
+  assert.deepStrictEqual(t.chamadas, ['limite BUY 0.5 99.5200 RO GTC']);
 });
 
-test('BE_RAPIDO_2M: bateu +0,85% ROI e recuou a +0,45% = fecha na hora, positivo (nunca devolve no relógio)', async () => {
+test('BE_REAL: bateu +1,30% ROI e recuou a +0,70% = fecha na hora, positivo (nunca devolve no relógio)', async () => {
   const t = montar();
   await t.m.monitorarPosicao('SOLUSDT', t.alvo);                 // TP colocado
-  t.set(100.18); await t.m.monitorarPosicao('SOLUSDT', t.alvo);  // ROI +0,90%: arma o piso, sem sair
-  assert.ok(t.alvo.maxRoiReached >= 0.85); assert.ok(!t.alvo.saidaMotivo);
-  t.set(100.09); t.avancar(1000); await t.m.monitorarPosicao('SOLUSDT', t.alvo); // ROI +0,45%: fecha
+  t.set(100.27); await t.m.monitorarPosicao('SOLUSDT', t.alvo);  // ROI +1,35%: arma o piso, sem sair
+  assert.ok(t.alvo.maxRoiReached >= 1.30); assert.ok(!t.alvo.saidaMotivo);
+  t.set(100.14); t.avancar(1000); await t.m.monitorarPosicao('SOLUSDT', t.alvo); // ROI +0,70%: arma limite
+  t.avancar(3500); await t.m.monitorarPosicao('SOLUSDT', t.alvo); // fecha Market
   assert.strictEqual(t.localAlvos.SOLUSDT, undefined);
   assert.ok(t.chamadas.includes('cancelOrd 1')); assert.ok(t.chamadas.includes('fechar LONG'));
   const tr = linhas(t).find(l => l.tipo === 'TRADE');
@@ -171,8 +172,9 @@ test('SL_CURTO_2M: virada do Supertrend 1m contra a posição fecha mesmo sem o 
   assert.ok(t.chamadas.includes('fechar LONG'));
 });
 
-test('FIM_TURNO_2M: nos últimos 5 s do turno limite reduceOnly; sem fill = Market antes da fronteira seguinte', async () => {
-  const t = montar({ agora: T0 + s.TURNO_MS - s.FIM_ANTECIPA_MS - s.FIM_LIMITE_MS - 1000 });
+test('FIM_TURNO_2M: nos últimos 5 s após 8 min sem andar, fecha a Market', async () => {
+  const t = montar({ agora: T0 + 8 * 60 * 1000 - s.FIM_ANTECIPA_MS - s.FIM_LIMITE_MS - 1000 });
+  t.alvo.openTime = T0 - 10000; t.alvo.candle = T0 + 8 * 60 * 1000 - s.TURNO_MS;
   await t.m.monitorarPosicao('SOLUSDT', t.alvo);                 // ainda fora da janela: só coloca o TP
   assert.ok(!t.alvo.saidaMotivo);
   t.avancar(1500); await t.m.monitorarPosicao('SOLUSDT', t.alvo);
@@ -180,8 +182,15 @@ test('FIM_TURNO_2M: nos últimos 5 s do turno limite reduceOnly; sem fill = Mark
   assert.ok(t.chamadas.some(c => c.startsWith('limite SELL') && c.endsWith('RO GTX')));
   t.avancar(4600); await t.m.monitorarPosicao('SOLUSDT', t.alvo);
   assert.ok(t.chamadas.includes('fechar LONG'));
-  assert.ok(t.agora() <= T0 + s.TURNO_MS); // fechou antes da fronteira: slot livre na entrada do próximo turno
   assert.strictEqual(linhas(t).find(l => l.tipo === 'TRADE').saida_motivo, 'SCALP_FIM_TURNO_2M');
+});
+
+test('RENOVAÇÃO ZONA NEUTRA: aos 120s com ROI neutro e ST a favor renova ciclo; não fecha prematuro', async () => {
+  const t = montar({ agora: T0 + s.TURNO_MS - s.FIM_ANTECIPA_MS - s.FIM_LIMITE_MS + 500 });
+  t.alvo.openTime = T0;
+  await t.m.monitorarPosicao('SOLUSDT', t.alvo);
+  assert.ok(!t.alvo.saidaMotivo);
+  assert.strictEqual(t.alvo.ciclosRenovados, 1);
 });
 
 test('zerarContadores: placar do dia, taxas e histórico recomeçam do zero', () => {

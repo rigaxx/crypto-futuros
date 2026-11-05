@@ -1179,7 +1179,17 @@ app.post('/api/close', async (req, res) => {
     }
     closingInProgress.add(symbol); closingStartedAt[symbol] = Date.now(); lockScalp = ehScalp;
     const pos = await fut.posicao(symbol);
-    if (!pos || pos.quantidade === 0) throw new Error('Nenhuma posição aberta.');
+    if (!pos || pos.quantidade === 0) {
+      if (ehScalp) {
+        try { scalp1m.liberarSlot(symbol); } catch (e) {}
+      }
+      delete saidaSarTicks[symbol];
+      Reflect.deleteProperty(localAlvos, symbol);
+      salvarAlvos();
+      await fut.cancelarTodasOrdens(symbol).catch(() => false);
+      closingInProgress.delete(symbol); delete closingStartedAt[symbol];
+      return res.json({ success: true, aviso: 'Posição já estava zerada na corretora. Alvo e slot limpos.' });
+    }
     if (!ehScalp) await fut.cancelarTodasOrdens(symbol);
     let r;
     if (ehScalp) { // scalp: fecha primeiro; stop só cai após o fechamento
@@ -2548,6 +2558,19 @@ app.get('/', (req, res) => {
       }
     }
 
+    async function fecharSlotAgora(sym) {
+      sym = String(sym || '').trim().toUpperCase();
+      if (!sym) return;
+      if (!sym.endsWith('USDT')) sym += 'USDT';
+      if (!(await askConfirm('Fechar agora', 'Encerrar 100% de <b style="color:var(--gold);">' + escHtml(sym) + '</b> a mercado?'))) return;
+      try {
+        const res = await fetch('/api/close', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ symbol: sym }) });
+        const data = await res.json();
+        if (!data.success) alert('Erro ao fechar ' + sym + ': ' + (data.error || res.status));
+        try { carregarSaldo(); carregarPlacar(); } catch (e) {}
+      } catch (e) { alert('Erro ao fechar ' + sym + ': ' + e.message); }
+    }
+
     async function fecharPosicao(col) {
       let sym = document.getElementById('sym-' + col).value.trim().toUpperCase();
       if (!sym.endsWith('USDT')) sym += 'USDT';
@@ -2769,7 +2792,7 @@ app.get('/', (req, res) => {
             '<span class="scalp-slot-n">Slot ' + (n - 2) + '</span>' +
             '<span><span class="scalp-moeda">' + escHtml(s.moeda) + '</span> ' + scalpDirHtml(s.direcao) + '</span>' +
             '<span class="scalp-pnl" style="color:' + scalpCor(s.pnlAoVivo) + ';">' + escHtml(scalpUsd(s.pnlAoVivo)) + (s.pnlAoVivo == null ? '' : ' <small>(' + escHtml((s.pnlAoVivo / 10 * 100).toFixed(2)) + '% margem)</small>') + '</span>' +
-            '<span class="scalp-status">' + escHtml(SCALP_STATUS_TXT[s.status] || s.status) + '</span>' +
+            '<span class="scalp-status">' + escHtml(SCALP_STATUS_TXT[s.status] || s.status) + ' <button class="btn-close" style="padding:2px 8px;font-size:0.65rem;margin-left:6px;" data-sym="' + escHtml(s.moeda) + '" onclick="fecharSlotAgora(this.dataset.sym)">FECHAR AGORA</button></span>' +
             '<span class="scalp-campo"><span class="scalp-mini">Entrada</span> ' + escHtml(scalpPreco(s.precoEntrada)) + '</span>' +
             '<span class="scalp-campo" style="text-align:right;"><span class="scalp-mini">Restam</span> <b>' + (seg == null ? '--' : escHtml(seg + ' s')) + '</b>' + (seg == null ? '' : '<div class="sc-barra" style="margin-top:3px;"><span style="display:block;height:100%;width:' + Math.round(100 * seg / ((cfg.holdMs || 120000) / 1000)) + '%;background:var(--gold);"></span></div>') + '</span>' +
           '</div>';

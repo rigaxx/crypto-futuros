@@ -1149,7 +1149,7 @@ test('PL1 placar do scalp usa o líquido REAL: bruto +0,036 com taxas 0,035 = W;
   // motor entrega o líquido real no alvo
   const t = montarMotor({ pos: { lado: 'LONG', quantidade: 0.5, precoMarca: 100.2 } });
   t.m._estado.slots[3] = { symbol: 'ETHUSDT', side: 'LONG', status: 'x', openTime: AGORA };
-  t.localAlvos.ETHUSDT = ALVO_ETH(); t.avancar(HOLD);
+  t.localAlvos.ETHUSDT = ALVO_ETH(); t.avancar(8 * 60 * 1000);
   await t.m.monitorarPosicao('ETHUSDT', t.localAlvos.ETHUSDT);
   const tr = lerJsonl(t).find(l => l.tipo === 'TRADE');
   quase(t.desfechos[0][4].pnlLiquidoReal, tr.pnl_testnet.liquido);
@@ -1649,13 +1649,13 @@ test('CM1 cancela as ordens do símbolo ANTES da Market; pré-cancel falho: Mark
   let n = 0;
   const t = montarMotor({ pos: { lado: 'LONG', quantidade: 0.5, precoMarca: 100.2 }, cancelarTodasOrdens: async () => { t.chamadas.push('cancelar'); return ++n > 1; } });
   t.m._estado.slots[3] = { symbol: 'ETHUSDT', side: 'LONG', status: 'x', openTime: AGORA };
-  t.localAlvos.ETHUSDT = ALVO_ETH(); t.avancar(HOLD);
+  t.localAlvos.ETHUSDT = ALVO_ETH(); t.avancar(8 * 60 * 1000);
   await t.m.monitorarPosicao('ETHUSDT', t.localAlvos.ETHUSDT);
   assert.deepStrictEqual(t.chamadas, ['cancelar', 'fechar LONG', 'cancelar']); // 1º falhou: Market não espera; refaz depois
   assert.strictEqual(t.localAlvos.ETHUSDT, undefined);
   const u = montarMotor({ pos: { lado: 'LONG', quantidade: 0.5, precoMarca: 100.2 }, fecharMercado: async () => { throw new Error('rejeitada'); }, openAlgoOrdens: async () => [] });
   u.m._estado.slots[3] = { symbol: 'ETHUSDT', side: 'LONG', status: 'x', openTime: AGORA };
-  u.localAlvos.ETHUSDT = ALVO_ETH(); u.avancar(HOLD);
+  u.localAlvos.ETHUSDT = ALVO_ETH(); u.avancar(8 * 60 * 1000);
   await capturarErros(() => u.m.monitorarPosicao('ETHUSDT', u.localAlvos.ETHUSDT));
   assert.deepStrictEqual(u.chamadas, ['cancelar', 'sl LONG 99.8000']); // stop caiu no cancela e a Market falhou: reprotege
   assert(u.localAlvos.ETHUSDT); assert.strictEqual(u.localAlvos.ETHUSDT.slNaCorretora, true);
