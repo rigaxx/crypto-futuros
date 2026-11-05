@@ -1585,7 +1585,7 @@ app.get('/', (req, res) => {
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8">
-  <title>Futuros Quant Institucional - Binance</title>
+  <title>Futuros Quant Institucional - Binance (Scalp 2M)</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22 fill=%22%23D4AF37%22>$</text></svg>">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <style>
@@ -2088,10 +2088,10 @@ app.get('/', (req, res) => {
       </div>
     </div>
 
-    <!-- SCALP 1M: CICLO DE 5 MIN (tela principal com PSAR desligado) -->
+    <!-- SCALP 2M: CICLO DE 2 MIN (tela principal com PSAR desligado) -->
     <div class="scalp-turno-bar" id="scalp-turno-bar">
       <div class="sc-topo">
-        <span class="scalp-tag">SCALP 1M</span>
+        <span class="scalp-tag">SCALP 2M</span>
         <span id="scalp-estado" class="scalp-estado">Carregando...</span>
         <div class="sc-placar" title="Placar de trades (persistente): W / L / win rate"><span class="badge-win" id="scalp-placar-w">0 W</span><span class="scalp-mini">/</span><span class="badge-loss" id="scalp-placar-l">0 L</span><span class="badge-wr" id="scalp-placar-wr">0% WR</span></div>
         <div class="sc-kpis" id="scalp-hoje"></div>
@@ -2773,7 +2773,7 @@ app.get('/', (req, res) => {
           kpi('Taxas', escHtml('$ ' + Number(h.taxasPagas || 0).toFixed(4))) +
           kpi('Win rate', escHtml(scalpPct(h.winRatePorOperacao)) + ' <span class="scalp-mini">' + escHtml(h.operacoes) + ' op.</span>') +
           kpi('Expectativa / op.', escHtml(scalpUsd(h.expectativaLiquidaMediaPorOperacao)), scalpCor(h.expectativaLiquidaMediaPorOperacao)) +
-          kpi('Turnos', escHtml(h.turnos) + ' <span class="scalp-mini">' + escHtml(h.positivos) + '+ ' + escHtml(h.negativos) + '− ' + escHtml(h.turnosVazios) + 'v</span>') +
+          kpi('Turnos', escHtml(h.turnos) + ' <span class="scalp-mini">' + escHtml(h.positivos) + '+ ' + escHtml(h.negativos) + '− ' + escHtml(h.turnosVazios) + 'v' + ((h.renovados || 0) > 0 ? ' ' + escHtml(h.renovados) + 'r' : '') + '</span>') +
           kpi('Jev = código', escHtml(scalpPct(g.taxaConcorda === null || g.taxaConcorda === undefined ? null : g.taxaConcorda * 100)) + ' <span class="scalp-mini">' + escHtml(g.concorda || 0) + '/' + escHtml(g.comOpiniao || 0) + (g.ativo === false ? ' · sem chave' : '') + '</span>') +
           kpi('Latência Jev', escHtml(g.latenciaMediaMs === null || g.latenciaMediaMs === undefined ? '--' : g.latenciaMediaMs + ' ms') + ' <span class="scalp-mini">' + escHtml(g.timeouts || 0) + ' timeout</span>') +
           kpi('Maker ent./saí.', escHtml(scalpPct(d.maker_entrada_pct)) + ' <span class="scalp-mini">/</span> ' + escHtml(scalpPct(d.maker_saida_pct)));
@@ -2819,8 +2819,9 @@ app.get('/', (req, res) => {
             (!c.fora1Ciclo && origem[c.simbolo] === 'REPETIDA' ? '<span class="scalp-mini" title="Repetiu da lista anterior">repetiu</span>' : '') +
             (!c.fora1Ciclo && (origem[c.simbolo] === 'NOVA' || origem[c.simbolo] === 'ATR_PROXIMO') ? '<span class="scalp-mini" style="color:var(--green);" title="Entrou na lista agora">nova</span>' : '');
           const nome = String(c.simbolo).replace(/USDT$/, '');
+          const temErroDuro = ['DADOS_ATRASADOS', 'CAMPO_INVALIDO', 'SPREAD_ALTO'].includes(c.bloqueio) || !!c.erro;
           return '<tr title="' + escHtml(c.simbolo) + (c.bloqueio ? ' · ' + escHtml(c.bloqueio) + ' ' + escHtml(c.bloqueio_detalhe || '') : '') + '"><td>' + escHtml(i + 1) + '</td><td>' + escHtml(nome) +
-            (c.bloqueio ? ' <span class="scalp-chip scalp-chip-neg">!</span>' : '') + '</td><td class="sc-num">' + escHtml(fmtVol(c.volume_24h)) + '</td><td class="sc-num">' +
+            (temErroDuro ? ' <span class="scalp-chip scalp-chip-neg" title="' + escHtml(c.bloqueio) + '">!</span>' : '') + '</td><td class="sc-num">' + escHtml(fmtVol(c.volume_24h)) + '</td><td class="sc-num">' +
             escHtml(Number.isFinite(Number(c.atr)) && c.atr != null ? Number(c.atr).toFixed(3) : '--') + '</td><td class="sc-num">' + escHtml(c.score == null ? '--' : Number(c.score).toFixed(2)) + '</td><td>' +
             (c.direcao ? scalpDirHtml(c.direcao) : '<span class="scalp-mini">--</span>') + '</td><td class="sc-num">' + escHtml(c.condicoes_ok == null ? '-' : c.condicoes_ok + '/5') + '</td><td>' + (selos || '<span class="scalp-mini">--</span>') + '</td></tr>';
         };
@@ -2835,10 +2836,11 @@ app.get('/', (req, res) => {
         const hs = (d.historico || []).slice(0, 10);
         hiEl.innerHTML = '<tr><th>Turno</th><th>Moedas</th><th>Direção</th><th>Soma líq.</th></tr>' + (hs.length
           ? hs.map(u => {
-              const cls = u.vazio || u.positivo == null ? 'sc-neutro' : (u.positivo ? 'sc-pos' : 'sc-neg');
+              const cls = u.vazio ? 'sc-neutro' : (u.renovado ? 'sc-neutro' : (u.positivo == null ? 'sc-neutro' : (u.positivo ? 'sc-pos' : 'sc-neg')));
               const moedas = (u.moedas || []).length ? (u.moedas || []).map(escHtml).join(' / ') : 'VAZIO';
               const dirs = u.vazio ? escHtml(u.motivo || '') : (u.direcoes || []).map(escHtml).join(' / ');
-              return '<tr class="' + cls + '"><td>#' + escHtml(u.numero) + '</td><td>' + moedas + '</td><td>' + dirs + '</td><td class="sc-num">' + escHtml(u.vazio ? '--' : scalpUsd(u.somaLiquida)) + '</td></tr>';
+              const txtSoma = u.renovado || (u.somaLiquida == null && !u.vazio) ? '<span style="color:var(--gold);">EM CURSO (RENOVADO)</span>' : (u.vazio ? '--' : scalpUsd(u.somaLiquida));
+              return '<tr class="' + cls + '"><td>#' + escHtml(u.numero) + '</td><td>' + moedas + '</td><td>' + dirs + '</td><td class="sc-num">' + txtSoma + '</td></tr>';
             }).join('')
           : '<tr><td colspan="4" class="scalp-mini">sem turnos hoje</td></tr>');
       }

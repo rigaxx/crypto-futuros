@@ -166,6 +166,7 @@ test('SL_CURTO_2M: -2,20% ROI (-0,44%) tenta limite reduceOnly por 3 s e vai a M
 
 test('SL_CURTO_2M: virada do Supertrend 1m contra a posição fecha mesmo sem o preço no stop', async () => {
   const t = montar({ klines: serie(80, i => (i < 40 ? 100 + i : 140 - (i - 40) * 3)) }); // ST do 1m em BAIXA com posição LONG
+  t.avancar(s.TURNO_MS - s.FIM_ANTECIPA_MS - s.FIM_LIMITE_MS + 500);
   await t.m.monitorarPosicao('SOLUSDT', t.alvo);
   assert.strictEqual(t.alvo.saidaMotivo, 'SCALP_SL_CURTO_2M');
   t.avancar(3500); await t.m.monitorarPosicao('SOLUSDT', t.alvo);
